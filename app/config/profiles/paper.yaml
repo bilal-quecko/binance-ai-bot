@@ -1,0 +1,5 @@
+mode: paper
+symbols:
+  - BTCUSDT
+risk_per_trade: 0.005
+max_daily_loss: 0.02

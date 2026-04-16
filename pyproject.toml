@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "binance-ai-bot"
+version = "0.1.0"
+description = "Starter scaffold for a Binance Spot trading bot with optional AI-assisted analysis"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "Syed Bilal Shah" }
+]
+dependencies = [
+  "fastapi>=0.115.0,<1.0.0",
+  "uvicorn[standard]>=0.30.0,<1.0.0",
+  "pydantic>=2.8.0,<3.0.0",
+  "pydantic-settings>=2.4.0,<3.0.0",
+  "httpx>=0.27.0,<1.0.0",
+  "websockets>=12.0,<16.0",
+  "sqlalchemy>=2.0.0,<3.0.0",
+  "alembic>=1.13.0,<2.0.0",
+  "python-dotenv>=1.0.1,<2.0.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.0,<9.0.0",
+  "pytest-asyncio>=0.24.0,<1.0.0",
+  "ruff>=0.6.0,<1.0.0",
+  "mypy>=1.11.0,<2.0.0"
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true

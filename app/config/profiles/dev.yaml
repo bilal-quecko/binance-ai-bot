@@ -1,0 +1,7 @@
+mode: dev
+symbols:
+  - BTCUSDT
+  - ETHUSDT
+timeframes:
+  - 1m
+  - 5m
