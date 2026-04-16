@@ -1,0 +1,92 @@
+Metadata-Version: 2.4
+Name: binance-ai-bot
+Version: 0.1.0
+Summary: Starter scaffold for a Binance Spot trading bot with optional AI-assisted analysis
+Author: Syed Bilal Shah
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi<1.0.0,>=0.115.0
+Requires-Dist: uvicorn[standard]<1.0.0,>=0.30.0
+Requires-Dist: pydantic<3.0.0,>=2.8.0
+Requires-Dist: pydantic-settings<3.0.0,>=2.4.0
+Requires-Dist: httpx<1.0.0,>=0.27.0
+Requires-Dist: websockets<16.0,>=12.0
+Requires-Dist: sqlalchemy<3.0.0,>=2.0.0
+Requires-Dist: alembic<2.0.0,>=1.13.0
+Requires-Dist: python-dotenv<2.0.0,>=1.0.1
+Provides-Extra: dev
+Requires-Dist: pytest<9.0.0,>=8.3.0; extra == "dev"
+Requires-Dist: pytest-asyncio<1.0.0,>=0.24.0; extra == "dev"
+Requires-Dist: ruff<1.0.0,>=0.6.0; extra == "dev"
+Requires-Dist: mypy<2.0.0,>=1.11.0; extra == "dev"
+
+# Binance AI Bot
+
+Python scaffold for a Binance Spot trading bot with optional AI-assisted market analysis.
+
+## Current status
+This repository is a starter architecture only.
+It includes:
+- project structure
+- typed settings
+- basic logging
+- minimal FastAPI health app
+- placeholders for all major modules
+- basic tests
+
+## Quick start
+
+```bash
+python -m venv .venv
+source .venv/bin/activate  # On Windows PowerShell: .venv\Scripts\Activate.ps1
+pip install -e .[dev]
+cp .env.example .env
+uvicorn app.main:app --reload
+pytest
+```
+
+## Modes
+- `dev`
+- `paper`
+- `live`
+
+Default mode should remain `paper` until the trading core is implemented and tested.
+
+## Safety baseline
+- Spot only
+- no leverage
+- no Futures
+- AI must never place trades directly
+- every order path must pass deterministic risk validation
+
+## Tree
+
+```text
+binance-ai-bot/
+├── app/
+│   ├── main.py
+│   ├── config/
+│   ├── exchange/
+│   ├── market_data/
+│   ├── features/
+│   ├── strategies/
+│   ├── ai/
+│   ├── decision/
+│   ├── risk/
+│   ├── execution/
+│   ├── portfolio/
+│   ├── storage/
+│   ├── backtest/
+│   ├── paper/
+│   ├── monitoring/
+│   └── api/
+├── tests/
+├── scripts/
+├── docs/
+├── docker/
+├── .env.example
+├── .gitignore
+├── AGENTS.md
+├── pyproject.toml
+└── requirements.txt
+```
