@@ -23,5 +23,8 @@ class TrendFollowingConfig:
     max_atr_ratio: Decimal = Decimal("0.05")
     max_spread_ratio: Decimal = Decimal("0.002")
     min_order_book_imbalance: Decimal = Decimal("-0.25")
+    stop_loss_atr_multiple: Decimal = Decimal("2")
+    take_profit_atr_multiple: Decimal = Decimal("3")
     buy_confidence: Decimal = Decimal("0.60")
+    sell_confidence: Decimal = Decimal("0.70")
     hold_confidence: Decimal = Decimal("1.00")

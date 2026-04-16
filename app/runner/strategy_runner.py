@@ -12,7 +12,7 @@ from app.market_data.candles import Candle
 from app.market_data.models import MarketSnapshot
 from app.market_data.orderbook import TopOfBook
 from app.paper.broker import PaperBroker
-from app.paper.models import FillResult, OrderRequest
+from app.paper.models import FillResult, OrderRequest, Position
 from app.risk.limits import RiskEngine
 from app.risk.models import RiskDecision, RiskInput
 from app.runner.models import RunnerConfig, RunnerCycleResult
@@ -95,6 +95,7 @@ class StrategyRunner:
         self,
         feature_snapshot: FeatureSnapshot,
         signal: StrategySignal,
+        position: Position | None,
     ) -> RiskInput:
         """Create risk input for the current feature snapshot and broker state."""
 
@@ -106,14 +107,19 @@ class StrategyRunner:
         if self._day_start_equity is None:
             self._day_start_equity = self._current_equity()
 
+        requested_quantity = self._config.order_quantity
+        if signal.side == "SELL":
+            requested_quantity = position.quantity if position is not None else Decimal("0")
+
         return RiskInput(
             signal=signal,
             entry_price=entry_price,
-            requested_quantity=self._config.order_quantity,
+            requested_quantity=requested_quantity,
             equity=self._current_equity(),
             day_start_equity=self._day_start_equity,
             daily_pnl=self._current_pnl(),
             open_positions=len(self._broker.positions()),
+            current_position_quantity=position.quantity if position is not None else Decimal("0"),
             stop_price=stop_price,
             volatility=feature_snapshot.atr,
             risk_per_trade=self._config.risk_per_trade,
@@ -130,13 +136,14 @@ class StrategyRunner:
         self._record_snapshot(snapshot)
         symbol = snapshot.symbol.upper()
         feature_snapshot = self._build_feature_snapshot(symbol)
-        signal = self._strategy.evaluate(feature_snapshot)
+        existing_position = self._broker.get_position(symbol)
+        signal = self._strategy.evaluate(feature_snapshot, position=existing_position)
         self._logger.info("signal generated | symbol=%s side=%s reasons=%s", symbol, signal.side, signal.reason_codes)
 
         risk_decision: RiskDecision | None = None
         execution_result: FillResult | None = None
-        if signal.side == "BUY":
-            risk_input = self._build_risk_input(feature_snapshot, signal)
+        if signal.side in {"BUY", "SELL"}:
+            risk_input = self._build_risk_input(feature_snapshot, signal, existing_position)
             risk_decision = self._risk_engine.evaluate(risk_input)
             self._logger.info(
                 "risk decision | symbol=%s decision=%s quantity=%s reasons=%s",
@@ -148,8 +155,8 @@ class StrategyRunner:
 
             order = OrderRequest(
                 symbol=symbol,
-                side="BUY",
-                quantity=self._config.order_quantity,
+                side=signal.side,
+                quantity=risk_input.requested_quantity,
                 market_price=feature_snapshot.mid_price or feature_snapshot.ema_fast or Decimal("0"),
                 timestamp=feature_snapshot.timestamp,
                 quote_asset=self._config.quote_asset,
@@ -157,8 +164,9 @@ class StrategyRunner:
             )
             execution_result = self._execution_engine.execute(order, risk_decision)
             self._logger.info(
-                "execution result | symbol=%s status=%s qty=%s reasons=%s",
+                "execution result | symbol=%s side=%s status=%s qty=%s reasons=%s",
                 symbol,
+                signal.side,
                 execution_result.status,
                 execution_result.filled_quantity,
                 execution_result.reason_codes,

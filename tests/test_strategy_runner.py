@@ -56,7 +56,7 @@ def build_snapshot(index: int, close_price: str) -> MarketSnapshot:
     )
 
 
-def test_strategy_runner_executes_one_loop_cycle() -> None:
+def test_strategy_runner_completes_buy_hold_sell_cycle() -> None:
     broker = PaperBroker(initial_balances={"USDT": Decimal("1000")})
     runner = StrategyRunner(
         feature_engine=FeatureEngine(
@@ -84,18 +84,27 @@ def test_strategy_runner_executes_one_loop_cycle() -> None:
             build_snapshot(0, "100"),
             build_snapshot(1, "101"),
             build_snapshot(2, "102"),
+            build_snapshot(3, "103"),
+            build_snapshot(4, "95"),
         ],
-        iterations=3,
+        iterations=5,
     )
 
-    final_result = results[-1]
+    buy_result = results[2]
+    hold_result = results[3]
+    sell_result = results[4]
 
-    assert len(results) == 3
-    assert final_result.signal.side == "BUY"
-    assert final_result.risk_decision is not None
-    assert final_result.risk_decision.decision == "approve"
-    assert final_result.execution_result is not None
-    assert final_result.execution_result.status == "executed"
-    assert final_result.current_position is not None
-    assert final_result.current_position.quantity == Decimal("1")
-    assert final_result.current_pnl == Decimal("-0.10200")
+    assert len(results) == 5
+    assert buy_result.signal.side == "BUY"
+    assert buy_result.execution_result is not None
+    assert buy_result.execution_result.status == "executed"
+    assert hold_result.signal.side == "HOLD"
+    assert hold_result.current_position is not None
+    assert sell_result.signal.side == "SELL"
+    assert sell_result.risk_decision is not None
+    assert sell_result.risk_decision.decision == "approve"
+    assert sell_result.execution_result is not None
+    assert sell_result.execution_result.status == "executed"
+    assert sell_result.current_position is None
+    assert sell_result.current_pnl == Decimal("-7.19700")
+    assert broker.realized_pnl == Decimal("-7.19700")

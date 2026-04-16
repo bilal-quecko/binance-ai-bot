@@ -3,6 +3,7 @@
 from decimal import Decimal
 
 from app.features.models import FeatureSnapshot
+from app.paper.models import Position
 from app.strategies.models import StrategySignal, TrendFollowingConfig
 
 
@@ -19,6 +20,16 @@ class TrendFollowingStrategy:
             symbol=symbol,
             side="HOLD",
             confidence=self.config.hold_confidence,
+            reason_codes=tuple(reason_codes),
+        )
+
+    def _sell(self, symbol: str, *reason_codes: str) -> StrategySignal:
+        """Return a typed SELL signal with deterministic reason codes."""
+
+        return StrategySignal(
+            symbol=symbol,
+            side="SELL",
+            confidence=self.config.sell_confidence,
             reason_codes=tuple(reason_codes),
         )
 
@@ -47,8 +58,38 @@ class TrendFollowingStrategy:
 
         return True
 
-    def evaluate(self, snapshot: FeatureSnapshot) -> StrategySignal:
+    def _exit_signal(
+        self,
+        snapshot: FeatureSnapshot,
+        position: Position,
+    ) -> StrategySignal | None:
+        """Return a SELL signal when exit conditions are satisfied."""
+
+        market_price = snapshot.mid_price
+        if market_price is None:
+            return None
+
+        if snapshot.ema_fast is not None and snapshot.ema_slow is not None and snapshot.ema_fast < snapshot.ema_slow:
+            return self._sell(snapshot.symbol, "EMA_BEARISH_EXIT")
+
+        if snapshot.atr is not None:
+            stop_loss_price = position.avg_entry_price - (snapshot.atr * self.config.stop_loss_atr_multiple)
+            take_profit_price = position.avg_entry_price + (snapshot.atr * self.config.take_profit_atr_multiple)
+            if market_price <= stop_loss_price:
+                return self._sell(snapshot.symbol, "STOP_LOSS_HIT")
+            if market_price >= take_profit_price:
+                return self._sell(snapshot.symbol, "TAKE_PROFIT_HIT")
+
+        return None
+
+    def evaluate(self, snapshot: FeatureSnapshot, position: Position | None = None) -> StrategySignal:
         """Evaluate a feature snapshot and return a deterministic signal."""
+
+        if position is not None and position.quantity > Decimal("0"):
+            exit_signal = self._exit_signal(snapshot, position)
+            if exit_signal is not None:
+                return exit_signal
+            return self._hold(snapshot.symbol, "POSITION_OPEN")
 
         if snapshot.ema_fast is None or snapshot.ema_slow is None:
             return self._hold(snapshot.symbol, "MISSING_EMA")

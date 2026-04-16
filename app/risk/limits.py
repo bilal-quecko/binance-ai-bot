@@ -62,12 +62,27 @@ class RiskEngine:
 
         if risk_input.mode != "paper":
             return self._reject("PAPER_ONLY")
-        if risk_input.signal.side != "BUY":
+        if risk_input.signal.side not in {"BUY", "SELL"}:
             return self._reject("NON_ACTIONABLE_SIGNAL")
         if risk_input.entry_price <= Decimal("0") or risk_input.requested_quantity <= Decimal("0"):
             return self._reject("INVALID_ORDER_REQUEST")
         if risk_input.day_start_equity <= Decimal("0") or risk_input.equity <= Decimal("0"):
             return self._reject("INVALID_EQUITY_CONTEXT")
+
+        if risk_input.signal.side == "SELL":
+            if risk_input.current_position_quantity <= Decimal("0"):
+                return self._reject("NO_POSITION_TO_EXIT")
+            if risk_input.requested_quantity > risk_input.current_position_quantity:
+                return RiskDecision(
+                    decision="resize",
+                    approved_quantity=risk_input.current_position_quantity,
+                    reason_codes=("RESIZED_TO_POSITION",),
+                )
+            return RiskDecision(
+                decision="approve",
+                approved_quantity=risk_input.requested_quantity,
+                reason_codes=("EXIT_APPROVED",),
+            )
 
         current_drawdown = max(-risk_input.daily_pnl, Decimal("0")) / risk_input.day_start_equity
         daily_loss_decision = check_daily_loss(current_drawdown, risk_input.max_daily_loss)

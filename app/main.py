@@ -50,9 +50,13 @@ def _sample_market_snapshots(iterations: int) -> list[MarketSnapshot]:
 
     base_time = datetime(2024, 3, 9, 16, 0, 0, tzinfo=UTC)
     snapshots: list[MarketSnapshot] = []
+    pivot = max(iterations // 2, 1)
 
     for index in range(iterations):
-        close_price = Decimal("100") + Decimal(index)
+        if index <= pivot:
+            close_price = Decimal("100") + Decimal(index)
+        else:
+            close_price = Decimal("100") + Decimal(pivot) - (Decimal(index - pivot) * Decimal("2"))
         open_time = base_time + timedelta(minutes=index)
         close_time = open_time + timedelta(minutes=1) - timedelta(milliseconds=1)
         candle = Candle(

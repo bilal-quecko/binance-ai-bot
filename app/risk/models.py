@@ -18,6 +18,7 @@ class RiskInput:
     day_start_equity: Decimal
     daily_pnl: Decimal
     open_positions: int
+    current_position_quantity: Decimal = Decimal("0")
     stop_price: Decimal | None = None
     volatility: Decimal | None = None
     risk_per_trade: Decimal = Decimal("0.005")
