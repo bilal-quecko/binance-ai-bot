@@ -7,5 +7,9 @@ from app.strategies.models import StrategySignal
 
 
 class Strategy(Protocol):
-    def evaluate(self, snapshot: FeatureSnapshot) -> StrategySignal | None:
+    """Typed strategy interface for deterministic signals."""
+
+    def evaluate(self, snapshot: FeatureSnapshot) -> StrategySignal:
+        """Return a deterministic strategy signal for the supplied feature snapshot."""
+
         ...
