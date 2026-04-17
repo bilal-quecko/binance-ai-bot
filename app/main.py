@@ -7,6 +7,7 @@ from decimal import Decimal
 
 from fastapi import FastAPI
 
+from app.api.dashboard_api import router as dashboard_router
 from app.config import get_settings
 from app.execution.execution_engine import ExecutionEngine
 from app.features.feature_store import FeatureEngine
@@ -14,11 +15,11 @@ from app.features.models import FeatureConfig
 from app.market_data.candles import Candle
 from app.market_data.models import MarketSnapshot
 from app.market_data.orderbook import TopOfBook
-from app.monitoring.health import HealthStatus
 from app.monitoring.logging import configure_logging
 from app.paper.broker import PaperBroker
 from app.risk.limits import RiskEngine
 from app.runner import RunnerConfig, StrategyRunner
+from app.storage import StorageRepository
 from app.strategies.models import TrendFollowingConfig
 from app.strategies.trend_following import TrendFollowingStrategy
 
@@ -31,18 +32,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Binance AI Bot", version="0.1.0", lifespan=lifespan)
-
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    """Basic health endpoint."""
-
-    settings = get_settings()
-    return HealthStatus(
-        name=settings.app_name,
-        status="ok",
-        mode=settings.app_mode,
-    ).to_dict()
+app.include_router(dashboard_router)
 
 
 def _sample_market_snapshots(iterations: int) -> list[MarketSnapshot]:
@@ -118,12 +108,14 @@ def run_paper_loop(iterations: int = 20) -> None:
     )
     strategy = TrendFollowingStrategy(TrendFollowingConfig())
     risk_engine = RiskEngine()
+    storage_repository = StorageRepository(settings.database_url)
     runner = StrategyRunner(
         feature_engine=feature_engine,
         strategy=strategy,
         risk_engine=risk_engine,
         execution_engine=execution_engine,
         broker=broker,
+        storage_repository=storage_repository,
         config=RunnerConfig(
             order_quantity=Decimal("1"),
             risk_per_trade=Decimal(str(settings.risk_per_trade)),
@@ -132,16 +124,19 @@ def run_paper_loop(iterations: int = 20) -> None:
         ),
     )
 
-    for result in runner.run(_sample_market_snapshots(iterations), iterations=iterations):
-        execution_status = result.execution_result.status if result.execution_result else "skipped"
-        print(
-            f"{result.feature_snapshot.timestamp.isoformat()} "
-            f"signal={result.signal.side} "
-            f"risk={result.risk_decision.decision if result.risk_decision else 'skipped'} "
-            f"execution={execution_status} "
-            f"position={result.current_position} "
-            f"pnl={result.current_pnl}"
-        )
+    try:
+        for result in runner.run(_sample_market_snapshots(iterations), iterations=iterations):
+            execution_status = result.execution_result.status if result.execution_result else "skipped"
+            print(
+                f"{result.feature_snapshot.timestamp.isoformat()} "
+                f"signal={result.signal.side} "
+                f"risk={result.risk_decision.decision if result.risk_decision else 'skipped'} "
+                f"execution={execution_status} "
+                f"position={result.current_position} "
+                f"pnl={result.current_pnl}"
+            )
+    finally:
+        storage_repository.close()
 
 
 def main() -> None:

@@ -1,5 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
+from uuid import uuid4
 
 from app.execution.execution_engine import ExecutionEngine
 from app.features.feature_store import FeatureEngine
@@ -10,11 +12,18 @@ from app.market_data.orderbook import TopOfBook
 from app.paper.broker import PaperBroker
 from app.risk.limits import RiskEngine
 from app.runner import RunnerConfig, StrategyRunner
+from app.storage import StorageRepository
 from app.strategies.models import TrendFollowingConfig
 from app.strategies.trend_following import TrendFollowingStrategy
 
 
 BASE_TIME = datetime(2024, 3, 9, 16, 0, 0, tzinfo=UTC)
+
+
+def _db_path() -> Path:
+    base = Path("tests/.tmp_storage")
+    base.mkdir(parents=True, exist_ok=True)
+    return (base / f"runner_{uuid4().hex}.sqlite").resolve()
 
 
 def build_snapshot(index: int, close_price: str) -> MarketSnapshot:
@@ -58,6 +67,8 @@ def build_snapshot(index: int, close_price: str) -> MarketSnapshot:
 
 def test_strategy_runner_completes_buy_hold_sell_cycle() -> None:
     broker = PaperBroker(initial_balances={"USDT": Decimal("1000")})
+    db_path = _db_path()
+    repository = StorageRepository(f"sqlite:///{db_path}")
     runner = StrategyRunner(
         feature_engine=FeatureEngine(
             FeatureConfig(
@@ -71,6 +82,7 @@ def test_strategy_runner_completes_buy_hold_sell_cycle() -> None:
         risk_engine=RiskEngine(),
         execution_engine=ExecutionEngine(broker),
         broker=broker,
+        storage_repository=repository,
         config=RunnerConfig(
             order_quantity=Decimal("1"),
             risk_per_trade=Decimal("0.01"),
@@ -108,3 +120,18 @@ def test_strategy_runner_completes_buy_hold_sell_cycle() -> None:
     assert sell_result.current_position is None
     assert sell_result.current_pnl == Decimal("-7.19700")
     assert broker.realized_pnl == Decimal("-7.19700")
+
+    repository.close()
+    reopened = StorageRepository(f"sqlite:///{db_path}")
+    try:
+        trade_history = reopened.get_trade_history()
+        daily_pnl = reopened.get_daily_pnl(BASE_TIME.date())
+        runner_events = reopened.get_runner_events()
+    finally:
+        reopened.close()
+
+    assert len(trade_history) == 2
+    assert trade_history[0].side == "BUY"
+    assert trade_history[1].side == "SELL"
+    assert daily_pnl == Decimal("-7.19700")
+    assert any(event.event_type == "signal_generated" for event in runner_events)

@@ -16,6 +16,7 @@ from app.paper.models import FillResult, OrderRequest, Position
 from app.risk.limits import RiskEngine
 from app.risk.models import RiskDecision, RiskInput
 from app.runner.models import RunnerConfig, RunnerCycleResult
+from app.storage.repositories import StorageRepository
 from app.strategies.models import StrategySignal
 from app.strategies.trend_following import TrendFollowingStrategy
 
@@ -33,6 +34,7 @@ class StrategyRunner:
         broker: PaperBroker,
         config: RunnerConfig | None = None,
         logger: logging.Logger | None = None,
+        storage_repository: StorageRepository | None = None,
     ) -> None:
         self._feature_engine = feature_engine
         self._strategy = strategy
@@ -41,6 +43,7 @@ class StrategyRunner:
         self._broker = broker
         self._config = config or RunnerConfig()
         self._logger = logger or logging.getLogger(__name__)
+        self._storage_repository = storage_repository
         self._candles_by_symbol: dict[str, list[Candle]] = {}
         self._top_of_book_by_symbol: dict[str, TopOfBook] = {}
         self._last_price_by_symbol: dict[str, Decimal] = {}
@@ -130,6 +133,27 @@ class StrategyRunner:
             mode=self._config.mode,
         )
 
+    def _persist_event(
+        self,
+        *,
+        event_type: str,
+        symbol: str,
+        message: str,
+        payload: dict[str, object],
+        event_time,
+    ) -> None:
+        """Persist a runner event when storage is configured."""
+
+        if self._storage_repository is None:
+            return
+        self._storage_repository.insert_event(
+            event_type=event_type,
+            symbol=symbol,
+            message=message,
+            payload=payload,
+            event_time=event_time,
+        )
+
     def process_snapshot(self, snapshot: MarketSnapshot) -> RunnerCycleResult:
         """Process one market snapshot through feature, strategy, risk, and execution."""
 
@@ -139,6 +163,13 @@ class StrategyRunner:
         existing_position = self._broker.get_position(symbol)
         signal = self._strategy.evaluate(feature_snapshot, position=existing_position)
         self._logger.info("signal generated | symbol=%s side=%s reasons=%s", symbol, signal.side, signal.reason_codes)
+        self._persist_event(
+            event_type="signal_generated",
+            symbol=symbol,
+            message=f"signal={signal.side}",
+            payload={"side": signal.side, "reason_codes": signal.reason_codes},
+            event_time=feature_snapshot.timestamp,
+        )
 
         risk_decision: RiskDecision | None = None
         execution_result: FillResult | None = None
@@ -151,6 +182,17 @@ class StrategyRunner:
                 risk_decision.decision,
                 risk_decision.approved_quantity,
                 risk_decision.reason_codes,
+            )
+            self._persist_event(
+                event_type="risk_decision",
+                symbol=symbol,
+                message=f"decision={risk_decision.decision}",
+                payload={
+                    "decision": risk_decision.decision,
+                    "approved_quantity": str(risk_decision.approved_quantity),
+                    "reason_codes": risk_decision.reason_codes,
+                },
+                event_time=feature_snapshot.timestamp,
             )
 
             order = OrderRequest(
@@ -171,18 +213,90 @@ class StrategyRunner:
                 execution_result.filled_quantity,
                 execution_result.reason_codes,
             )
+            self._persist_event(
+                event_type="execution_result",
+                symbol=symbol,
+                message=f"status={execution_result.status}",
+                payload={
+                    "status": execution_result.status,
+                    "side": signal.side,
+                    "filled_quantity": str(execution_result.filled_quantity),
+                    "reason_codes": execution_result.reason_codes,
+                },
+                event_time=feature_snapshot.timestamp,
+            )
+            if self._storage_repository is not None and risk_decision is not None:
+                self._storage_repository.insert_trade(
+                    fill_result=execution_result,
+                    risk_decision=risk_decision,
+                    approved_quantity=risk_decision.approved_quantity,
+                    event_time=feature_snapshot.timestamp,
+                )
+                if execution_result.status == "executed":
+                    self._storage_repository.insert_fill(execution_result, feature_snapshot.timestamp)
+                    self._persist_event(
+                        event_type="fill",
+                        symbol=symbol,
+                        message=f"fill_side={execution_result.side}",
+                        payload={
+                            "order_id": execution_result.order_id,
+                            "fill_price": str(execution_result.fill_price),
+                            "filled_quantity": str(execution_result.filled_quantity),
+                            "realized_pnl": str(execution_result.realized_pnl),
+                        },
+                        event_time=feature_snapshot.timestamp,
+                    )
         else:
             self._logger.info("risk decision | symbol=%s decision=skipped reasons=%s", symbol, ("NON_ACTIONABLE_SIGNAL",))
             self._logger.info("execution result | symbol=%s status=skipped", symbol)
+            self._persist_event(
+                event_type="risk_decision",
+                symbol=symbol,
+                message="decision=skipped",
+                payload={"decision": "skipped", "reason_codes": ("NON_ACTIONABLE_SIGNAL",)},
+                event_time=feature_snapshot.timestamp,
+            )
+            self._persist_event(
+                event_type="execution_result",
+                symbol=symbol,
+                message="status=skipped",
+                payload={"status": "skipped"},
+                event_time=feature_snapshot.timestamp,
+            )
 
         current_position = self._broker.get_position(symbol)
         current_pnl = self._current_pnl()
+        current_equity = self._current_equity()
         self._logger.info(
             "portfolio state | symbol=%s position=%s pnl=%s",
             symbol,
             current_position,
             current_pnl,
         )
+        if self._storage_repository is not None:
+            self._storage_repository.insert_position_snapshot(
+                current_position,
+                feature_snapshot.timestamp,
+                symbol,
+            )
+            self._storage_repository.insert_pnl_snapshot(
+                snapshot_time=feature_snapshot.timestamp,
+                equity=current_equity,
+                total_pnl=current_pnl,
+                realized_pnl=self._broker.realized_pnl,
+                cash_balance=self._broker.get_balance(self._config.quote_asset),
+            )
+            self._persist_event(
+                event_type="pnl_snapshot",
+                symbol=symbol,
+                message="portfolio_snapshot",
+                payload={
+                    "realized_pnl": str(self._broker.realized_pnl),
+                    "current_equity": str(current_equity),
+                    "current_pnl": str(current_pnl),
+                },
+                event_time=feature_snapshot.timestamp,
+            )
 
         return RunnerCycleResult(
             market_snapshot=snapshot,
