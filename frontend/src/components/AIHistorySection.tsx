@@ -2,7 +2,7 @@ import { TimeSeriesChart } from './TimeSeriesChart';
 import { StatePanel } from './StatePanel';
 import { badgeTone, classNames, formatDateTime } from '../lib/format';
 import { buildAiHistoryViewModel } from '../lib/ai-history.js';
-import type { AISignalSummary } from '../lib/types';
+import type { AISignalSummary, WorkstationDataState } from '../lib/types';
 
 interface AIHistorySectionProps {
   symbol: string;
@@ -10,6 +10,8 @@ interface AIHistorySectionProps {
   loading: boolean;
   refreshing: boolean;
   error: string | null;
+  dataState: WorkstationDataState;
+  statusMessage: string | null;
 }
 
 function biasTone(bias: AISignalSummary['bias']): string {
@@ -22,7 +24,7 @@ function biasTone(bias: AISignalSummary['bias']): string {
   return 'bg-amber-500/10 text-amber-300 ring-1 ring-amber-500/30';
 }
 
-export function AIHistorySection({ symbol, history, loading, refreshing, error }: AIHistorySectionProps) {
+export function AIHistorySection({ symbol, history, loading, refreshing, error, dataState, statusMessage }: AIHistorySectionProps) {
   const viewModel = buildAiHistoryViewModel(symbol, history);
 
   if (!symbol) {
@@ -47,7 +49,14 @@ export function AIHistorySection({ symbol, history, loading, refreshing, error }
     return (
       <StatePanel
         title="No AI history yet"
-        message="The selected symbol does not have persisted advisory snapshots yet. Start the live paper runtime and wait for closed candles to accumulate history."
+        message={
+          statusMessage
+          ?? (
+            dataState === 'waiting_for_runtime'
+              ? 'Start the live paper runtime for the selected symbol to generate advisory history.'
+              : 'The selected symbol does not have persisted advisory snapshots yet. Wait for closed candles to accumulate history.'
+          )
+        }
         tone="empty"
       />
     );
@@ -111,7 +120,7 @@ export function AIHistorySection({ symbol, history, loading, refreshing, error }
                   </span>
                   <span className="text-xs text-slate-500">{formatDateTime(item.timestamp)}</span>
                 </div>
-                <p className="mt-2 text-slate-400">{item.bias} bias • confidence {item.confidence}%</p>
+                <p className="mt-2 text-slate-400">{item.bias} bias ï¿½ confidence {item.confidence}%</p>
               </div>
             ))}
           </div>

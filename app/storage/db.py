@@ -1,7 +1,16 @@
 """SQLite storage helpers."""
 
+from __future__ import annotations
+
 from pathlib import Path
 import sqlite3
+
+
+AI_SIGNAL_FEATURE_SUMMARY_DEFAULT = (
+    '{"candle_count": 0, "close_price": "0", "microstructure_healthy": false, '
+    '"momentum": null, "spread_ratio": null, "volatility_pct": null, '
+    '"volume_change_pct": null, "volume_spike_ratio": null}'
+)
 
 
 SCHEMA_STATEMENTS = (
@@ -96,6 +105,30 @@ SCHEMA_STATEMENTS = (
     """,
 )
 
+OPTIONAL_TABLE_COLUMNS: dict[str, dict[str, str]] = {
+    "ai_signal_snapshots": {
+        "id": "INTEGER",
+        "symbol": "TEXT NOT NULL DEFAULT ''",
+        "snapshot_time": "TEXT NOT NULL DEFAULT ''",
+        "bias": "TEXT NOT NULL DEFAULT 'sideways'",
+        "confidence": "INTEGER NOT NULL DEFAULT 0",
+        "entry_signal": "INTEGER NOT NULL DEFAULT 0",
+        "exit_signal": "INTEGER NOT NULL DEFAULT 0",
+        "suggested_action": "TEXT NOT NULL DEFAULT 'wait'",
+        "explanation": "TEXT NOT NULL DEFAULT ''",
+        "feature_summary_json": f"TEXT NOT NULL DEFAULT '{AI_SIGNAL_FEATURE_SUMMARY_DEFAULT}'",
+    },
+    "market_candle_snapshots": {
+        "id": "INTEGER",
+        "symbol": "TEXT NOT NULL DEFAULT ''",
+        "timeframe": "TEXT NOT NULL DEFAULT '1m'",
+        "open_time": "TEXT NOT NULL DEFAULT ''",
+        "close_time": "TEXT NOT NULL DEFAULT ''",
+        "close_price": "TEXT NOT NULL DEFAULT '0'",
+        "event_time": "TEXT NOT NULL DEFAULT ''",
+    },
+}
+
 
 def resolve_sqlite_path(database_url: str) -> Path:
     """Resolve a sqlite database URL to a local filesystem path."""
@@ -124,3 +157,24 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     with connection:
         for statement in SCHEMA_STATEMENTS:
             connection.execute(statement)
+        _ensure_optional_table_columns(connection)
+
+
+def _ensure_optional_table_columns(connection: sqlite3.Connection) -> None:
+    """Add missing optional AI/evaluation columns for older local SQLite files."""
+
+    for table_name, column_definitions in OPTIONAL_TABLE_COLUMNS.items():
+        existing_columns = _get_existing_columns(connection, table_name)
+        for column_name, column_definition in column_definitions.items():
+            if column_name in existing_columns:
+                continue
+            connection.execute(
+                f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
+            )
+
+
+def _get_existing_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+    """Return the current column names for a SQLite table."""
+
+    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {str(row[1]) for row in rows}

@@ -118,6 +118,19 @@ class DashboardDataAccess:
 
         return self.repository.get_latest_pnl_snapshot()
 
+    def get_latest_equity_in_range(
+        self,
+        *,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> PnlSnapshotRecord | None:
+        """Return the latest persisted equity snapshot within an optional range."""
+
+        return self.repository.get_latest_pnl_snapshot(
+            start_date=start_date,
+            end_date=end_date,
+        )
+
     def get_daily_pnl(self, day: date | None) -> Decimal:
         """Return daily PnL for the requested UTC day."""
 
@@ -127,6 +140,19 @@ class DashboardDataAccess:
         """Return all persisted trades for aggregate calculations."""
 
         return self.repository.get_trade_history()
+
+    def get_trades(
+        self,
+        *,
+        symbol: str | None,
+        end_date: date | None,
+    ) -> list[TradeRecord]:
+        """Return trades needed for performance analytics calculations."""
+
+        return self.repository.get_trade_history(
+            symbol=symbol,
+            end_date=end_date,
+        )
 
     def get_all_positions(self) -> list[PositionSnapshotRecord]:
         """Return all open positions for symbol summaries."""

@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from app.api.dependencies import DashboardDataAccess, get_dashboard_data_access
 from app.config import Settings, get_settings
+from app.monitoring.metrics import build_performance_analytics
 from app.monitoring.health import HealthStatus
 from app.storage.models import (
     DailyPnlRecord,
@@ -239,6 +240,43 @@ class DrawdownResponse(BaseModel):
     max_drawdown: Decimal
     max_drawdown_pct: Decimal
     points: list[DrawdownPointResponse]
+
+
+class PerformanceQueryParams(BaseModel):
+    """Shared query parameters for symbol-scoped performance analytics."""
+
+    symbol: str | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+
+    @model_validator(mode="after")
+    def validate_date_range(self) -> "PerformanceQueryParams":
+        """Validate the requested performance-analytics filters."""
+
+        if self.start_date is not None and self.end_date is not None and self.end_date < self.start_date:
+            raise ValueError("end_date must be greater than or equal to start_date")
+        if self.symbol is not None:
+            self.symbol = self.symbol.upper()
+        return self
+
+
+class PerformanceAnalyticsResponse(BaseModel):
+    """Symbol/date-scoped paper-trading performance analytics."""
+
+    symbol: str | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    total_closed_trades: int
+    expectancy_per_closed_trade: Decimal | None = None
+    profit_factor: Decimal | None = None
+    average_hold_seconds: int | None = None
+    average_win: Decimal | None = None
+    average_loss: Decimal | None = None
+    session_realized_pnl: Decimal
+    session_unrealized_pnl: Decimal
+    symbol_realized_pnl: Decimal
+    max_drawdown: Decimal
+    current_drawdown: Decimal
 
 
 def _to_trade_response(record: TradeRecord) -> TradeResponse:
@@ -535,6 +573,47 @@ def get_metrics(
     trades = data_access.get_all_trades()
     latest_pnl = data_access.get_latest_equity()
     return _build_metrics(trades, latest_pnl)
+
+
+@router.get("/performance", response_model=PerformanceAnalyticsResponse)
+def get_performance_analytics(
+    query: Annotated[PerformanceQueryParams, Depends()],
+    data_access: Annotated[DashboardDataAccess, Depends(get_dashboard_data_access)],
+) -> PerformanceAnalyticsResponse:
+    """Return symbol/date-scoped paper-trading performance analytics."""
+
+    analytics = build_performance_analytics(
+        trades=data_access.get_trades(
+            symbol=query.symbol,
+            end_date=query.end_date,
+        ),
+        latest_pnl=data_access.get_latest_equity_in_range(
+            start_date=query.start_date,
+            end_date=query.end_date,
+        ),
+        drawdown=data_access.get_drawdown_summary(
+            start_date=query.start_date,
+            end_date=query.end_date,
+        ),
+        start_date=query.start_date,
+        end_date=query.end_date,
+    )
+    return PerformanceAnalyticsResponse(
+        symbol=query.symbol,
+        start_date=query.start_date,
+        end_date=query.end_date,
+        total_closed_trades=analytics.total_closed_trades,
+        expectancy_per_closed_trade=analytics.expectancy_per_closed_trade,
+        profit_factor=analytics.profit_factor,
+        average_hold_seconds=analytics.average_hold_seconds,
+        average_win=analytics.average_win,
+        average_loss=analytics.average_loss,
+        session_realized_pnl=analytics.session_realized_pnl,
+        session_unrealized_pnl=analytics.session_unrealized_pnl,
+        symbol_realized_pnl=analytics.symbol_realized_pnl,
+        max_drawdown=analytics.max_drawdown,
+        current_drawdown=analytics.current_drawdown,
+    )
 
 
 @router.get("/summary/symbols", response_model=list[SymbolSummaryResponse])

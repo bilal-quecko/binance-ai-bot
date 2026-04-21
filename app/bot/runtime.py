@@ -103,6 +103,21 @@ class PaperBotRuntime:
             last_error=self._status.last_error,
         )
 
+    def storage_degraded(self) -> bool:
+        """Return whether optional workstation storage is currently degraded."""
+
+        return bool(
+            self._storage_repository is not None
+            and self._storage_repository.optional_storage_degraded
+        )
+
+    def storage_status_message(self) -> str | None:
+        """Return the latest optional storage degradation message, if any."""
+
+        if self._storage_repository is None:
+            return None
+        return self._storage_repository.optional_storage_message
+
     def _reset_runtime_state(self) -> None:
         """Reset in-memory runtime state after stop/reset."""
 
@@ -130,7 +145,14 @@ class PaperBotRuntime:
             )
 
         feature_snapshot = self._runner.get_feature_snapshot(normalized_symbol)
-        ai_signal = self._persist_ai_signal_if_needed(normalized_symbol, feature_snapshot)
+        try:
+            ai_signal = self._persist_ai_signal_if_needed(normalized_symbol, feature_snapshot)
+        except Exception:
+            self._logger.exception(
+                "Failed to build or persist AI signal for workstation symbol %s.",
+                normalized_symbol,
+            )
+            ai_signal = None
 
         return WorkstationState(
             symbol=normalized_symbol,
@@ -175,21 +197,24 @@ class PaperBotRuntime:
         ai_signal = self._build_ai_signal(symbol, feature_snapshot)
         if ai_signal is None or self._storage_repository is None:
             return ai_signal
-        was_inserted = self._storage_repository.insert_ai_signal_snapshot(ai_signal)
-        if was_inserted:
-            self._storage_repository.insert_event(
-                event_type="ai_signal_snapshot",
-                symbol=symbol,
-                message=f"bias={ai_signal.bias} action={ai_signal.suggested_action}",
-                payload={
-                    "bias": ai_signal.bias,
-                    "confidence": ai_signal.confidence,
-                    "entry_signal": ai_signal.entry_signal,
-                    "exit_signal": ai_signal.exit_signal,
-                    "suggested_action": ai_signal.suggested_action,
-                },
-                event_time=ai_signal.feature_vector.timestamp,
-            )
+        try:
+            was_inserted = self._storage_repository.insert_ai_signal_snapshot(ai_signal)
+            if was_inserted:
+                self._storage_repository.insert_event(
+                    event_type="ai_signal_snapshot",
+                    symbol=symbol,
+                    message=f"bias={ai_signal.bias} action={ai_signal.suggested_action}",
+                    payload={
+                        "bias": ai_signal.bias,
+                        "confidence": ai_signal.confidence,
+                        "entry_signal": ai_signal.entry_signal,
+                        "exit_signal": ai_signal.exit_signal,
+                        "suggested_action": ai_signal.suggested_action,
+                    },
+                    event_time=ai_signal.feature_vector.timestamp,
+                )
+        except Exception:
+            self._logger.exception("Failed to persist AI signal snapshot for %s.", symbol)
         return ai_signal
 
     def _build_streams(self, symbol: str, timeframe: str) -> list[str]:

@@ -182,6 +182,7 @@ def test_dashboard_api_core_endpoints() -> None:
         pnl_history_response = client.get("/pnl/history")
         drawdown_response = client.get("/drawdown")
         metrics_response = client.get("/metrics")
+        performance_response = client.get("/performance", params={"symbol": "BTCUSDT"})
     finally:
         app.dependency_overrides.clear()
 
@@ -335,6 +336,24 @@ def test_dashboard_api_core_endpoints() -> None:
         "max_losing_streak": 1,
     }
 
+    assert performance_response.status_code == 200
+    assert performance_response.json() == {
+        "symbol": "BTCUSDT",
+        "start_date": None,
+        "end_date": None,
+        "total_closed_trades": 1,
+        "expectancy_per_closed_trade": "10",
+        "profit_factor": None,
+        "average_hold_seconds": 60,
+        "average_win": "10",
+        "average_loss": None,
+        "session_realized_pnl": "5",
+        "session_unrealized_pnl": "59",
+        "symbol_realized_pnl": "10",
+        "max_drawdown": "140",
+        "current_drawdown": "56",
+    }
+
 
 def test_dashboard_api_filtering_pagination_and_summary() -> None:
     db_path = _db_path()
@@ -353,6 +372,10 @@ def test_dashboard_api_filtering_pagination_and_summary() -> None:
         )
         events_response = client.get("/events", params={"symbol": "ETHUSDT", "limit": 1, "offset": 1})
         summary_response = client.get("/summary/symbols", params=[("symbols", "BTCUSDT"), ("symbols", "SOLUSDT")])
+        performance_response = client.get(
+            "/performance",
+            params={"symbol": "BTCUSDT", "start_date": "2024-03-09", "end_date": "2024-03-09"},
+        )
     finally:
         app.dependency_overrides.clear()
 
@@ -428,6 +451,24 @@ def test_dashboard_api_filtering_pagination_and_summary() -> None:
             "last_trade_time": None,
         },
     ]
+
+    assert performance_response.status_code == 200
+    assert performance_response.json() == {
+        "symbol": "BTCUSDT",
+        "start_date": "2024-03-09",
+        "end_date": "2024-03-09",
+        "total_closed_trades": 1,
+        "expectancy_per_closed_trade": "10",
+        "profit_factor": None,
+        "average_hold_seconds": 60,
+        "average_win": "10",
+        "average_loss": None,
+        "session_realized_pnl": "5",
+        "session_unrealized_pnl": "0",
+        "symbol_realized_pnl": "10",
+        "max_drawdown": "0",
+        "current_drawdown": "0",
+    }
 
 
 def test_dashboard_api_uses_dependency_backed_data_access() -> None:

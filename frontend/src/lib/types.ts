@@ -1,6 +1,7 @@
 ﻿export type DecimalString = string;
 export type RangePreset = '1D' | '7D' | '30D' | 'ALL';
 export type AutoRefreshIntervalSeconds = 0 | 5 | 10 | 30;
+export type WorkstationDataState = 'ready' | 'waiting_for_runtime' | 'waiting_for_history' | 'degraded_storage';
 
 export interface SpotSymbolItem {
   symbol: string;
@@ -78,6 +79,8 @@ export interface AISignalHistoryResponse {
   total: number;
   limit: number;
   offset: number;
+  data_state: WorkstationDataState;
+  status_message: string | null;
 }
 
 export interface AIOutcomeHorizonSummary {
@@ -114,6 +117,8 @@ export interface AIOutcomeEvaluationResponse {
   generated_at: string;
   horizons: AIOutcomeHorizonSummary[];
   recent_samples: AIOutcomeSampleSummary[];
+  data_state: WorkstationDataState;
+  status_message: string | null;
 }
 
 export interface SignalSummary {
@@ -140,6 +145,8 @@ export interface LastActionSummary {
 
 export interface WorkstationResponse {
   symbol: string;
+  data_state: WorkstationDataState;
+  status_message: string | null;
   is_runtime_symbol: boolean;
   runtime_status: BotStatusResponse;
   last_price: DecimalString | null;
@@ -173,6 +180,23 @@ export interface MetricsResponse {
   current_equity: DecimalString;
   max_winning_streak: number;
   max_losing_streak: number;
+}
+
+export interface PerformanceAnalyticsResponse {
+  symbol: string | null;
+  start_date: string | null;
+  end_date: string | null;
+  total_closed_trades: number;
+  expectancy_per_closed_trade: DecimalString | null;
+  profit_factor: DecimalString | null;
+  average_hold_seconds: number | null;
+  average_win: DecimalString | null;
+  average_loss: DecimalString | null;
+  session_realized_pnl: DecimalString;
+  session_unrealized_pnl: DecimalString;
+  symbol_realized_pnl: DecimalString;
+  max_drawdown: DecimalString;
+  current_drawdown: DecimalString;
 }
 
 export interface TradeItem {

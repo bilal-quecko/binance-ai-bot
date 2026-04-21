@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import sqlite3
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
@@ -29,6 +31,9 @@ from app.storage.models import (
 )
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 def _decimal(value: Any) -> Decimal:
     """Convert a stored numeric value into Decimal."""
 
@@ -45,20 +50,38 @@ def _parse_reason_codes(value: str) -> tuple[str, ...]:
 def _parse_ai_feature_summary(value: str) -> AISignalFeatureSummaryRecord:
     """Parse a compact persisted AI feature summary."""
 
-    raw = json.loads(value)
+    try:
+        raw = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return _empty_ai_feature_summary()
     return AISignalFeatureSummaryRecord(
-        candle_count=int(raw["candle_count"]),
-        close_price=_decimal(raw["close_price"]),
-        volatility_pct=_decimal(raw["volatility_pct"]) if raw["volatility_pct"] is not None else None,
-        momentum=_decimal(raw["momentum"]) if raw["momentum"] is not None else None,
+        candle_count=int(raw.get("candle_count", 0)),
+        close_price=_decimal(raw.get("close_price", "0")),
+        volatility_pct=_decimal(raw["volatility_pct"]) if raw.get("volatility_pct") is not None else None,
+        momentum=_decimal(raw["momentum"]) if raw.get("momentum") is not None else None,
         volume_change_pct=(
-            _decimal(raw["volume_change_pct"]) if raw["volume_change_pct"] is not None else None
+            _decimal(raw["volume_change_pct"]) if raw.get("volume_change_pct") is not None else None
         ),
         volume_spike_ratio=(
-            _decimal(raw["volume_spike_ratio"]) if raw["volume_spike_ratio"] is not None else None
+            _decimal(raw["volume_spike_ratio"]) if raw.get("volume_spike_ratio") is not None else None
         ),
-        spread_ratio=_decimal(raw["spread_ratio"]) if raw["spread_ratio"] is not None else None,
-        microstructure_healthy=bool(raw["microstructure_healthy"]),
+        spread_ratio=_decimal(raw["spread_ratio"]) if raw.get("spread_ratio") is not None else None,
+        microstructure_healthy=bool(raw.get("microstructure_healthy", False)),
+    )
+
+
+def _empty_ai_feature_summary() -> AISignalFeatureSummaryRecord:
+    """Return a neutral compact AI feature summary."""
+
+    return AISignalFeatureSummaryRecord(
+        candle_count=0,
+        close_price=Decimal("0"),
+        volatility_pct=None,
+        momentum=None,
+        volume_change_pct=None,
+        volume_spike_ratio=None,
+        spread_ratio=None,
+        microstructure_healthy=False,
     )
 
 
@@ -122,106 +145,166 @@ def _drawdown_pct(drawdown: Decimal, peak_equity: Decimal) -> Decimal:
     return drawdown / peak_equity
 
 
+def _is_optional_schema_error(error: sqlite3.Error) -> bool:
+    """Return whether a SQLite error points to missing optional AI/evaluation schema."""
+
+    message = str(error).lower()
+    return (
+        "no such table" in message
+        or "no such column" in message
+        or "has no column named" in message
+    )
+
+
 class StorageRepository:
     """Paper-mode SQLite repository."""
 
     def __init__(self, database_url: str) -> None:
         self._connection = create_db_connection(database_url)
+        self._optional_storage_degraded = False
+        self._optional_storage_message: str | None = None
 
     def close(self) -> None:
         """Close the underlying SQLite connection."""
 
         self._connection.close()
 
+    @property
+    def optional_storage_degraded(self) -> bool:
+        """Return whether optional AI/evaluation storage access has degraded."""
+
+        return self._optional_storage_degraded
+
+    @property
+    def optional_storage_message(self) -> str | None:
+        """Return the latest optional storage degradation message, if any."""
+
+        return self._optional_storage_message
+
+    def _mark_optional_storage_degraded(self, message: str) -> None:
+        """Record that optional AI/evaluation storage access degraded."""
+
+        self._optional_storage_degraded = True
+        self._optional_storage_message = message
+
     def clear_all(self) -> None:
         """Delete all persisted paper-session rows."""
 
         with self._connection:
-            self._connection.execute("DELETE FROM trades")
-            self._connection.execute("DELETE FROM fills")
-            self._connection.execute("DELETE FROM positions_snapshots")
-            self._connection.execute("DELETE FROM pnl_snapshots")
-            self._connection.execute("DELETE FROM runner_events")
-            self._connection.execute("DELETE FROM ai_signal_snapshots")
-            self._connection.execute("DELETE FROM market_candle_snapshots")
+            for table_name in (
+                "trades",
+                "fills",
+                "positions_snapshots",
+                "pnl_snapshots",
+                "runner_events",
+                "ai_signal_snapshots",
+                "market_candle_snapshots",
+            ):
+                try:
+                    self._connection.execute(f"DELETE FROM {table_name}")
+                except sqlite3.OperationalError as exc:
+                    if not _is_optional_schema_error(exc):
+                        raise
+                    self._mark_optional_storage_degraded(f"Optional storage table {table_name} is unavailable.")
+                    LOGGER.warning("Skipping clear for missing table %s: %s", table_name, exc)
 
     def insert_market_candle_snapshot(self, candle: Candle) -> None:
         """Persist a closed candle for later AI outcome validation."""
 
         if not candle.is_closed:
             return
-        with self._connection:
-            self._connection.execute(
-                """
-                INSERT OR REPLACE INTO market_candle_snapshots (
-                    symbol, timeframe, open_time, close_time, close_price, event_time
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    candle.symbol.upper(),
-                    candle.timeframe,
-                    candle.open_time.isoformat(),
-                    candle.close_time.isoformat(),
-                    str(candle.close),
-                    candle.event_time.isoformat(),
-                ),
-            )
+        try:
+            with self._connection:
+                self._connection.execute(
+                    """
+                    INSERT OR REPLACE INTO market_candle_snapshots (
+                        symbol, timeframe, open_time, close_time, close_price, event_time
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        candle.symbol.upper(),
+                        candle.timeframe,
+                        candle.open_time.isoformat(),
+                        candle.close_time.isoformat(),
+                        str(candle.close),
+                        candle.event_time.isoformat(),
+                    ),
+                )
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Closed-candle outcome storage is unavailable.")
+            LOGGER.warning("Skipping market candle snapshot persistence due to schema issue: %s", exc)
 
     def insert_ai_signal_snapshot(self, snapshot: AISignalSnapshot) -> bool:
         """Persist an AI advisory snapshot when it materially changed."""
 
-        latest_snapshot = self.get_latest_ai_signal(snapshot.symbol)
-        next_feature_summary = _parse_ai_feature_summary(_serialize_ai_feature_summary(snapshot))
-        next_snapshot = AISignalSnapshotRecord(
-            symbol=snapshot.symbol.upper(),
-            timestamp=snapshot.feature_vector.timestamp,
-            bias=snapshot.bias,
-            confidence=snapshot.confidence,
-            entry_signal=snapshot.entry_signal,
-            exit_signal=snapshot.exit_signal,
-            suggested_action=snapshot.suggested_action,
-            explanation=snapshot.explanation,
-            feature_summary=next_feature_summary,
-        )
-        if latest_snapshot is not None and not _ai_signal_materially_changed(latest_snapshot, next_snapshot):
-            return False
-
         with self._connection:
-            self._connection.execute(
-                """
-                INSERT INTO ai_signal_snapshots (
-                    symbol, snapshot_time, bias, confidence, entry_signal, exit_signal,
-                    suggested_action, explanation, feature_summary_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    next_snapshot.symbol,
-                    next_snapshot.timestamp.isoformat(),
-                    next_snapshot.bias,
-                    next_snapshot.confidence,
-                    int(next_snapshot.entry_signal),
-                    int(next_snapshot.exit_signal),
-                    next_snapshot.suggested_action,
-                    next_snapshot.explanation,
-                    _serialize_ai_feature_summary(snapshot),
-                ),
-            )
+            try:
+                latest_snapshot = self.get_latest_ai_signal(snapshot.symbol)
+                next_feature_summary = _parse_ai_feature_summary(_serialize_ai_feature_summary(snapshot))
+                next_snapshot = AISignalSnapshotRecord(
+                    symbol=snapshot.symbol.upper(),
+                    timestamp=snapshot.feature_vector.timestamp,
+                    bias=snapshot.bias,
+                    confidence=snapshot.confidence,
+                    entry_signal=snapshot.entry_signal,
+                    exit_signal=snapshot.exit_signal,
+                    suggested_action=snapshot.suggested_action,
+                    explanation=snapshot.explanation,
+                    feature_summary=next_feature_summary,
+                )
+                if latest_snapshot is not None and not _ai_signal_materially_changed(latest_snapshot, next_snapshot):
+                    return False
+
+                self._connection.execute(
+                    """
+                    INSERT INTO ai_signal_snapshots (
+                        symbol, snapshot_time, bias, confidence, entry_signal, exit_signal,
+                        suggested_action, explanation, feature_summary_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        next_snapshot.symbol,
+                        next_snapshot.timestamp.isoformat(),
+                        next_snapshot.bias,
+                        next_snapshot.confidence,
+                        int(next_snapshot.entry_signal),
+                        int(next_snapshot.exit_signal),
+                        next_snapshot.suggested_action,
+                        next_snapshot.explanation,
+                        _serialize_ai_feature_summary(snapshot),
+                    ),
+                )
+            except sqlite3.OperationalError as exc:
+                if not _is_optional_schema_error(exc):
+                    raise
+                self._mark_optional_storage_degraded("AI advisory snapshot storage is unavailable.")
+                LOGGER.warning("Skipping AI signal snapshot persistence due to schema issue: %s", exc)
+                return False
         return True
 
     def get_latest_ai_signal(self, symbol: str) -> AISignalSnapshotRecord | None:
         """Return the latest persisted AI advisory snapshot for a symbol."""
 
-        row = self._connection.execute(
-            """
-            SELECT symbol, snapshot_time, bias, confidence, entry_signal, exit_signal,
-                   suggested_action, explanation, feature_summary_json
-            FROM ai_signal_snapshots
-            WHERE symbol = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (symbol.upper(),),
-        ).fetchone()
+        try:
+            row = self._connection.execute(
+                """
+                SELECT symbol, snapshot_time, bias, confidence, entry_signal, exit_signal,
+                       suggested_action, explanation, feature_summary_json
+                FROM ai_signal_snapshots
+                WHERE symbol = ?
+                ORDER BY snapshot_time DESC
+                LIMIT 1
+                """,
+                (symbol.upper(),),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("AI advisory snapshot storage is unavailable.")
+            LOGGER.warning("Failed to read latest AI signal due to schema issue: %s", exc)
+            return None
         if row is None:
             return None
         return AISignalSnapshotRecord(
@@ -261,11 +344,18 @@ class StorageRepository:
             end_date=end_date,
             timestamp_column="snapshot_time",
         )
-        query += " ORDER BY id DESC"
+        query += " ORDER BY snapshot_time DESC"
         if limit is not None:
             query += " LIMIT ? OFFSET ?"
             params.extend((limit, offset))
-        rows = self._connection.execute(query, tuple(params)).fetchall()
+        try:
+            rows = self._connection.execute(query, tuple(params)).fetchall()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("AI advisory history storage is unavailable.")
+            LOGGER.warning("Failed to read AI signal history due to schema issue: %s", exc)
+            return []
         return [
             AISignalSnapshotRecord(
                 symbol=row["symbol"],
@@ -303,7 +393,14 @@ class StorageRepository:
             end_date=end_date,
             timestamp_column="snapshot_time",
         )
-        row = self._connection.execute(query, tuple(params)).fetchone()
+        try:
+            row = self._connection.execute(query, tuple(params)).fetchone()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("AI advisory history storage is unavailable.")
+            LOGGER.warning("Failed to count AI signal history due to schema issue: %s", exc)
+            return 0
         return int(row["row_count"]) if row is not None else 0
 
     def get_market_candle_history(
@@ -333,7 +430,14 @@ class StorageRepository:
             timestamp_column="close_time",
         )
         query += " ORDER BY close_time ASC"
-        rows = self._connection.execute(query, tuple(params)).fetchall()
+        try:
+            rows = self._connection.execute(query, tuple(params)).fetchall()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Closed-candle outcome storage is unavailable.")
+            LOGGER.warning("Failed to read market candle history due to schema issue: %s", exc)
+            return []
         return [
             MarketCandleSnapshotRecord(
                 symbol=row["symbol"],
@@ -777,17 +881,29 @@ class StorageRepository:
             points=points,
         )
 
-    def get_latest_pnl_snapshot(self) -> PnlSnapshotRecord | None:
-        """Return the latest persisted PnL snapshot."""
+    def get_latest_pnl_snapshot(
+        self,
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> PnlSnapshotRecord | None:
+        """Return the latest persisted PnL snapshot within an optional date range."""
 
-        rows = self._connection.execute(
-            """
+        query = """
             SELECT snapshot_time, equity, total_pnl, realized_pnl, cash_balance
             FROM pnl_snapshots
-            ORDER BY id DESC
-            LIMIT 1
-            """
-        ).fetchall()
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        query, params = self._apply_date_filters(
+            query=query,
+            params=params,
+            start_date=start_date,
+            end_date=end_date,
+            timestamp_column="snapshot_time",
+        )
+        query += " ORDER BY id DESC LIMIT 1"
+        rows = self._connection.execute(query, tuple(params)).fetchall()
         if not rows:
             return None
 

@@ -4,7 +4,9 @@ import { AIEvaluationCard } from './components/AIEvaluationCard';
 import { AIHistorySection } from './components/AIHistorySection';
 import { AutoRefreshSelector } from './components/AutoRefreshSelector';
 import { BotControlPanel } from './components/BotControlPanel';
+import { DataStateIndicator } from './components/DataStateIndicator';
 import { MetricCard } from './components/MetricCard';
+import { PerformanceAnalyticsSection } from './components/PerformanceAnalyticsSection';
 import { SectionCard } from './components/SectionCard';
 import { StatePanel } from './components/StatePanel';
 import {
@@ -13,6 +15,7 @@ import {
   getAISignalHistory,
   getBotStatus,
   getHealth,
+  getPerformanceAnalytics,
   getSymbols,
   getWorkstation,
   pauseBot,
@@ -29,6 +32,7 @@ import type {
   AutoRefreshIntervalSeconds,
   BotStatusResponse,
   HealthResponse,
+  PerformanceAnalyticsResponse,
   SpotSymbolItem,
   WorkstationResponse,
 } from './lib/types';
@@ -59,8 +63,11 @@ const INITIAL_AI_HISTORY: AISignalHistoryResponse = {
   total: 0,
   limit: 20,
   offset: 0,
+  data_state: 'waiting_for_runtime',
+  status_message: 'Start the live runtime for the selected symbol to generate advisory history.',
 };
 const INITIAL_AI_EVALUATION: AIOutcomeEvaluationResponse | null = null;
+const INITIAL_PERFORMANCE: PerformanceAnalyticsResponse | null = null;
 
 function createRemoteState<T>(data: T): RemoteState<T> {
   return {
@@ -102,6 +109,7 @@ function App() {
   const [aiSignal, setAiSignal] = useState<RemoteState<AISignalSummary | null>>(createRemoteState(INITIAL_AI_SIGNAL));
   const [aiHistory, setAiHistory] = useState<RemoteState<AISignalHistoryResponse>>(createRemoteState(INITIAL_AI_HISTORY));
   const [aiEvaluation, setAiEvaluation] = useState<RemoteState<AIOutcomeEvaluationResponse | null>>(createRemoteState(INITIAL_AI_EVALUATION));
+  const [performanceAnalytics, setPerformanceAnalytics] = useState<RemoteState<PerformanceAnalyticsResponse | null>>(createRemoteState(INITIAL_PERFORMANCE));
   const [symbolResults, setSymbolResults] = useState<RemoteState<SpotSymbolItem[]>>(createRemoteState<SpotSymbolItem[]>([]));
 
   const [selectedSymbol, setSelectedSymbol] = useState('');
@@ -128,15 +136,17 @@ function App() {
       setAiSignal((current) => setPending(current));
       setAiHistory((current) => setPending(current));
       setAiEvaluation((current) => setPending(current));
+      setPerformanceAnalytics((current) => setPending(current));
     } else {
       setWorkstation({ data: null, loading: false, refreshing: false, error: null });
       setAiSignal({ data: null, loading: false, refreshing: false, error: null });
       setAiHistory({ data: INITIAL_AI_HISTORY, loading: false, refreshing: false, error: null });
       setAiEvaluation({ data: null, loading: false, refreshing: false, error: null });
+      setPerformanceAnalytics({ data: null, loading: false, refreshing: false, error: null });
     }
 
     try {
-      const [healthData, botStatusData, workstationData, aiSignalData, aiHistoryData, aiEvaluationData] = await Promise.all([
+      const [healthData, botStatusData, workstationData, aiSignalData, aiHistoryData, aiEvaluationData, performanceData] = await Promise.all([
         getHealth(),
         getBotStatus(),
         symbol.trim().length > 0 ? getWorkstation(symbol) : Promise.resolve<WorkstationResponse | null>(null),
@@ -145,6 +155,7 @@ function App() {
           ? getAISignalHistory(symbol, { limit: INITIAL_AI_HISTORY.limit, offset: 0 })
           : Promise.resolve<AISignalHistoryResponse>(INITIAL_AI_HISTORY),
         symbol.trim().length > 0 ? getAISignalEvaluation(symbol) : Promise.resolve<AIOutcomeEvaluationResponse | null>(null),
+        symbol.trim().length > 0 ? getPerformanceAnalytics(symbol) : Promise.resolve<PerformanceAnalyticsResponse | null>(null),
       ]);
       setHealth({ data: healthData, loading: false, refreshing: false, error: null });
       setBotStatus({ data: botStatusData, loading: false, refreshing: false, error: null });
@@ -152,6 +163,7 @@ function App() {
       setAiSignal({ data: aiSignalData, loading: false, refreshing: false, error: null });
       setAiHistory({ data: aiHistoryData, loading: false, refreshing: false, error: null });
       setAiEvaluation({ data: aiEvaluationData, loading: false, refreshing: false, error: null });
+      setPerformanceAnalytics({ data: performanceData, loading: false, refreshing: false, error: null });
       setLastUpdatedAt(new Date());
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to refresh workstation state.';
@@ -162,6 +174,7 @@ function App() {
         setAiSignal((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setAiHistory((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setAiEvaluation((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setPerformanceAnalytics((current) => ({ ...current, loading: false, refreshing: false, error: message }));
       }
     }
   }, []);
@@ -206,6 +219,7 @@ function App() {
     setAiSignal({ data: null, loading: false, refreshing: false, error: null });
     setAiHistory({ data: INITIAL_AI_HISTORY, loading: false, refreshing: false, error: null });
     setAiEvaluation({ data: null, loading: false, refreshing: false, error: null });
+    setPerformanceAnalytics({ data: null, loading: false, refreshing: false, error: null });
   }, []);
 
   const runBotAction = useCallback(async (action: () => Promise<BotStatusResponse>) => {
@@ -237,6 +251,7 @@ function App() {
       setAiSignal({ data: null, loading: false, refreshing: false, error: null });
       setAiHistory({ data: INITIAL_AI_HISTORY, loading: false, refreshing: false, error: null });
       setAiEvaluation({ data: null, loading: false, refreshing: false, error: null });
+      setPerformanceAnalytics({ data: null, loading: false, refreshing: false, error: null });
       setLastUpdatedAt(new Date());
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to reset the paper session.';
@@ -260,6 +275,8 @@ function App() {
   }, [aiSignal.data, selectedSymbol]);
 
   const trendLabel = effectiveWorkstation?.trend_bias ?? 'Waiting for live data';
+  const workstationDataState = effectiveWorkstation?.data_state ?? 'waiting_for_runtime';
+  const workstationStatusMessage = effectiveWorkstation?.status_message ?? (selectedSymbol ? `Start or attach the live runtime for ${selectedSymbol} to populate symbol-scoped workstation data.` : 'Select one symbol to populate the workstation.');
   const signalExplanation = effectiveWorkstation?.explanation ?? 'Select a symbol, then start or pause the live paper runtime to populate live signal state.';
   const refreshLabel = autoRefreshSeconds === 0 ? 'Off' : `${autoRefreshSeconds}s`;
 
@@ -360,6 +377,8 @@ function App() {
                 <StatePanel title="No symbol selected" message="Pick a symbol to load live signal state." tone="empty" />
               ) : (
                 <div className="space-y-5">
+                  <DataStateIndicator dataState={workstationDataState} message={workstationStatusMessage} />
+
                   {effectiveWorkstation === null || effectiveWorkstation.is_runtime_symbol === false ? (
                     <StatePanel
                       title="Live signal idle"
@@ -477,6 +496,8 @@ function App() {
                       loading={aiHistory.loading}
                       refreshing={aiHistory.refreshing}
                       error={aiHistory.error}
+                      dataState={aiHistory.data.data_state}
+                      statusMessage={aiHistory.data.status_message}
                     />
                   </div>
 
@@ -487,6 +508,8 @@ function App() {
                       loading={aiEvaluation.loading}
                       refreshing={aiEvaluation.refreshing}
                       error={aiEvaluation.error}
+                      dataState={aiEvaluation.data?.data_state ?? workstationDataState}
+                      statusMessage={aiEvaluation.data?.status_message ?? workstationStatusMessage}
                     />
                   </div>
                 </div>
@@ -517,6 +540,7 @@ function App() {
                 <StatePanel title="No symbol selected" message="Pick a symbol first, then use the controls above." tone="empty" />
               ) : (
                 <div className="space-y-5">
+                  <DataStateIndicator dataState={workstationDataState} message={workstationStatusMessage} />
                   <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
                     <MetricCard label="Runtime Status" value={botStatus.data.state} helper={`Paper only - ${selectedSymbol}`} />
                     <MetricCard label="Last Action" value={effectiveWorkstation?.last_action?.signal_side ?? 'Waiting'} helper={formatDateTime(effectiveWorkstation?.last_action?.event_time ?? null)} />
@@ -563,6 +587,16 @@ function App() {
                     <p className="mt-3 text-sm leading-6 text-slate-300">
                       Start begins live market-data ingestion and paper decisioning for the selected symbol. Pause keeps the runtime connected but stops automatic trading decisions, which gives you a signal-only monitoring mode. Reset Session clears persisted paper-session history so stale data does not mix with the next run.
                     </p>
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <PerformanceAnalyticsSection
+                      symbol={selectedSymbol}
+                      analytics={performanceAnalytics.data}
+                      loading={performanceAnalytics.loading}
+                      refreshing={performanceAnalytics.refreshing}
+                      error={performanceAnalytics.error}
+                    />
                   </div>
                 </div>
               )}

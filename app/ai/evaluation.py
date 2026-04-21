@@ -6,10 +6,12 @@ from bisect import bisect_left
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from app.storage.models import AISignalSnapshotRecord, MarketCandleSnapshotRecord
-from app.storage.repositories import StorageRepository
+
+if TYPE_CHECKING:
+    from app.storage.repositories import StorageRepository
 
 
 ObservedDirection = Literal["bullish", "bearish", "sideways", "unknown"]

@@ -1,7 +1,7 @@
 import { MetricCard } from './MetricCard';
 import { StatePanel } from './StatePanel';
 import { badgeTone, classNames, formatDateTime, formatDecimal, formatPercent } from '../lib/format';
-import type { AIOutcomeEvaluationResponse } from '../lib/types';
+import type { AIOutcomeEvaluationResponse, WorkstationDataState } from '../lib/types';
 
 interface AIEvaluationCardProps {
   symbol: string;
@@ -9,9 +9,11 @@ interface AIEvaluationCardProps {
   loading: boolean;
   refreshing: boolean;
   error: string | null;
+  dataState: WorkstationDataState;
+  statusMessage: string | null;
 }
 
-export function AIEvaluationCard({ symbol, evaluation, loading, refreshing, error }: AIEvaluationCardProps) {
+export function AIEvaluationCard({ symbol, evaluation, loading, refreshing, error, dataState, statusMessage }: AIEvaluationCardProps) {
   if (!symbol) {
     return <StatePanel title="No symbol selected" message="Select a symbol to load AI outcome validation." tone="empty" />;
   }
@@ -22,7 +24,7 @@ export function AIEvaluationCard({ symbol, evaluation, loading, refreshing, erro
     return <StatePanel title="Loading AI evaluation" message="Computing directional outcome metrics for the selected symbol." tone="loading" />;
   }
   if (!evaluation || evaluation.horizons.every((item) => item.sample_size === 0)) {
-    return <StatePanel title="No AI outcome data yet" message="Outcome validation appears after persisted AI snapshots have enough later candle data for 5m, 15m, or 1h comparisons." tone="empty" />;
+    return <StatePanel title="No AI outcome data yet" message={statusMessage ?? (dataState === 'waiting_for_runtime' ? 'Start the live paper runtime for the selected symbol to accumulate evaluable AI outcomes.' : 'Outcome validation appears after persisted AI snapshots have enough later candle data for 5m, 15m, or 1h comparisons.')} tone="empty" />;
   }
 
   return (

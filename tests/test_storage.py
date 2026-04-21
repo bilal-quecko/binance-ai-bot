@@ -64,7 +64,7 @@ def test_storage_repository_creates_required_tables() -> None:
     repository = StorageRepository(f"sqlite:///{db_path}")
     repository.close()
 
-    connection = sqlite3.connect(db_path)
+    connection = sqlite3.connect(str(db_path))
     try:
         rows = connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
@@ -266,3 +266,52 @@ def test_storage_repository_filters_ai_signal_history_by_symbol() -> None:
     assert len(eth_history) == 1
     assert eth_history[0].symbol == "ETHUSDT"
     assert eth_history[0].suggested_action == "exit"
+
+
+def test_storage_repository_adds_missing_optional_ai_columns_for_old_sqlite_files() -> None:
+    db_path = _db_path("legacy_optional_schema")
+    repository = StorageRepository(f"sqlite:///{db_path}")
+    try:
+        repository._connection.execute("DROP TABLE ai_signal_snapshots")
+        repository._connection.execute("DROP TABLE market_candle_snapshots")
+        repository._connection.execute(
+            """
+            CREATE TABLE ai_signal_snapshots (
+                symbol TEXT NOT NULL,
+                snapshot_time TEXT NOT NULL,
+                bias TEXT NOT NULL,
+                confidence INTEGER NOT NULL,
+                entry_signal INTEGER NOT NULL,
+                exit_signal INTEGER NOT NULL,
+                suggested_action TEXT NOT NULL,
+                explanation TEXT NOT NULL
+            )
+            """
+        )
+        repository._connection.execute(
+            """
+            CREATE TABLE market_candle_snapshots (
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                open_time TEXT NOT NULL,
+                close_price TEXT NOT NULL
+            )
+            """
+        )
+        repository._connection.commit()
+    finally:
+        repository.close()
+
+    repository = StorageRepository(f"sqlite:///{db_path}")
+    try:
+        repository.insert_ai_signal_snapshot(
+            _ai_snapshot(symbol="BTCUSDT", timestamp=datetime(2024, 3, 9, 16, 0, 0, tzinfo=UTC))
+        )
+        history = repository.get_ai_signal_history(symbol="BTCUSDT", limit=10, offset=0)
+        candle_history = repository.get_market_candle_history(symbol="BTCUSDT")
+    finally:
+        repository.close()
+
+    assert len(history) == 1
+    assert history[0].feature_summary.candle_count == 5
+    assert candle_history == []

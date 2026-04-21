@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Annotated
+import logging
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -16,6 +17,9 @@ from app.exchange.symbol_service import SpotSymbolRecord, SpotSymbolService
 from app.storage import StorageRepository
 
 router = APIRouter()
+LOGGER = logging.getLogger(__name__)
+
+DataState = Literal["ready", "waiting_for_runtime", "waiting_for_history", "degraded_storage"]
 
 
 class SymbolResponse(BaseModel):
@@ -144,6 +148,8 @@ class AISignalHistoryResponse(BaseModel):
     total: int
     limit: int
     offset: int
+    data_state: DataState
+    status_message: str | None = None
 
 
 class AIOutcomeSummaryResponse(BaseModel):
@@ -186,12 +192,16 @@ class AIOutcomeEvaluationResponse(BaseModel):
     generated_at: datetime
     horizons: list[AIOutcomeSummaryResponse]
     recent_samples: list[AIOutcomeSampleResponse]
+    data_state: DataState
+    status_message: str | None = None
 
 
 class WorkstationResponse(BaseModel):
     """Symbol-scoped workstation payload."""
 
     symbol: str
+    data_state: DataState
+    status_message: str | None = None
     is_runtime_symbol: bool
     runtime_status: BotStatusResponse
     last_price: Decimal | None = None
@@ -208,6 +218,184 @@ class WorkstationResponse(BaseModel):
     last_market_event: datetime | None = None
     total_pnl: Decimal = Decimal("0")
     realized_pnl: Decimal = Decimal("0")
+
+
+def _empty_workstation_state(symbol: str) -> WorkstationState:
+    """Return a neutral workstation state for an uninitialized symbol."""
+
+    return WorkstationState(
+        symbol=symbol,
+        is_runtime_symbol=False,
+        market_snapshot=None,
+        feature_snapshot=None,
+        ai_signal=None,
+        entry_signal=None,
+        exit_signal=None,
+        current_position=None,
+        last_cycle_result=None,
+        total_pnl=Decimal("0"),
+        realized_pnl=Decimal("0"),
+    )
+
+
+def _safe_workstation_state(
+    runtime: PaperBotRuntime,
+    symbol: str,
+) -> tuple[WorkstationState, bool, str | None]:
+    """Return workstation state without allowing runtime errors to escape the API."""
+
+    try:
+        return runtime.workstation_state(symbol), False, None
+    except Exception:
+        LOGGER.exception("Failed to build workstation state for symbol %s.", symbol)
+        return (
+            _empty_workstation_state(symbol),
+            True,
+            "Optional workstation state is temporarily degraded.",
+        )
+
+
+def _empty_ai_signal_history_response(
+    limit: int,
+    offset: int,
+    *,
+    data_state: DataState,
+    status_message: str | None,
+) -> AISignalHistoryResponse:
+    """Return a typed empty AI history response."""
+
+    return AISignalHistoryResponse(
+        items=[],
+        total=0,
+        limit=limit,
+        offset=offset,
+        data_state=data_state,
+        status_message=status_message,
+    )
+
+
+def _empty_ai_outcome_evaluation_response(
+    symbol: str,
+    *,
+    data_state: DataState,
+    status_message: str | None,
+) -> AIOutcomeEvaluationResponse:
+    """Return a typed empty AI outcome evaluation payload."""
+
+    return AIOutcomeEvaluationResponse(
+        symbol=symbol,
+        generated_at=datetime.now(tz=UTC),
+        horizons=[
+            AIOutcomeSummaryResponse(
+                horizon=horizon,
+                sample_size=0,
+                directional_accuracy_pct=Decimal("0"),
+                confidence_calibration_pct=Decimal("0"),
+                false_positive_count=0,
+                false_positive_rate_pct=Decimal("0"),
+                false_reversal_count=0,
+                false_reversal_rate_pct=Decimal("0"),
+            )
+            for horizon in ("5m", "15m", "1h")
+        ],
+        recent_samples=[],
+        data_state=data_state,
+        status_message=status_message,
+    )
+
+
+def _runtime_matches_symbol(status: BotStatus, symbol: str) -> bool:
+    """Return whether the live runtime is currently attached to the requested symbol."""
+
+    return status.symbol == symbol and status.state in {"running", "paused"}
+
+
+def _derive_workstation_data_state(
+    *,
+    state: WorkstationState,
+    status: BotStatus,
+    storage_degraded: bool,
+    storage_message: str | None,
+    state_failed: bool,
+    state_failure_message: str | None,
+) -> tuple[DataState, str]:
+    """Derive the workstation readiness state for one symbol."""
+
+    runtime_attached = state.is_runtime_symbol and _runtime_matches_symbol(status, state.symbol)
+    if state_failed or (storage_degraded and runtime_attached):
+        return (
+            "degraded_storage",
+            state_failure_message
+            or storage_message
+            or "Optional workstation history or storage is temporarily degraded.",
+        )
+    if not runtime_attached:
+        return (
+            "waiting_for_runtime",
+            f"Start or attach the live runtime for {state.symbol} to populate symbol-scoped workstation data.",
+        )
+    if state.market_snapshot is None or state.feature_snapshot is None or state.ai_signal is None:
+        return (
+            "waiting_for_history",
+            f"Live data is connected for {state.symbol}, but more candle history is needed before all signal fields are ready.",
+        )
+    return ("ready", f"Live runtime, feature state, and advisory signal are ready for {state.symbol}.")
+
+
+def _derive_history_data_state(
+    *,
+    symbol: str,
+    status: BotStatus,
+    has_items: bool,
+    storage_degraded: bool,
+    storage_message: str | None,
+) -> tuple[DataState, str]:
+    """Derive a symbol-scoped AI history state."""
+
+    if storage_degraded:
+        return (
+            "degraded_storage",
+            storage_message or "Persisted AI history is temporarily unavailable.",
+        )
+    if has_items:
+        return ("ready", f"Persisted AI history is available for {symbol}.")
+    if _runtime_matches_symbol(status, symbol):
+        return (
+            "waiting_for_history",
+            f"The runtime is active for {symbol}, but persisted AI history has not accumulated yet.",
+        )
+    return (
+        "waiting_for_runtime",
+        f"Start the runtime for {symbol} to generate persisted AI history.",
+    )
+
+
+def _derive_evaluation_data_state(
+    *,
+    symbol: str,
+    status: BotStatus,
+    has_samples: bool,
+    storage_degraded: bool,
+    storage_message: str | None,
+) -> tuple[DataState, str]:
+    """Derive a symbol-scoped AI evaluation state."""
+
+    if storage_degraded:
+        return (
+            "degraded_storage",
+            storage_message or "AI outcome validation storage is temporarily unavailable.",
+        )
+    if has_samples:
+        return ("ready", f"AI outcome validation has enough samples for {symbol}.")
+    if _runtime_matches_symbol(status, symbol):
+        return (
+            "waiting_for_history",
+            f"AI outcome validation for {symbol} needs more closed-candle history after each advisory snapshot.",
+        )
+    return (
+        "waiting_for_runtime",
+        f"Start the runtime for {symbol} to accumulate advisory outcomes.",
+    )
 
 
 def get_symbol_service(request: Request) -> SpotSymbolService:
@@ -302,12 +490,16 @@ def _to_ai_outcome_evaluation_response(
     generated_at: datetime,
     horizons,
     recent_samples,
+    data_state: DataState,
+    status_message: str | None,
 ) -> AIOutcomeEvaluationResponse:
     """Build a stable AI outcome evaluation API response."""
 
     return AIOutcomeEvaluationResponse(
         symbol=symbol,
         generated_at=generated_at,
+        data_state=data_state,
+        status_message=status_message,
         horizons=[
             AIOutcomeSummaryResponse(
                 horizon=item.horizon,
@@ -348,6 +540,8 @@ def _to_workstation_response(
     *,
     state: WorkstationState,
     status: BotStatus,
+    data_state: DataState,
+    status_message: str | None,
 ) -> WorkstationResponse:
     """Convert runtime workstation state into an API response."""
 
@@ -388,6 +582,8 @@ def _to_workstation_response(
 
     return WorkstationResponse(
         symbol=state.symbol,
+        data_state=data_state,
+        status_message=status_message,
         is_runtime_symbol=state.is_runtime_symbol,
         runtime_status=_to_status_response(status),
         last_price=market_snapshot.last_price if market_snapshot is not None else None,
@@ -585,9 +781,21 @@ def get_workstation(
     """Return the current single-symbol workstation state."""
 
     normalized_symbol = symbol.strip().upper()
+    status = runtime.status()
+    state, state_failed, state_failure_message = _safe_workstation_state(runtime, normalized_symbol)
+    data_state, status_message = _derive_workstation_data_state(
+        state=state,
+        status=status,
+        storage_degraded=runtime.storage_degraded(),
+        storage_message=runtime.storage_status_message(),
+        state_failed=state_failed,
+        state_failure_message=state_failure_message,
+    )
     return _to_workstation_response(
-        state=runtime.workstation_state(normalized_symbol),
-        status=runtime.status(),
+        state=state,
+        status=status,
+        data_state=data_state,
+        status_message=status_message,
     )
 
 
@@ -600,11 +808,18 @@ def get_ai_signal(
     """Return the AI advisory signal for the selected symbol when available."""
 
     normalized_symbol = symbol.strip().upper()
-    state = runtime.workstation_state(normalized_symbol)
+    state, _, _ = _safe_workstation_state(runtime, normalized_symbol)
     if state.ai_signal is None:
-        repository = StorageRepository(settings.database_url)
+        try:
+            repository = StorageRepository(settings.database_url)
+        except Exception:
+            LOGGER.exception("Failed to open storage while reading AI signal for %s.", normalized_symbol)
+            return None
         try:
             latest_snapshot = repository.get_latest_ai_signal(normalized_symbol)
+        except Exception:
+            LOGGER.exception("Failed to read AI signal history for %s.", normalized_symbol)
+            latest_snapshot = None
         finally:
             repository.close()
         if latest_snapshot is None:
@@ -627,13 +842,28 @@ def get_ai_signal(
             spread_ratio=latest_snapshot.feature_summary.spread_ratio,
             microstructure_healthy=latest_snapshot.feature_summary.microstructure_healthy,
         )
-    workstation = _to_workstation_response(state=state, status=runtime.status())
+    workstation_status = runtime.status()
+    workstation_data_state, workstation_status_message = _derive_workstation_data_state(
+        state=state,
+        status=workstation_status,
+        storage_degraded=runtime.storage_degraded(),
+        storage_message=runtime.storage_status_message(),
+        state_failed=False,
+        state_failure_message=None,
+    )
+    workstation = _to_workstation_response(
+        state=state,
+        status=workstation_status,
+        data_state=workstation_data_state,
+        status_message=workstation_status_message,
+    )
     return workstation.ai_signal
 
 
 @router.get("/bot/ai-signal/history", response_model=AISignalHistoryResponse)
 def get_ai_signal_history(
     symbol: Annotated[str, Query(min_length=1)],
+    runtime: Annotated[PaperBotRuntime, Depends(get_bot_runtime)],
     settings: Annotated[Settings, Depends(get_settings_dependency)],
     start_date: date | None = None,
     end_date: date | None = None,
@@ -643,7 +873,17 @@ def get_ai_signal_history(
     """Return paginated AI advisory history for one symbol."""
 
     normalized_symbol = symbol.strip().upper()
-    repository = StorageRepository(settings.database_url)
+    runtime_status = runtime.status()
+    try:
+        repository = StorageRepository(settings.database_url)
+    except Exception:
+        LOGGER.exception("Failed to open storage while reading AI history for %s.", normalized_symbol)
+        return _empty_ai_signal_history_response(
+            limit=limit,
+            offset=offset,
+            data_state="degraded_storage",
+            status_message="Persisted AI history storage is unavailable.",
+        )
     try:
         items = repository.get_ai_signal_history(
             symbol=normalized_symbol,
@@ -657,8 +897,23 @@ def get_ai_signal_history(
             start_date=start_date,
             end_date=end_date,
         )
-    finally:
+    except Exception:
+        LOGGER.exception("Failed to read AI history for %s.", normalized_symbol)
         repository.close()
+        return _empty_ai_signal_history_response(
+            limit=limit,
+            offset=offset,
+            data_state="degraded_storage",
+            status_message="Persisted AI history is temporarily unavailable.",
+        )
+    data_state, status_message = _derive_history_data_state(
+        symbol=normalized_symbol,
+        status=runtime_status,
+        has_items=total > 0,
+        storage_degraded=repository.optional_storage_degraded,
+        storage_message=repository.optional_storage_message,
+    )
+    repository.close()
     return AISignalHistoryResponse(
         items=[
             _to_ai_signal_response(
@@ -684,25 +939,53 @@ def get_ai_signal_history(
         total=total,
         limit=limit,
         offset=offset,
+        data_state=data_state,
+        status_message=status_message,
     )
 
 
 @router.get("/bot/ai-signal/evaluation", response_model=AIOutcomeEvaluationResponse)
 def get_ai_signal_evaluation(
     symbol: Annotated[str, Query(min_length=1)],
+    runtime: Annotated[PaperBotRuntime, Depends(get_bot_runtime)],
     settings: Annotated[Settings, Depends(get_settings_dependency)],
 ) -> AIOutcomeEvaluationResponse:
     """Return symbol-scoped AI advisory outcome validation metrics."""
 
     normalized_symbol = symbol.strip().upper()
-    repository = StorageRepository(settings.database_url)
+    runtime_status = runtime.status()
+    try:
+        repository = StorageRepository(settings.database_url)
+    except Exception:
+        LOGGER.exception("Failed to open storage while evaluating AI outcomes for %s.", normalized_symbol)
+        return _empty_ai_outcome_evaluation_response(
+            normalized_symbol,
+            data_state="degraded_storage",
+            status_message="AI outcome validation storage is unavailable.",
+        )
     try:
         evaluation = AIOutcomeEvaluator(repository).evaluate(symbol=normalized_symbol)
-    finally:
+    except Exception:
+        LOGGER.exception("Failed to evaluate AI outcomes for %s.", normalized_symbol)
         repository.close()
+        return _empty_ai_outcome_evaluation_response(
+            normalized_symbol,
+            data_state="degraded_storage",
+            status_message="AI outcome validation is temporarily unavailable.",
+        )
+    data_state, status_message = _derive_evaluation_data_state(
+        symbol=normalized_symbol,
+        status=runtime_status,
+        has_samples=any(item.sample_size > 0 for item in evaluation.horizons),
+        storage_degraded=repository.optional_storage_degraded,
+        storage_message=repository.optional_storage_message,
+    )
+    repository.close()
     return _to_ai_outcome_evaluation_response(
         symbol=evaluation.symbol,
         generated_at=evaluation.generated_at,
         horizons=evaluation.horizons,
         recent_samples=evaluation.recent_samples,
+        data_state=data_state,
+        status_message=status_message,
     )

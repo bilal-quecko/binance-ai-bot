@@ -13,6 +13,7 @@
   MetricsResponse,
   PaginatedResponse,
   PnlHistoryResponse,
+  PerformanceAnalyticsResponse,
   PositionItem,
   WorkstationResponse,
   RangeFilters,
@@ -83,6 +84,15 @@ export function getHealth(): Promise<HealthResponse> {
 
 export function getMetrics(): Promise<MetricsResponse> {
   return requestJson<MetricsResponse>('/metrics');
+}
+
+export function getPerformanceAnalytics(
+  symbol: string,
+  filters?: RangeFilters,
+): Promise<PerformanceAnalyticsResponse> {
+  const params = buildRangeParams(filters);
+  params.set('symbol', symbol.trim().toUpperCase());
+  return requestJson<PerformanceAnalyticsResponse>('/performance', params);
 }
 
 export function getEquity(): Promise<EquityResponse> {

@@ -41,6 +41,12 @@ class FakeRuntime:
     def status(self) -> BotStatus:
         return self.state
 
+    def storage_degraded(self) -> bool:
+        return False
+
+    def storage_status_message(self) -> str | None:
+        return None
+
     async def start(self, symbol: str) -> BotStatus:
         self.state = BotStatus(state='running', symbol=symbol, timeframe='1m', started_at=datetime(2024, 3, 9, 16, 0, tzinfo=UTC))
         return self.state
@@ -145,6 +151,56 @@ class FakeRuntime:
             last_cycle_result=None,
             total_pnl=Decimal('3'),
             realized_pnl=Decimal('2'),
+        )
+
+
+class NeutralRuntime(FakeRuntime):
+    def workstation_state(self, symbol: str) -> WorkstationState:
+        return WorkstationState(
+            symbol=symbol,
+            is_runtime_symbol=False,
+            market_snapshot=None,
+            feature_snapshot=None,
+            ai_signal=None,
+            entry_signal=None,
+            exit_signal=None,
+            current_position=None,
+            last_cycle_result=None,
+            total_pnl=Decimal('0'),
+            realized_pnl=Decimal('0'),
+        )
+
+
+class BrokenRuntime(NeutralRuntime):
+    def workstation_state(self, symbol: str) -> WorkstationState:
+        raise RuntimeError("simulated workstation failure")
+
+
+class HistoryWaitingRuntime(FakeRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.state = BotStatus(state='running', symbol='BTCUSDT', timeframe='1m', started_at=datetime(2024, 3, 9, 16, 0, tzinfo=UTC))
+
+    def workstation_state(self, symbol: str) -> WorkstationState:
+        return WorkstationState(
+            symbol=symbol,
+            is_runtime_symbol=True,
+            market_snapshot=MarketSnapshot(
+                symbol=symbol,
+                candle=None,
+                top_of_book=None,
+                last_price=Decimal('100.5'),
+                event_time=datetime(2024, 3, 9, 16, 2, tzinfo=UTC),
+                received_at=datetime(2024, 3, 9, 16, 2, tzinfo=UTC),
+            ),
+            feature_snapshot=None,
+            ai_signal=None,
+            entry_signal=None,
+            exit_signal=None,
+            current_position=None,
+            last_cycle_result=None,
+            total_pnl=Decimal('0'),
+            realized_pnl=Decimal('0'),
         )
 
 
@@ -289,6 +345,7 @@ def test_symbol_and_bot_control_endpoints() -> None:
 
     assert workstation_response.status_code == 200
     assert workstation_response.json()['symbol'] == 'BTCUSDT'
+    assert workstation_response.json()['data_state'] == 'ready'
     assert workstation_response.json()['entry_signal']['side'] == 'BUY'
     assert workstation_response.json()['ai_signal']['bias'] == 'bullish'
 
@@ -299,11 +356,13 @@ def test_symbol_and_bot_control_endpoints() -> None:
 
     assert ai_history_response.status_code == 200
     assert ai_history_response.json()['total'] == 2
+    assert ai_history_response.json()['data_state'] == 'ready'
     assert ai_history_response.json()['items'][0]['bias'] == 'sideways'
     assert ai_history_response.json()['items'][1]['symbol'] == 'BTCUSDT'
 
     assert ai_evaluation_response.status_code == 200
     assert ai_evaluation_response.json()['symbol'] == 'BTCUSDT'
+    assert ai_evaluation_response.json()['data_state'] == 'ready'
     assert ai_evaluation_response.json()['horizons'][0]['horizon'] == '5m'
     assert 'directional_accuracy_pct' in ai_evaluation_response.json()['horizons'][0]
 
@@ -319,3 +378,274 @@ def test_symbol_and_bot_control_endpoints() -> None:
 
     assert stop_response.status_code == 200
     assert stop_response.json()['state'] == 'stopped'
+
+
+def test_workstation_endpoints_return_empty_states_without_runtime_data() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    fake_symbol_service = FakeSymbolService()
+    neutral_runtime = NeutralRuntime()
+    app.dependency_overrides[get_symbol_service] = lambda: fake_symbol_service
+    app.dependency_overrides[get_bot_runtime] = lambda: neutral_runtime
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    client = TestClient(app)
+
+    try:
+        workstation_response = client.get('/bot/workstation', params={'symbol': 'ETHUSDT'})
+        ai_signal_response = client.get('/bot/ai-signal', params={'symbol': 'ETHUSDT'})
+        ai_history_response = client.get('/bot/ai-signal/history', params={'symbol': 'ETHUSDT', 'limit': 10, 'offset': 0})
+        ai_evaluation_response = client.get('/bot/ai-signal/evaluation', params={'symbol': 'ETHUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert workstation_response.status_code == 200
+    assert workstation_response.json() == {
+        'symbol': 'ETHUSDT',
+        'data_state': 'waiting_for_runtime',
+        'status_message': 'Start or attach the live runtime for ETHUSDT to populate symbol-scoped workstation data.',
+        'is_runtime_symbol': False,
+        'runtime_status': {
+            'state': 'stopped',
+            'symbol': None,
+            'timeframe': '1m',
+            'paper_only': True,
+            'started_at': None,
+            'last_event_time': None,
+            'last_error': None,
+        },
+        'last_price': None,
+        'current_candle': None,
+        'top_of_book': None,
+        'feature': None,
+        'ai_signal': None,
+        'trend_bias': None,
+        'entry_signal': None,
+        'exit_signal': None,
+        'explanation': None,
+        'current_position': None,
+        'last_action': None,
+        'last_market_event': None,
+        'total_pnl': '0',
+        'realized_pnl': '0',
+    }
+    assert ai_signal_response.status_code == 200
+    assert ai_signal_response.json() is None
+    assert ai_history_response.status_code == 200
+    assert ai_history_response.json() == {
+        'items': [],
+        'total': 0,
+        'limit': 10,
+        'offset': 0,
+        'data_state': 'waiting_for_runtime',
+        'status_message': 'Start the runtime for ETHUSDT to generate persisted AI history.',
+    }
+    assert ai_evaluation_response.status_code == 200
+    assert ai_evaluation_response.json()['data_state'] == 'waiting_for_runtime'
+    assert [item['sample_size'] for item in ai_evaluation_response.json()['horizons']] == [0, 0, 0]
+    assert ai_evaluation_response.json()['recent_samples'] == []
+
+
+def test_workstation_endpoint_does_not_crash_when_runtime_state_errors() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_bot_runtime] = lambda: BrokenRuntime()
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    client = TestClient(app)
+
+    try:
+        workstation_response = client.get('/bot/workstation', params={'symbol': 'BTCUSDT'})
+        ai_signal_response = client.get('/bot/ai-signal', params={'symbol': 'BTCUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert workstation_response.status_code == 200
+    assert workstation_response.json()['data_state'] == 'degraded_storage'
+    assert workstation_response.json()['is_runtime_symbol'] is False
+    assert ai_signal_response.status_code == 200
+    assert ai_signal_response.json() is None
+
+
+def test_workstation_reports_waiting_for_history_when_runtime_is_live_but_features_are_missing() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_bot_runtime] = lambda: HistoryWaitingRuntime()
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    client = TestClient(app)
+
+    try:
+        workstation_response = client.get('/bot/workstation', params={'symbol': 'BTCUSDT'})
+        ai_history_response = client.get('/bot/ai-signal/history', params={'symbol': 'BTCUSDT', 'limit': 5, 'offset': 0})
+        ai_evaluation_response = client.get('/bot/ai-signal/evaluation', params={'symbol': 'BTCUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert workstation_response.status_code == 200
+    assert workstation_response.json()['data_state'] == 'waiting_for_history'
+    assert ai_history_response.status_code == 200
+    assert ai_history_response.json()['data_state'] == 'waiting_for_history'
+    assert ai_evaluation_response.status_code == 200
+    assert ai_evaluation_response.json()['data_state'] == 'waiting_for_history'
+
+
+def test_reset_session_followed_by_workstation_read_stays_safe() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    fake_runtime = NeutralRuntime()
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_bot_runtime] = lambda: fake_runtime
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    client = TestClient(app)
+
+    try:
+        reset_response = client.post('/bot/reset')
+        workstation_response = client.get('/bot/workstation', params={'symbol': 'BTCUSDT'})
+        ai_history_response = client.get('/bot/ai-signal/history', params={'symbol': 'BTCUSDT', 'limit': 5, 'offset': 0})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert reset_response.status_code == 200
+    assert workstation_response.status_code == 200
+    assert workstation_response.json()['data_state'] == 'waiting_for_runtime'
+    assert workstation_response.json()['is_runtime_symbol'] is False
+    assert ai_history_response.status_code == 200
+    assert ai_history_response.json()['items'] == []
+
+
+def test_ai_evaluation_returns_empty_metrics_when_no_candle_history_exists() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    repository = StorageRepository(settings.database_url)
+    try:
+        repository.insert_ai_signal_snapshot(
+            AISignalSnapshot(
+                symbol='BTCUSDT',
+                bias='bullish',
+                confidence=70,
+                entry_signal=True,
+                exit_signal=False,
+                suggested_action='enter',
+                explanation='Momentum is improving.',
+                feature_vector=AIFeatureVector(
+                    symbol='BTCUSDT',
+                    timestamp=datetime(2024, 3, 9, 16, 0, tzinfo=UTC),
+                    candle_count=5,
+                    close_price=Decimal('100'),
+                    ema_fast=Decimal('101'),
+                    ema_slow=Decimal('100'),
+                    rsi=Decimal('60'),
+                    atr=Decimal('1'),
+                    volatility_pct=Decimal('0.01'),
+                    momentum=Decimal('0.02'),
+                    recent_returns=(Decimal('0.01'),),
+                    wick_body_ratio=Decimal('1'),
+                    upper_wick_ratio=Decimal('0.2'),
+                    lower_wick_ratio=Decimal('0.1'),
+                    volume_change_pct=Decimal('0.2'),
+                    volume_spike_ratio=Decimal('1.1'),
+                    spread_ratio=Decimal('0.001'),
+                    order_book_imbalance=Decimal('0.2'),
+                    microstructure_healthy=True,
+                ),
+            )
+        )
+    finally:
+        repository.close()
+
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_bot_runtime] = lambda: NeutralRuntime()
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    client = TestClient(app)
+
+    try:
+        response = client.get('/bot/ai-signal/evaluation', params={'symbol': 'BTCUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()['data_state'] == 'waiting_for_runtime'
+    assert [item['sample_size'] for item in response.json()['horizons']] == [0, 0, 0]
+    assert response.json()['recent_samples'] == []
+
+
+def test_ai_history_and_evaluation_report_degraded_storage_when_repository_open_fails(monkeypatch) -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+
+    def raise_storage_error(*args, **kwargs):
+        raise RuntimeError('simulated storage open failure')
+
+    monkeypatch.setattr('app.api.bot_api.StorageRepository', raise_storage_error)
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_bot_runtime] = lambda: NeutralRuntime()
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    client = TestClient(app)
+
+    try:
+        ai_history_response = client.get('/bot/ai-signal/history', params={'symbol': 'BTCUSDT', 'limit': 5, 'offset': 0})
+        ai_evaluation_response = client.get('/bot/ai-signal/evaluation', params={'symbol': 'BTCUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert ai_history_response.status_code == 200
+    assert ai_history_response.json()['data_state'] == 'degraded_storage'
+    assert ai_evaluation_response.status_code == 200
+    assert ai_evaluation_response.json()['data_state'] == 'degraded_storage'
+
+
+def test_workstation_endpoints_tolerate_old_sqlite_schema() -> None:
+    db_path = _db_path()
+    repository = StorageRepository(f"sqlite:///{db_path}")
+    try:
+        repository._connection.execute("DROP TABLE ai_signal_snapshots")
+        repository._connection.execute("DROP TABLE market_candle_snapshots")
+        repository._connection.execute(
+            """
+            CREATE TABLE ai_signal_snapshots (
+                symbol TEXT NOT NULL,
+                snapshot_time TEXT NOT NULL,
+                bias TEXT NOT NULL,
+                confidence INTEGER NOT NULL,
+                entry_signal INTEGER NOT NULL,
+                exit_signal INTEGER NOT NULL,
+                suggested_action TEXT NOT NULL,
+                explanation TEXT NOT NULL
+            )
+            """
+        )
+        repository._connection.execute(
+            """
+            CREATE TABLE market_candle_snapshots (
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                open_time TEXT NOT NULL,
+                close_price TEXT NOT NULL
+            )
+            """
+        )
+        repository._connection.commit()
+    finally:
+        repository.close()
+
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_bot_runtime] = lambda: NeutralRuntime()
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    client = TestClient(app)
+
+    try:
+        ai_signal_response = client.get('/bot/ai-signal', params={'symbol': 'BTCUSDT'})
+        ai_history_response = client.get('/bot/ai-signal/history', params={'symbol': 'BTCUSDT', 'limit': 5, 'offset': 0})
+        ai_evaluation_response = client.get('/bot/ai-signal/evaluation', params={'symbol': 'BTCUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert ai_signal_response.status_code == 200
+    assert ai_signal_response.json() is None
+    assert ai_history_response.status_code == 200
+    assert ai_history_response.json()['data_state'] == 'waiting_for_runtime'
+    assert ai_history_response.json()['items'] == []
+    assert ai_evaluation_response.status_code == 200
+    assert ai_evaluation_response.json()['data_state'] == 'waiting_for_runtime'
+    assert all(item['sample_size'] == 0 for item in ai_evaluation_response.json()['horizons'])
