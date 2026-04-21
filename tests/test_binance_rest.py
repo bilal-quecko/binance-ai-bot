@@ -124,7 +124,9 @@ async def test_get_exchange_info_parses_typed_filters() -> None:
                         "baseAssetPrecision": 8,
                         "quoteAssetPrecision": 8,
                         "orderTypes": ["LIMIT", "MARKET"],
-                        "permissions": ["SPOT"],
+                        "permissions": [],
+                        "permissionSets": [["SPOT"]],
+                        "isSpotTradingAllowed": True,
                         "filters": [
                             {
                                 "filterType": "PRICE_FILTER",
@@ -162,7 +164,9 @@ async def test_get_exchange_info_parses_typed_filters() -> None:
                         "baseAssetPrecision": 8,
                         "quoteAssetPrecision": 8,
                         "orderTypes": ["LIMIT", "MARKET"],
-                        "permissions": ["SPOT"],
+                        "permissions": [],
+                        "permissionSets": [["SPOT", "MARGIN"]],
+                        "isSpotTradingAllowed": True,
                         "filters": [
                             {
                                 "filterType": "PRICE_FILTER",
@@ -200,6 +204,9 @@ async def test_get_exchange_info_parses_typed_filters() -> None:
     assert len(exchange_info.symbols) == 2
 
     btcusdt = exchange_info.symbols[0]
+    assert btcusdt.permissions == []
+    assert btcusdt.permission_sets == [["SPOT"]]
+    assert btcusdt.is_spot_trading_allowed is True
     assert btcusdt.filters.price is not None
     assert btcusdt.filters.price.tick_size == Decimal("0.01000000")
     assert btcusdt.filters.lot_size is not None
@@ -211,6 +218,8 @@ async def test_get_exchange_info_parses_typed_filters() -> None:
     assert btcusdt.filters.notional.max_notional == Decimal("1000000.00000000")
 
     ethusdt = exchange_info.symbols[1]
+    assert ethusdt.permission_sets == [["SPOT", "MARGIN"]]
+    assert ethusdt.is_spot_trading_allowed is True
     assert ethusdt.filters.notional is not None
     assert ethusdt.filters.notional.filter_type == "MIN_NOTIONAL"
     assert ethusdt.filters.notional.min_notional == Decimal("10.00000000")

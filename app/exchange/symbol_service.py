@@ -113,10 +113,13 @@ class SpotSymbolService:
     def _is_supported_symbol(symbol: ExchangeSymbol) -> bool:
         """Return whether the symbol is tradable in v1 paper mode."""
 
+        has_spot_permission = "SPOT" in symbol.permissions or any(
+            "SPOT" in permission_group for permission_group in symbol.permission_sets
+        )
         return (
             symbol.quote_asset == "USDT"
             and symbol.status == "TRADING"
-            and "SPOT" in symbol.permissions
+            and (symbol.is_spot_trading_allowed or has_spot_permission)
         )
 
     @staticmethod

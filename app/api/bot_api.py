@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from app.bot import BotStatus, PaperBotRuntime
+from app.bot import BotStatus, PaperBotRuntime, WorkstationState
+from app.config import Settings, get_settings
 from app.exchange.symbol_service import SpotSymbolRecord, SpotSymbolService
+from app.storage import StorageRepository
 
 router = APIRouter()
 
@@ -41,6 +44,119 @@ class BotStatusResponse(BaseModel):
     last_error: str | None = None
 
 
+class CandleSummaryResponse(BaseModel):
+    """Serialized latest candle state."""
+
+    timeframe: str
+    open_time: datetime
+    close_time: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
+    is_closed: bool
+
+
+class TopOfBookResponse(BaseModel):
+    """Serialized best bid/ask state."""
+
+    bid_price: Decimal
+    bid_quantity: Decimal
+    ask_price: Decimal
+    ask_quantity: Decimal
+    event_time: datetime
+
+
+class FeatureSummaryResponse(BaseModel):
+    """Serialized feature state for the selected symbol."""
+
+    regime: str | None = None
+    ema_fast: Decimal | None = None
+    ema_slow: Decimal | None = None
+    atr: Decimal | None = None
+    mid_price: Decimal | None = None
+    bid_ask_spread: Decimal | None = None
+    order_book_imbalance: Decimal | None = None
+    timestamp: datetime | None = None
+
+
+class SignalSummaryResponse(BaseModel):
+    """Serialized entry or exit signal preview."""
+
+    side: str
+    confidence: Decimal
+    reason_codes: tuple[str, ...]
+
+
+class PositionSummaryResponse(BaseModel):
+    """Serialized current paper position for the selected symbol."""
+
+    symbol: str
+    quantity: Decimal
+    avg_entry_price: Decimal
+    realized_pnl: Decimal
+    quote_asset: str
+
+
+class LastActionResponse(BaseModel):
+    """Serialized latest action for the selected symbol."""
+
+    signal_side: str
+    signal_reasons: tuple[str, ...]
+    execution_status: str | None = None
+    execution_reasons: tuple[str, ...] = ()
+    event_time: datetime
+
+
+class AIFeatureResponse(BaseModel):
+    """Serialized AI advisory feature vector."""
+
+    candle_count: int
+    close_price: Decimal
+    volatility_pct: Decimal | None = None
+    momentum: Decimal | None = None
+    volume_change_pct: Decimal | None = None
+    volume_spike_ratio: Decimal | None = None
+    spread_ratio: Decimal | None = None
+    microstructure_healthy: bool
+
+
+class AISignalResponse(BaseModel):
+    """Serialized AI advisory market read."""
+
+    symbol: str
+    bias: str
+    confidence: int
+    entry_signal: bool
+    exit_signal: bool
+    suggested_action: str
+    explanation: str
+    features: AIFeatureResponse
+
+
+class WorkstationResponse(BaseModel):
+    """Symbol-scoped workstation payload."""
+
+    symbol: str
+    is_runtime_symbol: bool
+    runtime_status: BotStatusResponse
+    last_price: Decimal | None = None
+    current_candle: CandleSummaryResponse | None = None
+    top_of_book: TopOfBookResponse | None = None
+    feature: FeatureSummaryResponse | None = None
+    ai_signal: AISignalResponse | None = None
+    trend_bias: str | None = None
+    entry_signal: SignalSummaryResponse | None = None
+    exit_signal: SignalSummaryResponse | None = None
+    explanation: str | None = None
+    current_position: PositionSummaryResponse | None = None
+    last_action: LastActionResponse | None = None
+    last_market_event: datetime | None = None
+    total_pnl: Decimal = Decimal("0")
+    realized_pnl: Decimal = Decimal("0")
+
+
 def get_symbol_service(request: Request) -> SpotSymbolService:
     """Return the shared symbol service instance from FastAPI app state."""
 
@@ -51,6 +167,12 @@ def get_bot_runtime(request: Request) -> PaperBotRuntime:
     """Return the shared live paper-bot runtime instance from app state."""
 
     return request.app.state.bot_runtime
+
+
+def get_settings_dependency() -> Settings:
+    """Return application settings for bot control routes."""
+
+    return get_settings()
 
 
 def _to_symbol_response(record: SpotSymbolRecord) -> SymbolResponse:
@@ -75,6 +197,154 @@ def _to_status_response(status: BotStatus) -> BotStatusResponse:
         started_at=status.started_at,
         last_event_time=status.last_event_time,
         last_error=status.last_error,
+    )
+
+
+def _to_workstation_response(
+    *,
+    state: WorkstationState,
+    status: BotStatus,
+) -> WorkstationResponse:
+    """Convert runtime workstation state into an API response."""
+
+    market_snapshot = state.market_snapshot
+    candle = market_snapshot.candle if market_snapshot is not None else None
+    top_of_book = market_snapshot.top_of_book if market_snapshot is not None else None
+    feature_snapshot = state.feature_snapshot
+    ai_signal = state.ai_signal
+    entry_signal = state.entry_signal
+    exit_signal = state.exit_signal
+    last_cycle_result = state.last_cycle_result
+
+    trend_bias: str | None = None
+    if feature_snapshot is not None:
+        if feature_snapshot.regime == "bullish":
+            trend_bias = "Bullish trend"
+        elif feature_snapshot.regime == "bearish":
+            trend_bias = "Bearish trend"
+        elif feature_snapshot.regime == "neutral":
+            trend_bias = "Neutral"
+
+    explanation_parts: list[str] = []
+    if entry_signal is not None:
+        explanation_parts.append(f"Entry {entry_signal.side}: {', '.join(entry_signal.reason_codes) or 'waiting'}")
+    if exit_signal is not None:
+        explanation_parts.append(f"Exit {exit_signal.side}: {', '.join(exit_signal.reason_codes) or 'waiting'}")
+
+    last_action = None
+    if last_cycle_result is not None:
+        execution_result = last_cycle_result.execution_result
+        last_action = LastActionResponse(
+            signal_side=last_cycle_result.signal.side,
+            signal_reasons=last_cycle_result.signal.reason_codes,
+            execution_status=execution_result.status if execution_result is not None else None,
+            execution_reasons=execution_result.reason_codes if execution_result is not None else (),
+            event_time=last_cycle_result.feature_snapshot.timestamp,
+        )
+
+    return WorkstationResponse(
+        symbol=state.symbol,
+        is_runtime_symbol=state.is_runtime_symbol,
+        runtime_status=_to_status_response(status),
+        last_price=market_snapshot.last_price if market_snapshot is not None else None,
+        current_candle=(
+            CandleSummaryResponse(
+                timeframe=candle.timeframe,
+                open_time=candle.open_time,
+                close_time=candle.close_time,
+                open=candle.open,
+                high=candle.high,
+                low=candle.low,
+                close=candle.close,
+                volume=candle.volume,
+                is_closed=candle.is_closed,
+            )
+            if candle is not None
+            else None
+        ),
+        top_of_book=(
+            TopOfBookResponse(
+                bid_price=top_of_book.bid_price,
+                bid_quantity=top_of_book.bid_quantity,
+                ask_price=top_of_book.ask_price,
+                ask_quantity=top_of_book.ask_quantity,
+                event_time=top_of_book.event_time,
+            )
+            if top_of_book is not None
+            else None
+        ),
+        feature=(
+            FeatureSummaryResponse(
+                regime=feature_snapshot.regime,
+                ema_fast=feature_snapshot.ema_fast,
+                ema_slow=feature_snapshot.ema_slow,
+                atr=feature_snapshot.atr,
+                mid_price=feature_snapshot.mid_price,
+                bid_ask_spread=feature_snapshot.bid_ask_spread,
+                order_book_imbalance=feature_snapshot.order_book_imbalance,
+                timestamp=feature_snapshot.timestamp,
+            )
+            if feature_snapshot is not None
+            else None
+        ),
+        ai_signal=(
+            AISignalResponse(
+                symbol=ai_signal.symbol,
+                bias=ai_signal.bias,
+                confidence=ai_signal.confidence,
+                entry_signal=ai_signal.entry_signal,
+                exit_signal=ai_signal.exit_signal,
+                suggested_action=ai_signal.suggested_action,
+                explanation=ai_signal.explanation,
+                features=AIFeatureResponse(
+                    candle_count=ai_signal.feature_vector.candle_count,
+                    close_price=ai_signal.feature_vector.close_price,
+                    volatility_pct=ai_signal.feature_vector.volatility_pct,
+                    momentum=ai_signal.feature_vector.momentum,
+                    volume_change_pct=ai_signal.feature_vector.volume_change_pct,
+                    volume_spike_ratio=ai_signal.feature_vector.volume_spike_ratio,
+                    spread_ratio=ai_signal.feature_vector.spread_ratio,
+                    microstructure_healthy=ai_signal.feature_vector.microstructure_healthy,
+                ),
+            )
+            if ai_signal is not None
+            else None
+        ),
+        trend_bias=trend_bias,
+        entry_signal=(
+            SignalSummaryResponse(
+                side=entry_signal.side,
+                confidence=entry_signal.confidence,
+                reason_codes=entry_signal.reason_codes,
+            )
+            if entry_signal is not None
+            else None
+        ),
+        exit_signal=(
+            SignalSummaryResponse(
+                side=exit_signal.side,
+                confidence=exit_signal.confidence,
+                reason_codes=exit_signal.reason_codes,
+            )
+            if exit_signal is not None
+            else None
+        ),
+        explanation=" | ".join(explanation_parts) if explanation_parts else None,
+        current_position=(
+            PositionSummaryResponse(
+                symbol=state.current_position.symbol,
+                quantity=state.current_position.quantity,
+                avg_entry_price=state.current_position.avg_entry_price,
+                realized_pnl=state.current_position.realized_pnl,
+                quote_asset=state.current_position.quote_asset,
+            )
+            if state.current_position is not None
+            else None
+        ),
+        last_action=last_action,
+        last_market_event=market_snapshot.event_time if market_snapshot is not None else None,
+        total_pnl=state.total_pnl,
+        realized_pnl=state.realized_pnl,
     )
 
 
@@ -146,3 +416,47 @@ async def resume_bot(
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _to_status_response(status)
+
+
+@router.post("/bot/reset", response_model=BotStatusResponse)
+async def reset_bot_session(
+    runtime: Annotated[PaperBotRuntime, Depends(get_bot_runtime)],
+    settings: Annotated[Settings, Depends(get_settings_dependency)],
+) -> BotStatusResponse:
+    """Stop the paper bot and clear persisted paper-session data."""
+
+    status = await runtime.reset_session()
+    repository = StorageRepository(settings.database_url)
+    try:
+        repository.clear_all()
+    finally:
+        repository.close()
+    return _to_status_response(status)
+
+
+@router.get("/bot/workstation", response_model=WorkstationResponse)
+def get_workstation(
+    symbol: Annotated[str, Query(min_length=1)],
+    runtime: Annotated[PaperBotRuntime, Depends(get_bot_runtime)],
+) -> WorkstationResponse:
+    """Return the current single-symbol workstation state."""
+
+    normalized_symbol = symbol.strip().upper()
+    return _to_workstation_response(
+        state=runtime.workstation_state(normalized_symbol),
+        status=runtime.status(),
+    )
+
+
+@router.get("/bot/ai-signal", response_model=AISignalResponse | None)
+def get_ai_signal(
+    symbol: Annotated[str, Query(min_length=1)],
+    runtime: Annotated[PaperBotRuntime, Depends(get_bot_runtime)],
+) -> AISignalResponse | None:
+    """Return the AI advisory signal for the selected symbol when available."""
+
+    state = runtime.workstation_state(symbol.strip().upper())
+    if state.ai_signal is None:
+        return None
+    workstation = _to_workstation_response(state=state, status=runtime.status())
+    return workstation.ai_signal

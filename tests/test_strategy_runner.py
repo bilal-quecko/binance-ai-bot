@@ -135,3 +135,48 @@ def test_strategy_runner_completes_buy_hold_sell_cycle() -> None:
     assert trade_history[1].side == "SELL"
     assert daily_pnl == Decimal("-7.19700")
     assert any(event.event_type == "signal_generated" for event in runner_events)
+
+
+def test_strategy_runner_ignores_duplicate_and_out_of_order_candles_in_cache() -> None:
+    broker = PaperBroker(initial_balances={"USDT": Decimal("1000")})
+    runner = StrategyRunner(
+        feature_engine=FeatureEngine(
+            FeatureConfig(
+                ema_fast_period=2,
+                ema_slow_period=3,
+                rsi_period=2,
+                atr_period=2,
+            )
+        ),
+        strategy=TrendFollowingStrategy(TrendFollowingConfig()),
+        risk_engine=RiskEngine(),
+        execution_engine=ExecutionEngine(broker),
+        broker=broker,
+    )
+
+    first = build_snapshot(0, "100")
+    duplicate_newer = build_snapshot(0, "101")
+    stale_older = build_snapshot(0, "99")
+    second = build_snapshot(1, "102")
+    older_after_second = build_snapshot(0, "98")
+    assert duplicate_newer.candle is not None
+    duplicate_newer.candle.event_time = duplicate_newer.candle.event_time + timedelta(seconds=1)
+    assert stale_older.candle is not None
+    stale_older.candle.event_time = stale_older.candle.event_time - timedelta(seconds=1)
+
+    runner.ingest_snapshot(first)
+    runner.ingest_snapshot(duplicate_newer)
+    runner.ingest_snapshot(stale_older)
+    runner.ingest_snapshot(second)
+    runner.ingest_snapshot(older_after_second)
+
+    feature_snapshot = runner.get_feature_snapshot("BTCUSDT")
+    latest_market_snapshot = runner.get_latest_market_snapshot("BTCUSDT")
+
+    assert feature_snapshot is None
+    assert latest_market_snapshot is not None
+    assert latest_market_snapshot.candle is not None
+    assert latest_market_snapshot.candle.close == Decimal("102")
+    assert runner._candles_by_symbol["BTCUSDT"][0].close == Decimal("101")  # noqa: SLF001 - targeted cache assertion
+    assert runner._candles_by_symbol["BTCUSDT"][1].close == Decimal("102")  # noqa: SLF001 - targeted cache assertion
+    assert len(runner._candles_by_symbol["BTCUSDT"]) == 2  # noqa: SLF001 - targeted cache assertion

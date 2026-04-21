@@ -1,6 +1,7 @@
 import { useId, useState } from 'react';
 
 import { badgeTone, classNames, formatDateTime } from '../lib/format';
+import { canStartBot } from '../lib/bot-controls';
 import type { BotStatusResponse, SpotSymbolItem } from '../lib/types';
 
 interface BotControlPanelProps {
@@ -15,9 +16,11 @@ interface BotControlPanelProps {
   actionError: string | null;
   onSearchChange: (value: string) => void;
   onSelectSymbol: (symbol: string) => void;
+  onClearSelection: () => void;
   onStart: () => void;
   onStop: () => void;
   onPauseResume: () => void;
+  onReset: () => void;
 }
 
 export function BotControlPanel({
@@ -32,14 +35,16 @@ export function BotControlPanel({
   actionError,
   onSearchChange,
   onSelectSymbol,
+  onClearSelection,
   onStart,
   onStop,
   onPauseResume,
+  onReset,
 }: BotControlPanelProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
   const listboxId = useId();
-  const canStart = hasValidSelection && status.state === 'stopped' && !actionLoading;
+  const canStart = hasValidSelection && canStartBot(selectedSymbol, status.state, actionLoading);
   const canStop = status.state !== 'stopped' && !actionLoading;
   const canPauseResume = (status.state === 'running' || status.state === 'paused') && !actionLoading;
   const pauseResumeLabel = status.state === 'paused' ? 'Resume' : 'Pause';
@@ -73,54 +78,69 @@ export function BotControlPanel({
           >
             <label className="text-sm text-slate-400">
               Search live Spot symbol
-              <input
-                role="combobox"
-                aria-autocomplete="list"
-                aria-expanded={isOpen}
-                aria-controls={listboxId}
-                value={searchQuery}
-                onFocus={() => {
-                  setIsOpen(true);
-                  setActiveIndex(0);
-                }}
-                onChange={(event) => {
-                  setIsOpen(true);
-                  setActiveIndex(0);
-                  onSearchChange(event.target.value);
-                }}
-                onKeyDown={(event) => {
-                  if (!isOpen || symbolResults.length === 0) {
-                    if (event.key === 'ArrowDown') {
-                      setIsOpen(true);
+              <div className="relative mt-2">
+                <input
+                  role="combobox"
+                  aria-autocomplete="list"
+                  aria-expanded={isOpen}
+                  aria-controls={listboxId}
+                  value={searchQuery}
+                  onFocus={() => {
+                    setIsOpen(true);
+                    setActiveIndex(0);
+                  }}
+                  onChange={(event) => {
+                    setIsOpen(true);
+                    setActiveIndex(0);
+                    onSearchChange(event.target.value);
+                  }}
+                  onKeyDown={(event) => {
+                    if (!isOpen || symbolResults.length === 0) {
+                      if (event.key === 'ArrowDown') {
+                        setIsOpen(true);
+                      }
+                      return;
                     }
-                    return;
-                  }
-                  if (event.key === 'ArrowDown') {
-                    event.preventDefault();
-                    setActiveIndex((current) => (current + 1) % symbolResults.length);
-                    return;
-                  }
-                  if (event.key === 'ArrowUp') {
-                    event.preventDefault();
-                    setActiveIndex((current) => (current - 1 + symbolResults.length) % symbolResults.length);
-                    return;
-                  }
-                  if (event.key === 'Enter') {
-                    event.preventDefault();
-                    const nextSelection = symbolResults[activeIndex];
-                    if (nextSelection) {
-                      onSelectSymbol(nextSelection.symbol);
+                    if (event.key === 'ArrowDown') {
+                      event.preventDefault();
+                      setActiveIndex((current) => (current + 1) % symbolResults.length);
+                      return;
+                    }
+                    if (event.key === 'ArrowUp') {
+                      event.preventDefault();
+                      setActiveIndex((current) => (current - 1 + symbolResults.length) % symbolResults.length);
+                      return;
+                    }
+                    if (event.key === 'Enter') {
+                      event.preventDefault();
+                      const nextSelection = symbolResults[activeIndex];
+                      if (nextSelection) {
+                        onSelectSymbol(nextSelection.symbol);
+                        setIsOpen(false);
+                      }
+                      return;
+                    }
+                    if (event.key === 'Escape') {
                       setIsOpen(false);
                     }
-                    return;
-                  }
-                  if (event.key === 'Escape') {
-                    setIsOpen(false);
-                  }
-                }}
-                placeholder="BTCUSDT"
-                className="mt-2 w-full rounded-xl border border-slate-700 bg-slate-950/60 px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-sky-400"
-              />
+                  }}
+                  placeholder="BTCUSDT"
+                  className="w-full rounded-xl border border-slate-700 bg-slate-950/60 px-3 py-2 pr-11 text-sm text-slate-100 outline-none transition focus:border-sky-400"
+                />
+                {searchQuery.length > 0 ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClearSelection();
+                      setIsOpen(true);
+                      setActiveIndex(0);
+                    }}
+                    className="absolute inset-y-0 right-2 my-auto h-7 rounded-lg px-2 text-xs text-slate-400 transition hover:bg-slate-800 hover:text-white"
+                  >
+                    Clear
+                  </button>
+                ) : null}
+              </div>
             </label>
 
             {isOpen ? (
@@ -223,6 +243,14 @@ export function BotControlPanel({
               className="rounded-xl border border-amber-400/30 bg-amber-400/10 px-4 py-2 text-sm font-medium text-amber-100 transition disabled:cursor-not-allowed disabled:opacity-40 hover:border-amber-300 hover:bg-amber-400/20"
             >
               {pauseResumeLabel}
+            </button>
+            <button
+              type="button"
+              disabled={actionLoading}
+              onClick={onReset}
+              className="rounded-xl border border-slate-700 bg-slate-900 px-4 py-2 text-sm font-medium text-slate-200 transition disabled:cursor-not-allowed disabled:opacity-40 hover:border-slate-500 hover:text-white"
+            >
+              Reset Session
             </button>
           </div>
         </div>

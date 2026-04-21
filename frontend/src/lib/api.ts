@@ -1,5 +1,6 @@
 ﻿import type {
   BotStatusResponse,
+  AISignalSummary,
   DrawdownResponse,
   EquityHistoryPoint,
   EquityResponse,
@@ -11,6 +12,7 @@
   PaginatedResponse,
   PnlHistoryResponse,
   PositionItem,
+  WorkstationResponse,
   RangeFilters,
   SpotSymbolItem,
   SymbolSummaryItem,
@@ -105,6 +107,16 @@ export function getBotStatus(): Promise<BotStatusResponse> {
   return requestJson<BotStatusResponse>('/bot/status');
 }
 
+export function getWorkstation(symbol: string): Promise<WorkstationResponse> {
+  const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
+  return requestJson<WorkstationResponse>('/bot/workstation', params);
+}
+
+export function getAISignal(symbol: string): Promise<AISignalSummary | null> {
+  const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
+  return requestJson<AISignalSummary | null>('/bot/ai-signal', params);
+}
+
 export function getSymbols(query = '', limit = 20): Promise<SpotSymbolItem[]> {
   const params = new URLSearchParams();
   if (query.trim().length > 0) {
@@ -131,6 +143,10 @@ export function pauseBot(): Promise<BotStatusResponse> {
 
 export function resumeBot(): Promise<BotStatusResponse> {
   return requestJson<BotStatusResponse>('/bot/resume', undefined, { method: 'POST' });
+}
+
+export function resetBotSession(): Promise<BotStatusResponse> {
+  return requestJson<BotStatusResponse>('/bot/reset', undefined, { method: 'POST' });
 }
 
 export function getDailyPnl(day?: string): Promise<string> {

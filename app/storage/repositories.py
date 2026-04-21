@@ -68,6 +68,16 @@ class StorageRepository:
 
         self._connection.close()
 
+    def clear_all(self) -> None:
+        """Delete all persisted paper-session rows."""
+
+        with self._connection:
+            self._connection.execute("DELETE FROM trades")
+            self._connection.execute("DELETE FROM fills")
+            self._connection.execute("DELETE FROM positions_snapshots")
+            self._connection.execute("DELETE FROM pnl_snapshots")
+            self._connection.execute("DELETE FROM runner_events")
+
     def insert_trade(
         self,
         *,

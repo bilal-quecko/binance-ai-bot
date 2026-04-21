@@ -67,6 +67,8 @@ class ExchangeSymbol:
     quote_asset_precision: int
     order_types: list[str] = field(default_factory=list)
     permissions: list[str] = field(default_factory=list)
+    permission_sets: list[list[str]] = field(default_factory=list)
+    is_spot_trading_allowed: bool = False
     filters: SymbolFilters = field(default_factory=lambda: SymbolFilters(symbol=""))
 
 

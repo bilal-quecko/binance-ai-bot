@@ -19,6 +19,101 @@ export interface BotStatusResponse {
   last_error: string | null;
 }
 
+export interface CandleSummary {
+  timeframe: string;
+  open_time: string;
+  close_time: string;
+  open: DecimalString;
+  high: DecimalString;
+  low: DecimalString;
+  close: DecimalString;
+  volume: DecimalString;
+  is_closed: boolean;
+}
+
+export interface TopOfBookSummary {
+  bid_price: DecimalString;
+  bid_quantity: DecimalString;
+  ask_price: DecimalString;
+  ask_quantity: DecimalString;
+  event_time: string;
+}
+
+export interface FeatureSummary {
+  regime: 'bullish' | 'bearish' | 'neutral' | null;
+  ema_fast: DecimalString | null;
+  ema_slow: DecimalString | null;
+  atr: DecimalString | null;
+  mid_price: DecimalString | null;
+  bid_ask_spread: DecimalString | null;
+  order_book_imbalance: DecimalString | null;
+  timestamp: string | null;
+}
+
+export interface AISignalFeatureSummary {
+  candle_count: number;
+  close_price: DecimalString;
+  volatility_pct: DecimalString | null;
+  momentum: DecimalString | null;
+  volume_change_pct: DecimalString | null;
+  volume_spike_ratio: DecimalString | null;
+  spread_ratio: DecimalString | null;
+  microstructure_healthy: boolean;
+}
+
+export interface AISignalSummary {
+  symbol: string;
+  bias: 'bullish' | 'bearish' | 'sideways';
+  confidence: number;
+  entry_signal: boolean;
+  exit_signal: boolean;
+  suggested_action: 'wait' | 'enter' | 'hold' | 'exit';
+  explanation: string;
+  features: AISignalFeatureSummary;
+}
+
+export interface SignalSummary {
+  side: 'BUY' | 'SELL' | 'HOLD';
+  confidence: DecimalString;
+  reason_codes: string[];
+}
+
+export interface PositionSummary {
+  symbol: string;
+  quantity: DecimalString;
+  avg_entry_price: DecimalString;
+  realized_pnl: DecimalString;
+  quote_asset: string;
+}
+
+export interface LastActionSummary {
+  signal_side: 'BUY' | 'SELL' | 'HOLD';
+  signal_reasons: string[];
+  execution_status: string | null;
+  execution_reasons: string[];
+  event_time: string;
+}
+
+export interface WorkstationResponse {
+  symbol: string;
+  is_runtime_symbol: boolean;
+  runtime_status: BotStatusResponse;
+  last_price: DecimalString | null;
+  current_candle: CandleSummary | null;
+  top_of_book: TopOfBookSummary | null;
+  feature: FeatureSummary | null;
+  ai_signal: AISignalSummary | null;
+  trend_bias: string | null;
+  entry_signal: SignalSummary | null;
+  exit_signal: SignalSummary | null;
+  explanation: string | null;
+  current_position: PositionSummary | null;
+  last_action: LastActionSummary | null;
+  last_market_event: string | null;
+  total_pnl: DecimalString;
+  realized_pnl: DecimalString;
+}
+
 export interface HealthResponse {
   name: string;
   status: string;

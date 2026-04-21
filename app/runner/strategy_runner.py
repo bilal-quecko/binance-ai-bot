@@ -47,16 +47,45 @@ class StrategyRunner:
         self._candles_by_symbol: dict[str, list[Candle]] = {}
         self._top_of_book_by_symbol: dict[str, TopOfBook] = {}
         self._last_price_by_symbol: dict[str, Decimal] = {}
+        self._latest_market_snapshot_by_symbol: dict[str, MarketSnapshot] = {}
+        self._last_cycle_result_by_symbol: dict[str, RunnerCycleResult] = {}
         self._day_start_equity: Decimal | None = None
+
+    def _upsert_candle(self, symbol: str, candle: Candle) -> None:
+        """Store candle history in ascending open_time order and ignore stale klines."""
+
+        candles = self._candles_by_symbol.setdefault(symbol, [])
+        if not candles:
+            candles.append(candle)
+            self._candles_by_symbol[symbol] = candles
+            return
+
+        latest_candle = candles[-1]
+        if candle.open_time > latest_candle.open_time:
+            candles.append(candle)
+        elif candle.open_time == latest_candle.open_time:
+            if candle.event_time >= latest_candle.event_time:
+                candles[-1] = candle
+        else:
+            return
+
+        self._candles_by_symbol[symbol] = candles[-self._config.history_limit :]
 
     def _record_snapshot(self, snapshot: MarketSnapshot) -> None:
         """Store the latest market state needed for feature generation and PnL."""
 
         symbol = snapshot.symbol.upper()
+        current_snapshot = self._latest_market_snapshot_by_symbol.get(symbol)
+        current_timestamp = (
+            (current_snapshot.event_time or current_snapshot.received_at)
+            if current_snapshot is not None
+            else None
+        )
+        next_timestamp = snapshot.event_time or snapshot.received_at
+        if current_timestamp is None or next_timestamp is None or next_timestamp >= current_timestamp:
+            self._latest_market_snapshot_by_symbol[symbol] = snapshot
         if snapshot.candle is not None:
-            candles = self._candles_by_symbol.setdefault(symbol, [])
-            candles.append(snapshot.candle)
-            self._candles_by_symbol[symbol] = candles[-self._config.history_limit :]
+            self._upsert_candle(symbol, snapshot.candle)
             self._last_price_by_symbol[symbol] = snapshot.candle.close
         if snapshot.top_of_book is not None:
             self._top_of_book_by_symbol[symbol] = snapshot.top_of_book
@@ -70,6 +99,64 @@ class StrategyRunner:
         """Ingest market data into the runner cache without executing a cycle."""
 
         self._record_snapshot(snapshot)
+
+    def get_latest_market_snapshot(self, symbol: str) -> MarketSnapshot | None:
+        """Return the latest cached market snapshot for a symbol."""
+
+        return self._latest_market_snapshot_by_symbol.get(symbol.upper())
+
+    def get_candle_history(self, symbol: str) -> list[Candle]:
+        """Return the cached candle history for a symbol."""
+
+        return list(self._candles_by_symbol.get(symbol.upper(), []))
+
+    def get_top_of_book(self, symbol: str) -> TopOfBook | None:
+        """Return the latest top-of-book snapshot for a symbol."""
+
+        return self._top_of_book_by_symbol.get(symbol.upper())
+
+    def get_feature_snapshot(self, symbol: str) -> FeatureSnapshot | None:
+        """Return the latest derived feature snapshot for a symbol when available."""
+
+        normalized_symbol = symbol.upper()
+        candles = self._candles_by_symbol.get(normalized_symbol, [])
+        if len(candles) < max(self._feature_engine.config.ema_slow_period, self._feature_engine.config.atr_period):
+            return None
+        return self._build_feature_snapshot(normalized_symbol)
+
+    def preview_entry_signal(self, symbol: str) -> StrategySignal | None:
+        """Return the current entry-side strategy preview for a symbol."""
+
+        feature_snapshot = self.get_feature_snapshot(symbol)
+        if feature_snapshot is None:
+            return None
+        return self._strategy.evaluate(feature_snapshot, position=None)
+
+    def preview_exit_signal(self, symbol: str) -> StrategySignal | None:
+        """Return the current exit-side strategy preview for a symbol."""
+
+        feature_snapshot = self.get_feature_snapshot(symbol)
+        if feature_snapshot is None:
+            return None
+        position = self._broker.get_position(symbol.upper())
+        if position is None or position.quantity <= Decimal("0"):
+            return StrategySignal(
+                symbol=symbol.upper(),
+                side="HOLD",
+                confidence=self._strategy.config.hold_confidence,
+                reason_codes=("NO_POSITION",),
+            )
+        return self._strategy.evaluate(feature_snapshot, position=position)
+
+    def get_current_position(self, symbol: str) -> Position | None:
+        """Return the current broker position for a symbol."""
+
+        return self._broker.get_position(symbol.upper())
+
+    def get_last_cycle_result(self, symbol: str) -> RunnerCycleResult | None:
+        """Return the latest processed cycle result for a symbol."""
+
+        return self._last_cycle_result_by_symbol.get(symbol.upper())
 
     def _current_equity(self) -> Decimal:
         """Return paper equity from balances plus marked-to-market positions."""
@@ -87,6 +174,16 @@ class StrategyRunner:
         if self._day_start_equity is None:
             self._day_start_equity = self._current_equity()
         return self._current_equity() - self._day_start_equity
+
+    def current_pnl(self) -> Decimal:
+        """Return the current marked-to-market PnL."""
+
+        return self._current_pnl()
+
+    def realized_pnl(self) -> Decimal:
+        """Return the broker's cumulative realized PnL."""
+
+        return self._broker.realized_pnl
 
     def _build_feature_snapshot(self, symbol: str) -> FeatureSnapshot:
         """Build a feature snapshot from cached candles and top-of-book data."""
@@ -303,7 +400,7 @@ class StrategyRunner:
                 event_time=feature_snapshot.timestamp,
             )
 
-        return RunnerCycleResult(
+        result = RunnerCycleResult(
             market_snapshot=snapshot,
             feature_snapshot=feature_snapshot,
             signal=signal,
@@ -312,6 +409,8 @@ class StrategyRunner:
             current_position=current_position,
             current_pnl=current_pnl,
         )
+        self._last_cycle_result_by_symbol[symbol] = result
+        return result
 
     def run(
         self,

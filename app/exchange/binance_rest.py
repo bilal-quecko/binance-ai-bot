@@ -92,6 +92,12 @@ class BinanceRestClient:
                 quote_asset_precision=int(raw_symbol["quoteAssetPrecision"]),
                 order_types=list(raw_symbol.get("orderTypes", [])),
                 permissions=list(raw_symbol.get("permissions", [])),
+                permission_sets=[
+                    [str(permission) for permission in permission_group]
+                    for permission_group in raw_symbol.get("permissionSets", [])
+                    if isinstance(permission_group, list)
+                ],
+                is_spot_trading_allowed=bool(raw_symbol.get("isSpotTradingAllowed", False)),
                 filters=parse_symbol_filters(
                     symbol=raw_symbol["symbol"],
                     raw_filters=raw_symbol.get("filters", []),
