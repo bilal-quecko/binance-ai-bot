@@ -1,151 +1,60 @@
 """Application entrypoint."""
 
+from __future__ import annotations
+
 from argparse import ArgumentParser
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 
+import uvicorn
 from fastapi import FastAPI
 
+from app.api.bot_api import router as bot_router
 from app.api.dashboard_api import router as dashboard_router
+from app.bot import PaperBotRuntime
 from app.config import get_settings
-from app.execution.execution_engine import ExecutionEngine
-from app.features.feature_store import FeatureEngine
-from app.features.models import FeatureConfig
-from app.market_data.candles import Candle
-from app.market_data.models import MarketSnapshot
-from app.market_data.orderbook import TopOfBook
+from app.exchange.binance_rest import BinanceRestClient
+from app.exchange.binance_ws import BinanceWebSocketClient
+from app.exchange.symbol_service import SpotSymbolService
 from app.monitoring.logging import configure_logging
-from app.paper.broker import PaperBroker
-from app.risk.limits import RiskEngine
-from app.runner import RunnerConfig, StrategyRunner
-from app.storage import StorageRepository
-from app.strategies.models import TrendFollowingConfig
-from app.strategies.trend_following import TrendFollowingStrategy
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(app: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level)
-    yield
+
+    rest_client = BinanceRestClient(settings)
+    websocket_client = BinanceWebSocketClient(base_url=settings.binance_ws_url)
+    symbol_service = SpotSymbolService(rest_client)
+    bot_runtime = PaperBotRuntime(
+        settings=settings,
+        websocket_client=websocket_client,
+    )
+
+    app.state.symbol_service = symbol_service
+    app.state.bot_runtime = bot_runtime
+
+    try:
+        yield
+    finally:
+        await bot_runtime.close()
+        await rest_client.close()
 
 
 app = FastAPI(title="Binance AI Bot", version="0.1.0", lifespan=lifespan)
 app.include_router(dashboard_router)
-
-
-def _sample_market_snapshots(iterations: int) -> list[MarketSnapshot]:
-    """Build a deterministic paper-mode market feed for the CLI loop."""
-
-    base_time = datetime(2024, 3, 9, 16, 0, 0, tzinfo=UTC)
-    snapshots: list[MarketSnapshot] = []
-    pivot = max(iterations // 2, 1)
-
-    for index in range(iterations):
-        if index <= pivot:
-            close_price = Decimal("100") + Decimal(index)
-        else:
-            close_price = Decimal("100") + Decimal(pivot) - (Decimal(index - pivot) * Decimal("2"))
-        open_time = base_time + timedelta(minutes=index)
-        close_time = open_time + timedelta(minutes=1) - timedelta(milliseconds=1)
-        candle = Candle(
-            symbol="BTCUSDT",
-            timeframe="1m",
-            open=close_price - Decimal("0.5"),
-            high=close_price + Decimal("1"),
-            low=close_price - Decimal("1"),
-            close=close_price,
-            volume=Decimal("10"),
-            quote_volume=close_price * Decimal("10"),
-            open_time=open_time,
-            close_time=close_time,
-            event_time=close_time,
-            trade_count=100 + index,
-            is_closed=True,
-        )
-        top_of_book = TopOfBook(
-            symbol="BTCUSDT",
-            bid_price=close_price - Decimal("0.05"),
-            bid_quantity=Decimal("2"),
-            ask_price=close_price + Decimal("0.05"),
-            ask_quantity=Decimal("1.5"),
-            event_time=close_time,
-        )
-        snapshots.append(
-            MarketSnapshot(
-                symbol="BTCUSDT",
-                candle=candle,
-                top_of_book=top_of_book,
-                last_price=close_price,
-                bid_price=top_of_book.bid_price,
-                ask_price=top_of_book.ask_price,
-                event_time=close_time,
-                received_at=close_time,
-            )
-        )
-
-    return snapshots
-
-
-def run_paper_loop(iterations: int = 20) -> None:
-    """Run a deterministic paper-mode bot loop and print results."""
-
-    settings = get_settings()
-    if settings.app_mode != "paper":
-        raise RuntimeError("The strategy runner CLI only supports paper mode.")
-
-    configure_logging(settings.log_level)
-    broker = PaperBroker(initial_balances={"USDT": Decimal("10000")})
-    execution_engine = ExecutionEngine(broker)
-    feature_engine = FeatureEngine(
-        FeatureConfig(
-            ema_fast_period=3,
-            ema_slow_period=5,
-            rsi_period=3,
-            atr_period=3,
-        )
-    )
-    strategy = TrendFollowingStrategy(TrendFollowingConfig())
-    risk_engine = RiskEngine()
-    storage_repository = StorageRepository(settings.database_url)
-    runner = StrategyRunner(
-        feature_engine=feature_engine,
-        strategy=strategy,
-        risk_engine=risk_engine,
-        execution_engine=execution_engine,
-        broker=broker,
-        storage_repository=storage_repository,
-        config=RunnerConfig(
-            order_quantity=Decimal("1"),
-            risk_per_trade=Decimal(str(settings.risk_per_trade)),
-            max_daily_loss=Decimal(str(settings.max_daily_loss)),
-            max_open_positions=settings.max_open_positions,
-        ),
-    )
-
-    try:
-        for result in runner.run(_sample_market_snapshots(iterations), iterations=iterations):
-            execution_status = result.execution_result.status if result.execution_result else "skipped"
-            print(
-                f"{result.feature_snapshot.timestamp.isoformat()} "
-                f"signal={result.signal.side} "
-                f"risk={result.risk_decision.decision if result.risk_decision else 'skipped'} "
-                f"execution={execution_status} "
-                f"position={result.current_position} "
-                f"pnl={result.current_pnl}"
-            )
-    finally:
-        storage_repository.close()
+app.include_router(bot_router)
 
 
 def main() -> None:
-    """CLI entry point for the paper-mode runner loop."""
+    """CLI entry point for serving the FastAPI backend."""
 
-    parser = ArgumentParser(description="Run the paper trading bot loop.")
-    parser.add_argument("--iterations", type=int, default=20, help="Number of loop iterations to run.")
+    settings = get_settings()
+    parser = ArgumentParser(description="Run the Binance AI Bot API server.")
+    parser.add_argument("--host", default=settings.api_host, help="Host interface to bind.")
+    parser.add_argument("--port", type=int, default=settings.api_port, help="Port to bind.")
     args = parser.parse_args()
-    run_paper_loop(iterations=args.iterations)
+    uvicorn.run("app.main:app", host=args.host, port=args.port, reload=False)
 
 
 if __name__ == "__main__":

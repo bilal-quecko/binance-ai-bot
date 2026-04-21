@@ -105,6 +105,14 @@ class BinanceRestClient:
             symbols=symbols,
         )
 
+    async def get_ticker_24h(self) -> list[dict[str, Any]]:
+        """Fetch 24-hour ticker statistics for all Spot symbols."""
+
+        payload = await self._request("GET", "/api/v3/ticker/24hr")
+        if not isinstance(payload, list):
+            raise ValueError("Expected Binance 24h ticker response to be a list.")
+        return [item for item in payload if isinstance(item, dict)]
+
     async def get_account_info(self) -> AccountInfo:
         """Fetch Binance Spot account information via a signed request."""
 

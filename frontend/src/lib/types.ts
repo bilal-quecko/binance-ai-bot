@@ -1,4 +1,23 @@
-export type DecimalString = string;
+﻿export type DecimalString = string;
+export type RangePreset = '1D' | '7D' | '30D' | 'ALL';
+export type AutoRefreshIntervalSeconds = 0 | 5 | 10 | 30;
+
+export interface SpotSymbolItem {
+  symbol: string;
+  base_asset: string;
+  quote_asset: string;
+  status: string;
+}
+
+export interface BotStatusResponse {
+  state: 'stopped' | 'running' | 'paused' | 'error';
+  symbol: string | null;
+  timeframe: string;
+  paper_only: boolean;
+  started_at: string | null;
+  last_event_time: string | null;
+  last_error: string | null;
+}
 
 export interface HealthResponse {
   name: string;
@@ -98,8 +117,45 @@ export interface HistoryFilters {
   offset: number;
 }
 
-export interface DailyPnlPoint {
-  day: string;
-  value: number;
+export interface RangeFilters {
+  startDate?: string;
+  endDate?: string;
 }
 
+export interface EquityHistoryPoint {
+  snapshot_time: string;
+  equity: DecimalString;
+}
+
+export interface PnlHistoryPoint {
+  snapshot_time: string;
+  total_pnl: DecimalString;
+  realized_pnl: DecimalString;
+}
+
+export interface DailyPnlPoint {
+  day: string;
+  total_pnl: DecimalString;
+  realized_pnl: DecimalString;
+}
+
+export interface PnlHistoryResponse {
+  points: PnlHistoryPoint[];
+  daily: DailyPnlPoint[];
+}
+
+export interface DrawdownPoint {
+  snapshot_time: string;
+  equity: DecimalString;
+  peak_equity: DecimalString;
+  drawdown: DecimalString;
+  drawdown_pct: DecimalString;
+}
+
+export interface DrawdownResponse {
+  current_drawdown: DecimalString;
+  current_drawdown_pct: DecimalString;
+  max_drawdown: DecimalString;
+  max_drawdown_pct: DecimalString;
+  points: DrawdownPoint[];
+}

@@ -1,5 +1,7 @@
-import type {
-  DailyPnlPoint,
+﻿import type {
+  BotStatusResponse,
+  DrawdownResponse,
+  EquityHistoryPoint,
   EquityResponse,
   EventItem,
   FillItem,
@@ -7,7 +9,10 @@ import type {
   HistoryFilters,
   MetricsResponse,
   PaginatedResponse,
+  PnlHistoryResponse,
   PositionItem,
+  RangeFilters,
+  SpotSymbolItem,
   SymbolSummaryItem,
   TradeItem,
 } from './types';
@@ -19,10 +24,13 @@ function buildUrl(path: string, params?: URLSearchParams): string {
   return `${API_BASE_URL}${path}${suffix}`;
 }
 
-async function requestJson<T>(path: string, params?: URLSearchParams): Promise<T> {
+async function requestJson<T>(path: string, params?: URLSearchParams, init?: RequestInit): Promise<T> {
   const response = await fetch(buildUrl(path, params), {
+    ...init,
     headers: {
       Accept: 'application/json',
+      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(init?.headers ?? {}),
     },
   });
 
@@ -54,6 +62,17 @@ function buildHistoryParams(filters: Partial<HistoryFilters>): URLSearchParams {
   return params;
 }
 
+function buildRangeParams(filters?: RangeFilters): URLSearchParams {
+  const params = new URLSearchParams();
+  if (filters?.startDate) {
+    params.set('start_date', filters.startDate);
+  }
+  if (filters?.endDate) {
+    params.set('end_date', filters.endDate);
+  }
+  return params;
+}
+
 export function getHealth(): Promise<HealthResponse> {
   return requestJson<HealthResponse>('/health');
 }
@@ -66,8 +85,52 @@ export function getEquity(): Promise<EquityResponse> {
   return requestJson<EquityResponse>('/equity');
 }
 
+export function getEquityHistory(filters?: RangeFilters): Promise<EquityHistoryPoint[]> {
+  return requestJson<EquityHistoryPoint[]>('/equity/history', buildRangeParams(filters));
+}
+
+export function getPnlHistory(filters?: RangeFilters): Promise<PnlHistoryResponse> {
+  return requestJson<PnlHistoryResponse>('/pnl/history', buildRangeParams(filters));
+}
+
+export function getDrawdown(filters?: RangeFilters): Promise<DrawdownResponse> {
+  return requestJson<DrawdownResponse>('/drawdown', buildRangeParams(filters));
+}
+
 export function getPositions(): Promise<PositionItem[]> {
   return requestJson<PositionItem[]>('/positions');
+}
+
+export function getBotStatus(): Promise<BotStatusResponse> {
+  return requestJson<BotStatusResponse>('/bot/status');
+}
+
+export function getSymbols(query = '', limit = 20): Promise<SpotSymbolItem[]> {
+  const params = new URLSearchParams();
+  if (query.trim().length > 0) {
+    params.set('query', query.trim());
+  }
+  params.set('limit', String(limit));
+  return requestJson<SpotSymbolItem[]>('/symbols', params);
+}
+
+export function startBot(symbol: string): Promise<BotStatusResponse> {
+  return requestJson<BotStatusResponse>('/bot/start', undefined, {
+    method: 'POST',
+    body: JSON.stringify({ symbol }),
+  });
+}
+
+export function stopBot(): Promise<BotStatusResponse> {
+  return requestJson<BotStatusResponse>('/bot/stop', undefined, { method: 'POST' });
+}
+
+export function pauseBot(): Promise<BotStatusResponse> {
+  return requestJson<BotStatusResponse>('/bot/pause', undefined, { method: 'POST' });
+}
+
+export function resumeBot(): Promise<BotStatusResponse> {
+  return requestJson<BotStatusResponse>('/bot/resume', undefined, { method: 'POST' });
 }
 
 export function getDailyPnl(day?: string): Promise<string> {
@@ -90,6 +153,30 @@ export function getEvents(filters: Partial<HistoryFilters>): Promise<PaginatedRe
   return requestJson<PaginatedResponse<EventItem>>('/events', buildHistoryParams(filters));
 }
 
+export async function getAllTrades(limit = 500): Promise<TradeItem[]> {
+  const firstPage = await getTrades({ limit, offset: 0 });
+  const items = [...firstPage.items];
+  let nextOffset = firstPage.items.length;
+
+  while (items.length < firstPage.total) {
+    const page = await getTrades({ limit, offset: nextOffset });
+    items.push(...page.items);
+    if (page.items.length === 0) {
+      break;
+    }
+    nextOffset += page.items.length;
+  }
+
+  return items;
+}
+
+export async function getRecentEvents(limit = 12): Promise<EventItem[]> {
+  const firstPage = await getEvents({ limit: 1, offset: 0 });
+  const recentOffset = Math.max(firstPage.total - limit, 0);
+  const recentPage = await getEvents({ limit, offset: recentOffset });
+  return recentPage.items;
+}
+
 export function getSymbolSummaries(symbols?: string[]): Promise<SymbolSummaryItem[]> {
   const params = new URLSearchParams();
   symbols
@@ -98,24 +185,3 @@ export function getSymbolSummaries(symbols?: string[]): Promise<SymbolSummaryIte
     .forEach((symbol) => params.append('symbols', symbol));
   return requestJson<SymbolSummaryItem[]>('/summary/symbols', params);
 }
-
-export async function getRecentDailyPnl(days: number): Promise<DailyPnlPoint[]> {
-  const now = new Date();
-  const requests: Promise<string>[] = [];
-  const labels: string[] = [];
-
-  for (let index = days - 1; index >= 0; index -= 1) {
-    const current = new Date(now);
-    current.setUTCDate(now.getUTCDate() - index);
-    const day = current.toISOString().slice(0, 10);
-    labels.push(day);
-    requests.push(getDailyPnl(day));
-  }
-
-  const values = await Promise.all(requests);
-  return values.map((value, index) => ({
-    day: labels[index],
-    value: Number(value),
-  }));
-}
-

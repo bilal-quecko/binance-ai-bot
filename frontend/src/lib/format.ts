@@ -1,4 +1,4 @@
-export function formatDecimal(value: string | number, options?: Intl.NumberFormatOptions): string {
+﻿export function formatDecimal(value: string | number, options?: Intl.NumberFormatOptions): string {
   const numericValue = typeof value === 'string' ? Number(value) : value;
   return new Intl.NumberFormat('en-US', {
     maximumFractionDigits: 4,
@@ -15,6 +15,14 @@ export function formatCurrency(value: string | number): string {
   }).format(numericValue);
 }
 
+export function formatPercent(value: string | number, digits = 2): string {
+  const numericValue = typeof value === 'string' ? Number(value) : value;
+  return new Intl.NumberFormat('en-US', {
+    style: 'percent',
+    maximumFractionDigits: digits,
+  }).format(numericValue);
+}
+
 export function formatDateTime(value: string | null): string {
   if (!value) {
     return '-';
@@ -22,6 +30,18 @@ export function formatDateTime(value: string | null): string {
   return new Intl.DateTimeFormat('en-US', {
     dateStyle: 'medium',
     timeStyle: 'short',
+  }).format(new Date(value));
+}
+
+export function formatShortDateTime(value: string | null): string {
+  if (!value) {
+    return '-';
+  }
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
   }).format(new Date(value));
 }
 
@@ -49,4 +69,3 @@ export function badgeTone(value: string): string {
 export function classNames(...parts: Array<string | false | null | undefined>): string {
   return parts.filter(Boolean).join(' ');
 }
-

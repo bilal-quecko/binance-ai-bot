@@ -66,6 +66,11 @@ class StrategyRunner:
         elif snapshot.last_price is not None:
             self._last_price_by_symbol[symbol] = snapshot.last_price
 
+    def ingest_snapshot(self, snapshot: MarketSnapshot) -> None:
+        """Ingest market data into the runner cache without executing a cycle."""
+
+        self._record_snapshot(snapshot)
+
     def _current_equity(self) -> Decimal:
         """Return paper equity from balances plus marked-to-market positions."""
 
