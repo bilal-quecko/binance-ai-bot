@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
+import { AIEvaluationCard } from './components/AIEvaluationCard';
 import { AIHistorySection } from './components/AIHistorySection';
 import { AutoRefreshSelector } from './components/AutoRefreshSelector';
 import { BotControlPanel } from './components/BotControlPanel';
@@ -7,6 +8,7 @@ import { MetricCard } from './components/MetricCard';
 import { SectionCard } from './components/SectionCard';
 import { StatePanel } from './components/StatePanel';
 import {
+  getAISignalEvaluation,
   getAISignal,
   getAISignalHistory,
   getBotStatus,
@@ -21,6 +23,7 @@ import {
 } from './lib/api';
 import { badgeTone, classNames, formatCurrency, formatDateTime, formatDecimal, pnlTone } from './lib/format';
 import type {
+  AIOutcomeEvaluationResponse,
   AISignalHistoryResponse,
   AISignalSummary,
   AutoRefreshIntervalSeconds,
@@ -57,6 +60,7 @@ const INITIAL_AI_HISTORY: AISignalHistoryResponse = {
   limit: 20,
   offset: 0,
 };
+const INITIAL_AI_EVALUATION: AIOutcomeEvaluationResponse | null = null;
 
 function createRemoteState<T>(data: T): RemoteState<T> {
   return {
@@ -97,6 +101,7 @@ function App() {
   const [workstation, setWorkstation] = useState<RemoteState<WorkstationResponse | null>>(createRemoteState(INITIAL_WORKSTATION));
   const [aiSignal, setAiSignal] = useState<RemoteState<AISignalSummary | null>>(createRemoteState(INITIAL_AI_SIGNAL));
   const [aiHistory, setAiHistory] = useState<RemoteState<AISignalHistoryResponse>>(createRemoteState(INITIAL_AI_HISTORY));
+  const [aiEvaluation, setAiEvaluation] = useState<RemoteState<AIOutcomeEvaluationResponse | null>>(createRemoteState(INITIAL_AI_EVALUATION));
   const [symbolResults, setSymbolResults] = useState<RemoteState<SpotSymbolItem[]>>(createRemoteState<SpotSymbolItem[]>([]));
 
   const [selectedSymbol, setSelectedSymbol] = useState('');
@@ -122,14 +127,16 @@ function App() {
       setWorkstation((current) => setPending(current));
       setAiSignal((current) => setPending(current));
       setAiHistory((current) => setPending(current));
+      setAiEvaluation((current) => setPending(current));
     } else {
       setWorkstation({ data: null, loading: false, refreshing: false, error: null });
       setAiSignal({ data: null, loading: false, refreshing: false, error: null });
       setAiHistory({ data: INITIAL_AI_HISTORY, loading: false, refreshing: false, error: null });
+      setAiEvaluation({ data: null, loading: false, refreshing: false, error: null });
     }
 
     try {
-      const [healthData, botStatusData, workstationData, aiSignalData, aiHistoryData] = await Promise.all([
+      const [healthData, botStatusData, workstationData, aiSignalData, aiHistoryData, aiEvaluationData] = await Promise.all([
         getHealth(),
         getBotStatus(),
         symbol.trim().length > 0 ? getWorkstation(symbol) : Promise.resolve<WorkstationResponse | null>(null),
@@ -137,12 +144,14 @@ function App() {
         symbol.trim().length > 0
           ? getAISignalHistory(symbol, { limit: INITIAL_AI_HISTORY.limit, offset: 0 })
           : Promise.resolve<AISignalHistoryResponse>(INITIAL_AI_HISTORY),
+        symbol.trim().length > 0 ? getAISignalEvaluation(symbol) : Promise.resolve<AIOutcomeEvaluationResponse | null>(null),
       ]);
       setHealth({ data: healthData, loading: false, refreshing: false, error: null });
       setBotStatus({ data: botStatusData, loading: false, refreshing: false, error: null });
       setWorkstation({ data: workstationData, loading: false, refreshing: false, error: null });
       setAiSignal({ data: aiSignalData, loading: false, refreshing: false, error: null });
       setAiHistory({ data: aiHistoryData, loading: false, refreshing: false, error: null });
+      setAiEvaluation({ data: aiEvaluationData, loading: false, refreshing: false, error: null });
       setLastUpdatedAt(new Date());
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to refresh workstation state.';
@@ -152,6 +161,7 @@ function App() {
         setWorkstation((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setAiSignal((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setAiHistory((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setAiEvaluation((current) => ({ ...current, loading: false, refreshing: false, error: message }));
       }
     }
   }, []);
@@ -195,6 +205,7 @@ function App() {
     setWorkstation({ data: null, loading: false, refreshing: false, error: null });
     setAiSignal({ data: null, loading: false, refreshing: false, error: null });
     setAiHistory({ data: INITIAL_AI_HISTORY, loading: false, refreshing: false, error: null });
+    setAiEvaluation({ data: null, loading: false, refreshing: false, error: null });
   }, []);
 
   const runBotAction = useCallback(async (action: () => Promise<BotStatusResponse>) => {
@@ -225,6 +236,7 @@ function App() {
       setWorkstation({ data: null, loading: false, refreshing: false, error: null });
       setAiSignal({ data: null, loading: false, refreshing: false, error: null });
       setAiHistory({ data: INITIAL_AI_HISTORY, loading: false, refreshing: false, error: null });
+      setAiEvaluation({ data: null, loading: false, refreshing: false, error: null });
       setLastUpdatedAt(new Date());
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to reset the paper session.';
@@ -465,6 +477,16 @@ function App() {
                       loading={aiHistory.loading}
                       refreshing={aiHistory.refreshing}
                       error={aiHistory.error}
+                    />
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <AIEvaluationCard
+                      symbol={selectedSymbol}
+                      evaluation={aiEvaluation.data}
+                      loading={aiEvaluation.loading}
+                      refreshing={aiEvaluation.refreshing}
+                      error={aiEvaluation.error}
                     />
                   </div>
                 </div>

@@ -261,6 +261,8 @@ class StrategyRunner:
 
         self._record_snapshot(snapshot)
         symbol = snapshot.symbol.upper()
+        if self._storage_repository is not None and snapshot.candle is not None:
+            self._storage_repository.insert_market_candle_snapshot(snapshot.candle)
         feature_snapshot = self._build_feature_snapshot(symbol)
         existing_position = self._broker.get_position(symbol)
         signal = self._strategy.evaluate(feature_snapshot, position=existing_position)

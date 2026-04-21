@@ -148,3 +148,15 @@ class AISignalSnapshotRecord:
     suggested_action: str
     explanation: str
     feature_summary: AISignalFeatureSummaryRecord
+
+
+@dataclass(slots=True)
+class MarketCandleSnapshotRecord:
+    """Persisted closed-candle snapshot for later evaluation."""
+
+    symbol: str
+    timeframe: str
+    open_time: datetime
+    close_time: datetime
+    close_price: Decimal
+    event_time: datetime

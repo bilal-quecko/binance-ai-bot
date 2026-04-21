@@ -1,4 +1,5 @@
 ﻿import type {
+  AIOutcomeEvaluationResponse,
   AISignalHistoryResponse,
   AISignalSummary,
   BotStatusResponse,
@@ -130,6 +131,11 @@ export function getAISignalHistory(
     offset: filters?.offset ?? 0,
   });
   return requestJson<AISignalHistoryResponse>('/bot/ai-signal/history', params);
+}
+
+export function getAISignalEvaluation(symbol: string): Promise<AIOutcomeEvaluationResponse> {
+  const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
+  return requestJson<AIOutcomeEvaluationResponse>('/bot/ai-signal/evaluation', params);
 }
 
 export function getSymbols(query = '', limit = 20): Promise<SpotSymbolItem[]> {

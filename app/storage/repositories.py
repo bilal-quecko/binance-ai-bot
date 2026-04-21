@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Any
 
 from app.ai.models import AISignalSnapshot
+from app.market_data.candles import Candle
 from app.paper.models import FillResult, Position
 from app.risk.models import RiskDecision
 from app.storage.db import create_db_connection
@@ -19,6 +20,7 @@ from app.storage.models import (
     DrawdownSummary,
     EquityHistoryPoint,
     FillRecord,
+    MarketCandleSnapshotRecord,
     PnlHistoryPoint,
     PnlSnapshotRecord,
     PositionSnapshotRecord,
@@ -141,6 +143,29 @@ class StorageRepository:
             self._connection.execute("DELETE FROM pnl_snapshots")
             self._connection.execute("DELETE FROM runner_events")
             self._connection.execute("DELETE FROM ai_signal_snapshots")
+            self._connection.execute("DELETE FROM market_candle_snapshots")
+
+    def insert_market_candle_snapshot(self, candle: Candle) -> None:
+        """Persist a closed candle for later AI outcome validation."""
+
+        if not candle.is_closed:
+            return
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT OR REPLACE INTO market_candle_snapshots (
+                    symbol, timeframe, open_time, close_time, close_price, event_time
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    candle.symbol.upper(),
+                    candle.timeframe,
+                    candle.open_time.isoformat(),
+                    candle.close_time.isoformat(),
+                    str(candle.close),
+                    candle.event_time.isoformat(),
+                ),
+            )
 
     def insert_ai_signal_snapshot(self, snapshot: AISignalSnapshot) -> bool:
         """Persist an AI advisory snapshot when it materially changed."""
@@ -280,6 +305,46 @@ class StorageRepository:
         )
         row = self._connection.execute(query, tuple(params)).fetchone()
         return int(row["row_count"]) if row is not None else 0
+
+    def get_market_candle_history(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> list[MarketCandleSnapshotRecord]:
+        """Return persisted closed-candle history for one symbol."""
+
+        query = """
+            SELECT symbol, timeframe, open_time, close_time, close_price, event_time
+            FROM market_candle_snapshots
+            WHERE symbol = ?
+        """
+        params: list[Any] = [symbol.upper()]
+        if timeframe is not None:
+            query += " AND timeframe = ?"
+            params.append(timeframe)
+        query, params = self._apply_date_filters(
+            query=query,
+            params=params,
+            start_date=start_date,
+            end_date=end_date,
+            timestamp_column="close_time",
+        )
+        query += " ORDER BY close_time ASC"
+        rows = self._connection.execute(query, tuple(params)).fetchall()
+        return [
+            MarketCandleSnapshotRecord(
+                symbol=row["symbol"],
+                timeframe=row["timeframe"],
+                open_time=datetime.fromisoformat(row["open_time"]),
+                close_time=datetime.fromisoformat(row["close_time"]),
+                close_price=_decimal(row["close_price"]),
+                event_time=datetime.fromisoformat(row["event_time"]),
+            )
+            for row in rows
+        ]
 
     def insert_trade(
         self,

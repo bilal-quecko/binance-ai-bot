@@ -252,6 +252,8 @@ class PaperBotRuntime:
                     continue
                 if snapshot.candle is None or not snapshot.candle.is_closed:
                     continue
+                if self._storage_repository is not None:
+                    self._storage_repository.insert_market_candle_snapshot(snapshot.candle)
                 last_processed_open_time = self._last_processed_candle_open_time.get(symbol)
                 if (
                     last_processed_open_time is not None

@@ -191,6 +191,23 @@ def test_symbol_and_bot_control_endpoints() -> None:
             ),
         )
     )
+    repository.insert_market_candle_snapshot(
+        Candle(
+            symbol='BTCUSDT',
+            timeframe='1m',
+            open=Decimal('100'),
+            high=Decimal('101'),
+            low=Decimal('99'),
+            close=Decimal('101'),
+            volume=Decimal('10'),
+            quote_volume=Decimal('1010'),
+            open_time=datetime(2024, 3, 9, 16, 4, 0, 1000, tzinfo=UTC),
+            close_time=datetime(2024, 3, 9, 16, 5, tzinfo=UTC),
+            event_time=datetime(2024, 3, 9, 16, 5, tzinfo=UTC),
+            trade_count=10,
+            is_closed=True,
+        )
+    )
     repository.insert_ai_signal_snapshot(
         AISignalSnapshot(
             symbol='BTCUSDT',
@@ -240,6 +257,7 @@ def test_symbol_and_bot_control_endpoints() -> None:
         workstation_response = client.get('/bot/workstation', params={'symbol': 'BTCUSDT'})
         ai_signal_response = client.get('/bot/ai-signal', params={'symbol': 'BTCUSDT'})
         ai_history_response = client.get('/bot/ai-signal/history', params={'symbol': 'BTCUSDT', 'limit': 10, 'offset': 0})
+        ai_evaluation_response = client.get('/bot/ai-signal/evaluation', params={'symbol': 'BTCUSDT'})
         pause_response = client.post('/bot/pause')
         resume_response = client.post('/bot/resume')
         reset_response = client.post('/bot/reset')
@@ -283,6 +301,11 @@ def test_symbol_and_bot_control_endpoints() -> None:
     assert ai_history_response.json()['total'] == 2
     assert ai_history_response.json()['items'][0]['bias'] == 'sideways'
     assert ai_history_response.json()['items'][1]['symbol'] == 'BTCUSDT'
+
+    assert ai_evaluation_response.status_code == 200
+    assert ai_evaluation_response.json()['symbol'] == 'BTCUSDT'
+    assert ai_evaluation_response.json()['horizons'][0]['horizon'] == '5m'
+    assert 'directional_accuracy_pct' in ai_evaluation_response.json()['horizons'][0]
 
     assert pause_response.status_code == 200
     assert pause_response.json()['state'] == 'paused'

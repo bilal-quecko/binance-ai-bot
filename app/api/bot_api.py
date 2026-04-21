@@ -9,6 +9,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from app.ai import AIOutcomeEvaluator
 from app.bot import BotStatus, PaperBotRuntime, WorkstationState
 from app.config import Settings, get_settings
 from app.exchange.symbol_service import SpotSymbolRecord, SpotSymbolService
@@ -145,6 +146,48 @@ class AISignalHistoryResponse(BaseModel):
     offset: int
 
 
+class AIOutcomeSummaryResponse(BaseModel):
+    """Aggregated AI outcome metrics for one evaluation horizon."""
+
+    horizon: str
+    sample_size: int
+    directional_accuracy_pct: Decimal
+    confidence_calibration_pct: Decimal
+    false_positive_count: int
+    false_positive_rate_pct: Decimal
+    false_reversal_count: int
+    false_reversal_rate_pct: Decimal
+
+
+class AIOutcomeSampleResponse(BaseModel):
+    """One evaluated AI advisory sample."""
+
+    symbol: str
+    snapshot_time: datetime
+    horizon: str
+    bias: str
+    confidence: int
+    entry_signal: bool
+    exit_signal: bool
+    suggested_action: str
+    baseline_close: Decimal
+    future_close: Decimal
+    return_pct: Decimal
+    observed_direction: str
+    directional_correct: bool
+    false_positive: bool
+    false_reversal: bool
+
+
+class AIOutcomeEvaluationResponse(BaseModel):
+    """Symbol-scoped AI outcome evaluation payload."""
+
+    symbol: str
+    generated_at: datetime
+    horizons: list[AIOutcomeSummaryResponse]
+    recent_samples: list[AIOutcomeSampleResponse]
+
+
 class WorkstationResponse(BaseModel):
     """Symbol-scoped workstation payload."""
 
@@ -250,6 +293,54 @@ def _to_ai_signal_response(
             spread_ratio=spread_ratio,
             microstructure_healthy=microstructure_healthy,
         ),
+    )
+
+
+def _to_ai_outcome_evaluation_response(
+    *,
+    symbol: str,
+    generated_at: datetime,
+    horizons,
+    recent_samples,
+) -> AIOutcomeEvaluationResponse:
+    """Build a stable AI outcome evaluation API response."""
+
+    return AIOutcomeEvaluationResponse(
+        symbol=symbol,
+        generated_at=generated_at,
+        horizons=[
+            AIOutcomeSummaryResponse(
+                horizon=item.horizon,
+                sample_size=item.sample_size,
+                directional_accuracy_pct=item.directional_accuracy_pct,
+                confidence_calibration_pct=item.confidence_calibration_pct,
+                false_positive_count=item.false_positive_count,
+                false_positive_rate_pct=item.false_positive_rate_pct,
+                false_reversal_count=item.false_reversal_count,
+                false_reversal_rate_pct=item.false_reversal_rate_pct,
+            )
+            for item in horizons
+        ],
+        recent_samples=[
+            AIOutcomeSampleResponse(
+                symbol=item.symbol,
+                snapshot_time=item.snapshot_time,
+                horizon=item.horizon,
+                bias=item.bias,
+                confidence=item.confidence,
+                entry_signal=item.entry_signal,
+                exit_signal=item.exit_signal,
+                suggested_action=item.suggested_action,
+                baseline_close=item.baseline_close,
+                future_close=item.future_close,
+                return_pct=item.return_pct,
+                observed_direction=item.observed_direction,
+                directional_correct=item.directional_correct,
+                false_positive=item.false_positive,
+                false_reversal=item.false_reversal,
+            )
+            for item in recent_samples
+        ],
     )
 
 
@@ -593,4 +684,25 @@ def get_ai_signal_history(
         total=total,
         limit=limit,
         offset=offset,
+    )
+
+
+@router.get("/bot/ai-signal/evaluation", response_model=AIOutcomeEvaluationResponse)
+def get_ai_signal_evaluation(
+    symbol: Annotated[str, Query(min_length=1)],
+    settings: Annotated[Settings, Depends(get_settings_dependency)],
+) -> AIOutcomeEvaluationResponse:
+    """Return symbol-scoped AI advisory outcome validation metrics."""
+
+    normalized_symbol = symbol.strip().upper()
+    repository = StorageRepository(settings.database_url)
+    try:
+        evaluation = AIOutcomeEvaluator(repository).evaluate(symbol=normalized_symbol)
+    finally:
+        repository.close()
+    return _to_ai_outcome_evaluation_response(
+        symbol=evaluation.symbol,
+        generated_at=evaluation.generated_at,
+        horizons=evaluation.horizons,
+        recent_samples=evaluation.recent_samples,
     )

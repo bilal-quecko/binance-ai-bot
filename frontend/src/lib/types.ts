@@ -80,6 +80,42 @@ export interface AISignalHistoryResponse {
   offset: number;
 }
 
+export interface AIOutcomeHorizonSummary {
+  horizon: '5m' | '15m' | '1h';
+  sample_size: number;
+  directional_accuracy_pct: DecimalString;
+  confidence_calibration_pct: DecimalString;
+  false_positive_count: number;
+  false_positive_rate_pct: DecimalString;
+  false_reversal_count: number;
+  false_reversal_rate_pct: DecimalString;
+}
+
+export interface AIOutcomeSampleSummary {
+  symbol: string;
+  snapshot_time: string;
+  horizon: '5m' | '15m' | '1h';
+  bias: 'bullish' | 'bearish' | 'sideways';
+  confidence: number;
+  entry_signal: boolean;
+  exit_signal: boolean;
+  suggested_action: 'wait' | 'enter' | 'hold' | 'exit';
+  baseline_close: DecimalString;
+  future_close: DecimalString;
+  return_pct: DecimalString;
+  observed_direction: 'bullish' | 'bearish' | 'sideways' | 'unknown';
+  directional_correct: boolean;
+  false_positive: boolean;
+  false_reversal: boolean;
+}
+
+export interface AIOutcomeEvaluationResponse {
+  symbol: string;
+  generated_at: string;
+  horizons: AIOutcomeHorizonSummary[];
+  recent_samples: AIOutcomeSampleSummary[];
+}
+
 export interface SignalSummary {
   side: 'BUY' | 'SELL' | 'HOLD';
   confidence: DecimalString;

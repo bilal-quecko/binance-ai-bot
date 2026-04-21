@@ -82,6 +82,18 @@ SCHEMA_STATEMENTS = (
         feature_summary_json TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS market_candle_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        timeframe TEXT NOT NULL,
+        open_time TEXT NOT NULL,
+        close_time TEXT NOT NULL,
+        close_price TEXT NOT NULL,
+        event_time TEXT NOT NULL,
+        UNIQUE(symbol, timeframe, open_time)
+    )
+    """,
 )
 
 

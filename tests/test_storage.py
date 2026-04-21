@@ -76,6 +76,7 @@ def test_storage_repository_creates_required_tables() -> None:
     assert {
         "ai_signal_snapshots",
         "fills",
+        "market_candle_snapshots",
         "pnl_snapshots",
         "positions_snapshots",
         "runner_events",

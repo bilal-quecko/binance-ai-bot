@@ -37,6 +37,11 @@ The project already includes:
   - exit preview
   - suggested action
   - explanation
+- AI outcome validation:
+  - directional accuracy
+  - confidence calibration
+  - false positives
+  - false reversals
 - tests/build checks passing
 
 ### What it is right now
@@ -228,16 +233,16 @@ Codex and all contributors must follow these rules.
 **Goal:** prove whether AI helps.
 
 ## Must complete
-- [ ] implement AI-vs-outcome evaluation pipeline
+- [x] implement AI-vs-outcome evaluation pipeline
 - [ ] compare:
-  - [ ] AI bias vs subsequent price direction
+  - [x] AI bias vs subsequent price direction
   - [ ] AI entry suggestion vs later opportunity quality
   - [ ] AI exit suggestion vs realized outcomes
-- [ ] score AI snapshot usefulness
-- [ ] add confidence calibration analysis
+- [x] score AI snapshot usefulness
+- [x] add confidence calibration analysis
 - [ ] compare deterministic-only vs AI-assisted signal quality
 - [ ] identify false positives and false negatives
-- [ ] add evaluation views/reports
+- [x] add evaluation views/reports
 
 ## Acceptance criteria
 - the project can answer: “Does AI improve the system?”
@@ -668,9 +673,9 @@ This project becomes a **game-changing product** only when it can:
 ### Recommended next implementation step
 Implement:
 
-> **Phase 1 — AI advisory history persistence and AI-history visualization**
+> **Phase 2 — Performance analytics and evaluation layer**
 
-That is the best next step because it makes the current AI layer measurable and prepares the platform for proper validation.
+That is the best next step because the workstation now has AI history and initial AI outcome validation, so broader strategy and symbol analytics are the next missing evaluation layer.
 
 ---
 
