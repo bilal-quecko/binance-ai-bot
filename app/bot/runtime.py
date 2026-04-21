@@ -129,17 +129,8 @@ class PaperBotRuntime:
                 realized_pnl=Decimal("0"),
             )
 
-        candles = self._runner.get_candle_history(normalized_symbol)
-        top_of_book = self._runner.get_top_of_book(normalized_symbol)
         feature_snapshot = self._runner.get_feature_snapshot(normalized_symbol)
-        ai_signal = None
-        if feature_snapshot is not None and candles:
-            ai_signal = self._ai_signal_service.build_signal(
-                symbol=normalized_symbol,
-                candles=candles,
-                feature_snapshot=feature_snapshot,
-                top_of_book=top_of_book,
-            )
+        ai_signal = self._persist_ai_signal_if_needed(normalized_symbol, feature_snapshot)
 
         return WorkstationState(
             symbol=normalized_symbol,
@@ -154,6 +145,52 @@ class PaperBotRuntime:
             total_pnl=self._runner.current_pnl(),
             realized_pnl=self._runner.realized_pnl(),
         )
+
+    def _build_ai_signal(
+        self,
+        symbol: str,
+        feature_snapshot: FeatureSnapshot | None,
+    ) -> AISignalSnapshot | None:
+        """Build an AI advisory snapshot from the current runner cache."""
+
+        if self._runner is None or feature_snapshot is None:
+            return None
+        candles = self._runner.get_candle_history(symbol)
+        if not candles:
+            return None
+        return self._ai_signal_service.build_signal(
+            symbol=symbol,
+            candles=candles,
+            feature_snapshot=feature_snapshot,
+            top_of_book=self._runner.get_top_of_book(symbol),
+        )
+
+    def _persist_ai_signal_if_needed(
+        self,
+        symbol: str,
+        feature_snapshot: FeatureSnapshot | None,
+    ) -> AISignalSnapshot | None:
+        """Persist a materially changed AI advisory snapshot for the active symbol."""
+
+        ai_signal = self._build_ai_signal(symbol, feature_snapshot)
+        if ai_signal is None or self._storage_repository is None:
+            return ai_signal
+        was_inserted = self._storage_repository.insert_ai_signal_snapshot(ai_signal)
+        if was_inserted:
+            self._storage_repository.insert_event(
+                event_type="ai_signal_snapshot",
+                symbol=symbol,
+                message=f"bias={ai_signal.bias} action={ai_signal.suggested_action}",
+                payload={
+                    "bias": ai_signal.bias,
+                    "confidence": ai_signal.confidence,
+                    "entry_signal": ai_signal.entry_signal,
+                    "exit_signal": ai_signal.exit_signal,
+                    "suggested_action": ai_signal.suggested_action,
+                },
+                event_time=ai_signal.feature_vector.timestamp,
+            )
+        return ai_signal
 
     def _build_streams(self, symbol: str, timeframe: str) -> list[str]:
         """Build required Binance Spot market-data streams for one symbol."""
@@ -228,7 +265,9 @@ class PaperBotRuntime:
                     )
                     continue
 
-                self._runner.process_snapshot(snapshot)
+                cycle_result = self._runner.process_snapshot(snapshot)
+                if cycle_result is not None:
+                    self._persist_ai_signal_if_needed(symbol, cycle_result.feature_snapshot)
                 self._last_processed_candle_open_time[symbol] = snapshot.candle.open_time
         except asyncio.CancelledError:
             raise

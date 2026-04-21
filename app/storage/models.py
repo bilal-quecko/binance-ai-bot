@@ -119,3 +119,32 @@ class RunnerEventRecord:
     message: str
     payload_json: str
     event_time: datetime
+
+
+@dataclass(slots=True)
+class AISignalFeatureSummaryRecord:
+    """Compact persisted AI feature summary."""
+
+    candle_count: int
+    close_price: Decimal
+    volatility_pct: Decimal | None
+    momentum: Decimal | None
+    volume_change_pct: Decimal | None
+    volume_spike_ratio: Decimal | None
+    spread_ratio: Decimal | None
+    microstructure_healthy: bool
+
+
+@dataclass(slots=True)
+class AISignalSnapshotRecord:
+    """Persisted AI advisory snapshot."""
+
+    symbol: str
+    timestamp: datetime
+    bias: str
+    confidence: int
+    entry_signal: bool
+    exit_signal: bool
+    suggested_action: str
+    explanation: str
+    feature_summary: AISignalFeatureSummaryRecord

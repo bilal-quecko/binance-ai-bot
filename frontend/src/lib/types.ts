@@ -63,6 +63,7 @@ export interface AISignalFeatureSummary {
 
 export interface AISignalSummary {
   symbol: string;
+  timestamp: string;
   bias: 'bullish' | 'bearish' | 'sideways';
   confidence: number;
   entry_signal: boolean;
@@ -70,6 +71,13 @@ export interface AISignalSummary {
   suggested_action: 'wait' | 'enter' | 'hold' | 'exit';
   explanation: string;
   features: AISignalFeatureSummary;
+}
+
+export interface AISignalHistoryResponse {
+  items: AISignalSummary[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 export interface SignalSummary {

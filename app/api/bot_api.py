@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated
 
@@ -126,6 +126,7 @@ class AISignalResponse(BaseModel):
     """Serialized AI advisory market read."""
 
     symbol: str
+    timestamp: datetime
     bias: str
     confidence: int
     entry_signal: bool
@@ -133,6 +134,15 @@ class AISignalResponse(BaseModel):
     suggested_action: str
     explanation: str
     features: AIFeatureResponse
+
+
+class AISignalHistoryResponse(BaseModel):
+    """Paginated AI advisory history for one symbol."""
+
+    items: list[AISignalResponse]
+    total: int
+    limit: int
+    offset: int
 
 
 class WorkstationResponse(BaseModel):
@@ -197,6 +207,49 @@ def _to_status_response(status: BotStatus) -> BotStatusResponse:
         started_at=status.started_at,
         last_event_time=status.last_event_time,
         last_error=status.last_error,
+    )
+
+
+def _to_ai_signal_response(
+    *,
+    symbol: str,
+    timestamp: datetime,
+    bias: str,
+    confidence: int,
+    entry_signal: bool,
+    exit_signal: bool,
+    suggested_action: str,
+    explanation: str,
+    candle_count: int,
+    close_price: Decimal,
+    volatility_pct: Decimal | None,
+    momentum: Decimal | None,
+    volume_change_pct: Decimal | None,
+    volume_spike_ratio: Decimal | None,
+    spread_ratio: Decimal | None,
+    microstructure_healthy: bool,
+) -> AISignalResponse:
+    """Build a stable AI advisory API response."""
+
+    return AISignalResponse(
+        symbol=symbol,
+        timestamp=timestamp,
+        bias=bias,
+        confidence=confidence,
+        entry_signal=entry_signal,
+        exit_signal=exit_signal,
+        suggested_action=suggested_action,
+        explanation=explanation,
+        features=AIFeatureResponse(
+            candle_count=candle_count,
+            close_price=close_price,
+            volatility_pct=volatility_pct,
+            momentum=momentum,
+            volume_change_pct=volume_change_pct,
+            volume_spike_ratio=volume_spike_ratio,
+            spread_ratio=spread_ratio,
+            microstructure_healthy=microstructure_healthy,
+        ),
     )
 
 
@@ -288,24 +341,23 @@ def _to_workstation_response(
             else None
         ),
         ai_signal=(
-            AISignalResponse(
+            _to_ai_signal_response(
                 symbol=ai_signal.symbol,
+                timestamp=ai_signal.feature_vector.timestamp,
                 bias=ai_signal.bias,
                 confidence=ai_signal.confidence,
                 entry_signal=ai_signal.entry_signal,
                 exit_signal=ai_signal.exit_signal,
                 suggested_action=ai_signal.suggested_action,
                 explanation=ai_signal.explanation,
-                features=AIFeatureResponse(
-                    candle_count=ai_signal.feature_vector.candle_count,
-                    close_price=ai_signal.feature_vector.close_price,
-                    volatility_pct=ai_signal.feature_vector.volatility_pct,
-                    momentum=ai_signal.feature_vector.momentum,
-                    volume_change_pct=ai_signal.feature_vector.volume_change_pct,
-                    volume_spike_ratio=ai_signal.feature_vector.volume_spike_ratio,
-                    spread_ratio=ai_signal.feature_vector.spread_ratio,
-                    microstructure_healthy=ai_signal.feature_vector.microstructure_healthy,
-                ),
+                candle_count=ai_signal.feature_vector.candle_count,
+                close_price=ai_signal.feature_vector.close_price,
+                volatility_pct=ai_signal.feature_vector.volatility_pct,
+                momentum=ai_signal.feature_vector.momentum,
+                volume_change_pct=ai_signal.feature_vector.volume_change_pct,
+                volume_spike_ratio=ai_signal.feature_vector.volume_spike_ratio,
+                spread_ratio=ai_signal.feature_vector.spread_ratio,
+                microstructure_healthy=ai_signal.feature_vector.microstructure_healthy,
             )
             if ai_signal is not None
             else None
@@ -452,11 +504,93 @@ def get_workstation(
 def get_ai_signal(
     symbol: Annotated[str, Query(min_length=1)],
     runtime: Annotated[PaperBotRuntime, Depends(get_bot_runtime)],
+    settings: Annotated[Settings, Depends(get_settings_dependency)],
 ) -> AISignalResponse | None:
     """Return the AI advisory signal for the selected symbol when available."""
 
-    state = runtime.workstation_state(symbol.strip().upper())
+    normalized_symbol = symbol.strip().upper()
+    state = runtime.workstation_state(normalized_symbol)
     if state.ai_signal is None:
-        return None
+        repository = StorageRepository(settings.database_url)
+        try:
+            latest_snapshot = repository.get_latest_ai_signal(normalized_symbol)
+        finally:
+            repository.close()
+        if latest_snapshot is None:
+            return None
+        return _to_ai_signal_response(
+            symbol=latest_snapshot.symbol,
+            timestamp=latest_snapshot.timestamp,
+            bias=latest_snapshot.bias,
+            confidence=latest_snapshot.confidence,
+            entry_signal=latest_snapshot.entry_signal,
+            exit_signal=latest_snapshot.exit_signal,
+            suggested_action=latest_snapshot.suggested_action,
+            explanation=latest_snapshot.explanation,
+            candle_count=latest_snapshot.feature_summary.candle_count,
+            close_price=latest_snapshot.feature_summary.close_price,
+            volatility_pct=latest_snapshot.feature_summary.volatility_pct,
+            momentum=latest_snapshot.feature_summary.momentum,
+            volume_change_pct=latest_snapshot.feature_summary.volume_change_pct,
+            volume_spike_ratio=latest_snapshot.feature_summary.volume_spike_ratio,
+            spread_ratio=latest_snapshot.feature_summary.spread_ratio,
+            microstructure_healthy=latest_snapshot.feature_summary.microstructure_healthy,
+        )
     workstation = _to_workstation_response(state=state, status=runtime.status())
     return workstation.ai_signal
+
+
+@router.get("/bot/ai-signal/history", response_model=AISignalHistoryResponse)
+def get_ai_signal_history(
+    symbol: Annotated[str, Query(min_length=1)],
+    settings: Annotated[Settings, Depends(get_settings_dependency)],
+    start_date: date | None = None,
+    end_date: date | None = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> AISignalHistoryResponse:
+    """Return paginated AI advisory history for one symbol."""
+
+    normalized_symbol = symbol.strip().upper()
+    repository = StorageRepository(settings.database_url)
+    try:
+        items = repository.get_ai_signal_history(
+            symbol=normalized_symbol,
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+            offset=offset,
+        )
+        total = repository.count_ai_signal_history(
+            symbol=normalized_symbol,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    finally:
+        repository.close()
+    return AISignalHistoryResponse(
+        items=[
+            _to_ai_signal_response(
+                symbol=item.symbol,
+                timestamp=item.timestamp,
+                bias=item.bias,
+                confidence=item.confidence,
+                entry_signal=item.entry_signal,
+                exit_signal=item.exit_signal,
+                suggested_action=item.suggested_action,
+                explanation=item.explanation,
+                candle_count=item.feature_summary.candle_count,
+                close_price=item.feature_summary.close_price,
+                volatility_pct=item.feature_summary.volatility_pct,
+                momentum=item.feature_summary.momentum,
+                volume_change_pct=item.feature_summary.volume_change_pct,
+                volume_spike_ratio=item.feature_summary.volume_spike_ratio,
+                spread_ratio=item.feature_summary.spread_ratio,
+                microstructure_healthy=item.feature_summary.microstructure_healthy,
+            )
+            for item in items
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )

@@ -7,10 +7,13 @@ from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
 
+from app.ai.models import AISignalSnapshot
 from app.paper.models import FillResult, Position
 from app.risk.models import RiskDecision
 from app.storage.db import create_db_connection
 from app.storage.models import (
+    AISignalFeatureSummaryRecord,
+    AISignalSnapshotRecord,
     DailyPnlRecord,
     DrawdownPoint,
     DrawdownSummary,
@@ -35,6 +38,66 @@ def _parse_reason_codes(value: str) -> tuple[str, ...]:
 
     raw = json.loads(value)
     return tuple(str(item) for item in raw)
+
+
+def _parse_ai_feature_summary(value: str) -> AISignalFeatureSummaryRecord:
+    """Parse a compact persisted AI feature summary."""
+
+    raw = json.loads(value)
+    return AISignalFeatureSummaryRecord(
+        candle_count=int(raw["candle_count"]),
+        close_price=_decimal(raw["close_price"]),
+        volatility_pct=_decimal(raw["volatility_pct"]) if raw["volatility_pct"] is not None else None,
+        momentum=_decimal(raw["momentum"]) if raw["momentum"] is not None else None,
+        volume_change_pct=(
+            _decimal(raw["volume_change_pct"]) if raw["volume_change_pct"] is not None else None
+        ),
+        volume_spike_ratio=(
+            _decimal(raw["volume_spike_ratio"]) if raw["volume_spike_ratio"] is not None else None
+        ),
+        spread_ratio=_decimal(raw["spread_ratio"]) if raw["spread_ratio"] is not None else None,
+        microstructure_healthy=bool(raw["microstructure_healthy"]),
+    )
+
+
+def _serialize_ai_feature_summary(snapshot: AISignalSnapshot) -> str:
+    """Serialize the persisted AI feature summary."""
+
+    feature_vector = snapshot.feature_vector
+    payload = {
+        "candle_count": feature_vector.candle_count,
+        "close_price": str(feature_vector.close_price),
+        "volatility_pct": (
+            str(feature_vector.volatility_pct) if feature_vector.volatility_pct is not None else None
+        ),
+        "momentum": str(feature_vector.momentum) if feature_vector.momentum is not None else None,
+        "volume_change_pct": (
+            str(feature_vector.volume_change_pct) if feature_vector.volume_change_pct is not None else None
+        ),
+        "volume_spike_ratio": (
+            str(feature_vector.volume_spike_ratio) if feature_vector.volume_spike_ratio is not None else None
+        ),
+        "spread_ratio": str(feature_vector.spread_ratio) if feature_vector.spread_ratio is not None else None,
+        "microstructure_healthy": feature_vector.microstructure_healthy,
+    }
+    return json.dumps(payload, sort_keys=True)
+
+
+def _ai_signal_materially_changed(
+    latest_snapshot: AISignalSnapshotRecord,
+    next_snapshot: AISignalSnapshotRecord,
+) -> bool:
+    """Return whether an AI advisory snapshot materially changed."""
+
+    return (
+        latest_snapshot.bias != next_snapshot.bias
+        or latest_snapshot.confidence != next_snapshot.confidence
+        or latest_snapshot.entry_signal != next_snapshot.entry_signal
+        or latest_snapshot.exit_signal != next_snapshot.exit_signal
+        or latest_snapshot.suggested_action != next_snapshot.suggested_action
+        or latest_snapshot.explanation != next_snapshot.explanation
+        or latest_snapshot.feature_summary != next_snapshot.feature_summary
+    )
 
 
 def _start_of_day(value: date) -> datetime:
@@ -77,6 +140,146 @@ class StorageRepository:
             self._connection.execute("DELETE FROM positions_snapshots")
             self._connection.execute("DELETE FROM pnl_snapshots")
             self._connection.execute("DELETE FROM runner_events")
+            self._connection.execute("DELETE FROM ai_signal_snapshots")
+
+    def insert_ai_signal_snapshot(self, snapshot: AISignalSnapshot) -> bool:
+        """Persist an AI advisory snapshot when it materially changed."""
+
+        latest_snapshot = self.get_latest_ai_signal(snapshot.symbol)
+        next_feature_summary = _parse_ai_feature_summary(_serialize_ai_feature_summary(snapshot))
+        next_snapshot = AISignalSnapshotRecord(
+            symbol=snapshot.symbol.upper(),
+            timestamp=snapshot.feature_vector.timestamp,
+            bias=snapshot.bias,
+            confidence=snapshot.confidence,
+            entry_signal=snapshot.entry_signal,
+            exit_signal=snapshot.exit_signal,
+            suggested_action=snapshot.suggested_action,
+            explanation=snapshot.explanation,
+            feature_summary=next_feature_summary,
+        )
+        if latest_snapshot is not None and not _ai_signal_materially_changed(latest_snapshot, next_snapshot):
+            return False
+
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO ai_signal_snapshots (
+                    symbol, snapshot_time, bias, confidence, entry_signal, exit_signal,
+                    suggested_action, explanation, feature_summary_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    next_snapshot.symbol,
+                    next_snapshot.timestamp.isoformat(),
+                    next_snapshot.bias,
+                    next_snapshot.confidence,
+                    int(next_snapshot.entry_signal),
+                    int(next_snapshot.exit_signal),
+                    next_snapshot.suggested_action,
+                    next_snapshot.explanation,
+                    _serialize_ai_feature_summary(snapshot),
+                ),
+            )
+        return True
+
+    def get_latest_ai_signal(self, symbol: str) -> AISignalSnapshotRecord | None:
+        """Return the latest persisted AI advisory snapshot for a symbol."""
+
+        row = self._connection.execute(
+            """
+            SELECT symbol, snapshot_time, bias, confidence, entry_signal, exit_signal,
+                   suggested_action, explanation, feature_summary_json
+            FROM ai_signal_snapshots
+            WHERE symbol = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (symbol.upper(),),
+        ).fetchone()
+        if row is None:
+            return None
+        return AISignalSnapshotRecord(
+            symbol=row["symbol"],
+            timestamp=datetime.fromisoformat(row["snapshot_time"]),
+            bias=row["bias"],
+            confidence=int(row["confidence"]),
+            entry_signal=bool(row["entry_signal"]),
+            exit_signal=bool(row["exit_signal"]),
+            suggested_action=row["suggested_action"],
+            explanation=row["explanation"],
+            feature_summary=_parse_ai_feature_summary(row["feature_summary_json"]),
+        )
+
+    def get_ai_signal_history(
+        self,
+        *,
+        symbol: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[AISignalSnapshotRecord]:
+        """Return persisted AI advisory history for one symbol."""
+
+        query = """
+            SELECT symbol, snapshot_time, bias, confidence, entry_signal, exit_signal,
+                   suggested_action, explanation, feature_summary_json
+            FROM ai_signal_snapshots
+            WHERE symbol = ?
+        """
+        params: list[Any] = [symbol.upper()]
+        query, params = self._apply_date_filters(
+            query=query,
+            params=params,
+            start_date=start_date,
+            end_date=end_date,
+            timestamp_column="snapshot_time",
+        )
+        query += " ORDER BY id DESC"
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend((limit, offset))
+        rows = self._connection.execute(query, tuple(params)).fetchall()
+        return [
+            AISignalSnapshotRecord(
+                symbol=row["symbol"],
+                timestamp=datetime.fromisoformat(row["snapshot_time"]),
+                bias=row["bias"],
+                confidence=int(row["confidence"]),
+                entry_signal=bool(row["entry_signal"]),
+                exit_signal=bool(row["exit_signal"]),
+                suggested_action=row["suggested_action"],
+                explanation=row["explanation"],
+                feature_summary=_parse_ai_feature_summary(row["feature_summary_json"]),
+            )
+            for row in rows
+        ]
+
+    def count_ai_signal_history(
+        self,
+        *,
+        symbol: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> int:
+        """Return the number of persisted AI advisory snapshots for one symbol."""
+
+        query = """
+            SELECT COUNT(*) AS row_count
+            FROM ai_signal_snapshots
+            WHERE symbol = ?
+        """
+        params: list[Any] = [symbol.upper()]
+        query, params = self._apply_date_filters(
+            query=query,
+            params=params,
+            start_date=start_date,
+            end_date=end_date,
+            timestamp_column="snapshot_time",
+        )
+        row = self._connection.execute(query, tuple(params)).fetchone()
+        return int(row["row_count"]) if row is not None else 0
 
     def insert_trade(
         self,

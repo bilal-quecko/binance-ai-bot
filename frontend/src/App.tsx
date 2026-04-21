@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
+import { AIHistorySection } from './components/AIHistorySection';
 import { AutoRefreshSelector } from './components/AutoRefreshSelector';
 import { BotControlPanel } from './components/BotControlPanel';
 import { MetricCard } from './components/MetricCard';
 import { SectionCard } from './components/SectionCard';
 import { StatePanel } from './components/StatePanel';
 import {
+  getAISignal,
+  getAISignalHistory,
   getBotStatus,
   getHealth,
   getSymbols,
@@ -18,6 +21,8 @@ import {
 } from './lib/api';
 import { badgeTone, classNames, formatCurrency, formatDateTime, formatDecimal, pnlTone } from './lib/format';
 import type {
+  AISignalHistoryResponse,
+  AISignalSummary,
   AutoRefreshIntervalSeconds,
   BotStatusResponse,
   HealthResponse,
@@ -45,6 +50,13 @@ const INITIAL_BOT_STATUS: BotStatusResponse = {
 };
 
 const INITIAL_WORKSTATION: WorkstationResponse | null = null;
+const INITIAL_AI_SIGNAL: AISignalSummary | null = null;
+const INITIAL_AI_HISTORY: AISignalHistoryResponse = {
+  items: [],
+  total: 0,
+  limit: 20,
+  offset: 0,
+};
 
 function createRemoteState<T>(data: T): RemoteState<T> {
   return {
@@ -83,6 +95,8 @@ function App() {
   const [health, setHealth] = useState<RemoteState<HealthResponse | null>>(createRemoteState<HealthResponse | null>(null));
   const [botStatus, setBotStatus] = useState<RemoteState<BotStatusResponse>>(createRemoteState(INITIAL_BOT_STATUS));
   const [workstation, setWorkstation] = useState<RemoteState<WorkstationResponse | null>>(createRemoteState(INITIAL_WORKSTATION));
+  const [aiSignal, setAiSignal] = useState<RemoteState<AISignalSummary | null>>(createRemoteState(INITIAL_AI_SIGNAL));
+  const [aiHistory, setAiHistory] = useState<RemoteState<AISignalHistoryResponse>>(createRemoteState(INITIAL_AI_HISTORY));
   const [symbolResults, setSymbolResults] = useState<RemoteState<SpotSymbolItem[]>>(createRemoteState<SpotSymbolItem[]>([]));
 
   const [selectedSymbol, setSelectedSymbol] = useState('');
@@ -106,19 +120,29 @@ function App() {
     setBotStatus((current) => setPending(current));
     if (symbol.trim().length > 0) {
       setWorkstation((current) => setPending(current));
+      setAiSignal((current) => setPending(current));
+      setAiHistory((current) => setPending(current));
     } else {
       setWorkstation({ data: null, loading: false, refreshing: false, error: null });
+      setAiSignal({ data: null, loading: false, refreshing: false, error: null });
+      setAiHistory({ data: INITIAL_AI_HISTORY, loading: false, refreshing: false, error: null });
     }
 
     try {
-      const [healthData, botStatusData, workstationData] = await Promise.all([
+      const [healthData, botStatusData, workstationData, aiSignalData, aiHistoryData] = await Promise.all([
         getHealth(),
         getBotStatus(),
         symbol.trim().length > 0 ? getWorkstation(symbol) : Promise.resolve<WorkstationResponse | null>(null),
+        symbol.trim().length > 0 ? getAISignal(symbol) : Promise.resolve<AISignalSummary | null>(null),
+        symbol.trim().length > 0
+          ? getAISignalHistory(symbol, { limit: INITIAL_AI_HISTORY.limit, offset: 0 })
+          : Promise.resolve<AISignalHistoryResponse>(INITIAL_AI_HISTORY),
       ]);
       setHealth({ data: healthData, loading: false, refreshing: false, error: null });
       setBotStatus({ data: botStatusData, loading: false, refreshing: false, error: null });
       setWorkstation({ data: workstationData, loading: false, refreshing: false, error: null });
+      setAiSignal({ data: aiSignalData, loading: false, refreshing: false, error: null });
+      setAiHistory({ data: aiHistoryData, loading: false, refreshing: false, error: null });
       setLastUpdatedAt(new Date());
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to refresh workstation state.';
@@ -126,6 +150,8 @@ function App() {
       setBotStatus((current) => ({ ...current, loading: false, refreshing: false, error: message }));
       if (symbol.trim().length > 0) {
         setWorkstation((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setAiSignal((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setAiHistory((current) => ({ ...current, loading: false, refreshing: false, error: message }));
       }
     }
   }, []);
@@ -167,6 +193,8 @@ function App() {
     setSymbolSearch('');
     setBotActionError(null);
     setWorkstation({ data: null, loading: false, refreshing: false, error: null });
+    setAiSignal({ data: null, loading: false, refreshing: false, error: null });
+    setAiHistory({ data: INITIAL_AI_HISTORY, loading: false, refreshing: false, error: null });
   }, []);
 
   const runBotAction = useCallback(async (action: () => Promise<BotStatusResponse>) => {
@@ -195,6 +223,8 @@ function App() {
       const nextStatus = await resetBotSession();
       setBotStatus({ data: nextStatus, loading: false, refreshing: false, error: null });
       setWorkstation({ data: null, loading: false, refreshing: false, error: null });
+      setAiSignal({ data: null, loading: false, refreshing: false, error: null });
+      setAiHistory({ data: INITIAL_AI_HISTORY, loading: false, refreshing: false, error: null });
       setLastUpdatedAt(new Date());
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to reset the paper session.';
@@ -210,6 +240,12 @@ function App() {
     }
     return null;
   }, [selectedSymbol, workstation.data]);
+  const effectiveAiSignal = useMemo(() => {
+    if (aiSignal.data?.symbol === selectedSymbol) {
+      return aiSignal.data;
+    }
+    return null;
+  }, [aiSignal.data, selectedSymbol]);
 
   const trendLabel = effectiveWorkstation?.trend_bias ?? 'Waiting for live data';
   const signalExplanation = effectiveWorkstation?.explanation ?? 'Select a symbol, then start or pause the live paper runtime to populate live signal state.';
@@ -305,113 +341,131 @@ function App() {
           <div className="grid gap-6 xl:grid-cols-[1.2fr,0.8fr]">
             <SectionCard
               title="Signal"
-              description="Live symbol context, trend bias, entry signal, and exit signal for the selected symbol."
-              action={effectiveWorkstation && (workstation.refreshing || workstation.loading) ? <span className="text-xs text-slate-400">Refreshing…</span> : null}
+              description="Live symbol context plus persisted advisory history for the selected symbol."
+              action={workstation.refreshing || workstation.loading || aiSignal.refreshing || aiHistory.refreshing ? <span className="text-xs text-slate-400">Refreshing...</span> : null}
             >
               {selectedSymbol.length === 0 ? (
                 <StatePanel title="No symbol selected" message="Pick a symbol to load live signal state." tone="empty" />
-              ) : effectiveWorkstation === null || effectiveWorkstation.is_runtime_symbol === false ? (
-                <StatePanel
-                  title="Live signal idle"
-                  message="The selected symbol is not currently connected to the live runtime. Start the paper runtime, or pause it if you only want live monitoring without auto trading."
-                  tone="empty"
-                />
               ) : (
                 <div className="space-y-5">
-                  <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-                    <MetricCard label="Selected Symbol" value={effectiveWorkstation.symbol} helper={`Runtime ${effectiveWorkstation.runtime_status.state}`} />
-                    <MetricCard
-                      label="Live Price"
-                      value={effectiveWorkstation.last_price ? formatCurrency(effectiveWorkstation.last_price) : '-'}
-                      helper={formatDateTime(effectiveWorkstation.last_market_event)}
+                  {effectiveWorkstation === null || effectiveWorkstation.is_runtime_symbol === false ? (
+                    <StatePanel
+                      title="Live signal idle"
+                      message="The selected symbol is not currently connected to the live runtime. Start the paper runtime to generate fresh live AI snapshots, or review the persisted AI history below."
+                      tone="empty"
                     />
-                    <MetricCard label="Trend / Bias" value={trendLabel} helper={effectiveWorkstation.feature?.regime ?? 'No regime yet'} />
-                    <MetricCard
-                      label="Current Candle"
-                      value={effectiveWorkstation.current_candle ? formatCurrency(effectiveWorkstation.current_candle.close) : '-'}
-                      helper={effectiveWorkstation.current_candle ? `${effectiveWorkstation.current_candle.timeframe} candle` : 'Waiting for kline'}
-                    />
-                  </div>
-
-                  <div className="grid gap-4 lg:grid-cols-2">
-                    <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
-                      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Entry Signal</p>
-                      <div className="mt-3 flex items-center gap-3">
-                        <span className={classNames('rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em]', badgeTone(effectiveWorkstation.entry_signal?.side ?? 'HOLD'))}>
-                          {effectiveWorkstation.entry_signal?.side ?? 'HOLD'}
-                        </span>
-                        <span className="text-sm text-slate-400">{describeSignal(effectiveWorkstation.entry_signal?.side)}</span>
+                  ) : (
+                    <div className="space-y-5">
+                      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                        <MetricCard label="Selected Symbol" value={effectiveWorkstation.symbol} helper={`Runtime ${effectiveWorkstation.runtime_status.state}`} />
+                        <MetricCard
+                          label="Live Price"
+                          value={effectiveWorkstation.last_price ? formatCurrency(effectiveWorkstation.last_price) : '-'}
+                          helper={formatDateTime(effectiveWorkstation.last_market_event)}
+                        />
+                        <MetricCard label="Trend / Bias" value={trendLabel} helper={effectiveWorkstation.feature?.regime ?? 'No regime yet'} />
+                        <MetricCard
+                          label="Current Candle"
+                          value={effectiveWorkstation.current_candle ? formatCurrency(effectiveWorkstation.current_candle.close) : '-'}
+                          helper={effectiveWorkstation.current_candle ? `${effectiveWorkstation.current_candle.timeframe} candle` : 'Waiting for kline'}
+                        />
                       </div>
-                      <p className="mt-3 text-sm text-slate-300">{effectiveWorkstation.entry_signal?.reason_codes.join(', ') || 'No entry context yet'}</p>
-                    </div>
 
-                    <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
-                      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Exit Signal</p>
-                      <div className="mt-3 flex items-center gap-3">
-                        <span className={classNames('rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em]', badgeTone(effectiveWorkstation.exit_signal?.side ?? 'HOLD'))}>
-                          {effectiveWorkstation.exit_signal?.side ?? 'HOLD'}
-                        </span>
-                        <span className="text-sm text-slate-400">{describeSignal(effectiveWorkstation.exit_signal?.side)}</span>
+                      <div className="grid gap-4 lg:grid-cols-2">
+                        <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Entry Signal</p>
+                          <div className="mt-3 flex items-center gap-3">
+                            <span className={classNames('rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em]', badgeTone(effectiveWorkstation.entry_signal?.side ?? 'HOLD'))}>
+                              {effectiveWorkstation.entry_signal?.side ?? 'HOLD'}
+                            </span>
+                            <span className="text-sm text-slate-400">{describeSignal(effectiveWorkstation.entry_signal?.side)}</span>
+                          </div>
+                          <p className="mt-3 text-sm text-slate-300">{effectiveWorkstation.entry_signal?.reason_codes.join(', ') || 'No entry context yet'}</p>
+                        </div>
+
+                        <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Exit Signal</p>
+                          <div className="mt-3 flex items-center gap-3">
+                            <span className={classNames('rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em]', badgeTone(effectiveWorkstation.exit_signal?.side ?? 'HOLD'))}>
+                              {effectiveWorkstation.exit_signal?.side ?? 'HOLD'}
+                            </span>
+                            <span className="text-sm text-slate-400">{describeSignal(effectiveWorkstation.exit_signal?.side)}</span>
+                          </div>
+                          <p className="mt-3 text-sm text-slate-300">{effectiveWorkstation.exit_signal?.reason_codes.join(', ') || 'No exit context yet'}</p>
+                        </div>
                       </div>
-                      <p className="mt-3 text-sm text-slate-300">{effectiveWorkstation.exit_signal?.reason_codes.join(', ') || 'No exit context yet'}</p>
-                    </div>
-                  </div>
 
-                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
-                    <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Short Explanation</p>
-                    <p className="mt-3 text-sm leading-6 text-slate-300">{signalExplanation}</p>
-                  </div>
+                      <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                        <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Short Explanation</p>
+                        <p className="mt-3 text-sm leading-6 text-slate-300">{signalExplanation}</p>
+                      </div>
+
+                      <div className="grid gap-4 lg:grid-cols-2">
+                        <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Candle Summary</p>
+                          {effectiveWorkstation.current_candle ? (
+                            <div className="mt-3 grid grid-cols-2 gap-3 text-sm text-slate-200">
+                              <div><span className="text-slate-500">Open</span><p>{formatCurrency(effectiveWorkstation.current_candle.open)}</p></div>
+                              <div><span className="text-slate-500">High</span><p>{formatCurrency(effectiveWorkstation.current_candle.high)}</p></div>
+                              <div><span className="text-slate-500">Low</span><p>{formatCurrency(effectiveWorkstation.current_candle.low)}</p></div>
+                              <div><span className="text-slate-500">Close</span><p>{formatCurrency(effectiveWorkstation.current_candle.close)}</p></div>
+                              <div><span className="text-slate-500">Volume</span><p>{formatDecimal(effectiveWorkstation.current_candle.volume)}</p></div>
+                              <div><span className="text-slate-500">Window</span><p>{formatDateTime(effectiveWorkstation.current_candle.close_time)}</p></div>
+                            </div>
+                          ) : (
+                            <StatePanel title="Waiting for candle" message="No live candle has been received yet for this symbol." tone="empty" />
+                          )}
+                        </div>
+
+                        <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Feature Snapshot</p>
+                          {effectiveWorkstation.feature ? (
+                            <div className="mt-3 grid grid-cols-2 gap-3 text-sm text-slate-200">
+                              <div><span className="text-slate-500">EMA Fast</span><p>{formatCurrency(effectiveWorkstation.feature.ema_fast ?? 0)}</p></div>
+                              <div><span className="text-slate-500">EMA Slow</span><p>{formatCurrency(effectiveWorkstation.feature.ema_slow ?? 0)}</p></div>
+                              <div><span className="text-slate-500">ATR</span><p>{formatDecimal(effectiveWorkstation.feature.atr ?? 0)}</p></div>
+                              <div><span className="text-slate-500">Spread</span><p>{formatDecimal(effectiveWorkstation.feature.bid_ask_spread ?? 0)}</p></div>
+                              <div><span className="text-slate-500">Mid Price</span><p>{formatCurrency(effectiveWorkstation.feature.mid_price ?? 0)}</p></div>
+                              <div><span className="text-slate-500">Book Imbalance</span><p>{formatDecimal(effectiveWorkstation.feature.order_book_imbalance ?? 0)}</p></div>
+                            </div>
+                          ) : (
+                            <StatePanel title="Waiting for features" message="More candle history is needed before the feature engine can derive trend and volatility state." tone="empty" />
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
 
                   <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
                     <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">AI Signal</p>
-                    {effectiveWorkstation.ai_signal ? (
+                    {aiSignal.error ? (
+                      <StatePanel title="AI signal unavailable" message={aiSignal.error} tone="error" />
+                    ) : effectiveAiSignal ? (
                       <div className="mt-3 space-y-4">
                         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
-                          <MetricCard label="Bias" value={effectiveWorkstation.ai_signal.bias} helper="Probable market direction" />
-                          <MetricCard label="Confidence" value={`${effectiveWorkstation.ai_signal.confidence}%`} helper="Advisory confidence score" />
-                          <MetricCard label="Entry Setup" value={effectiveWorkstation.ai_signal.entry_signal ? 'Yes' : 'No'} helper="Potential entry present" />
-                          <MetricCard label="Exit Setup" value={effectiveWorkstation.ai_signal.exit_signal ? 'Yes' : 'No'} helper="Potential exit present" />
-                          <MetricCard label="Suggested Action" value={effectiveWorkstation.ai_signal.suggested_action} helper="Advisory only" />
+                          <MetricCard label="Bias" value={effectiveAiSignal.bias} helper="Probable market direction" />
+                          <MetricCard label="Confidence" value={`${effectiveAiSignal.confidence}%`} helper={formatDateTime(effectiveAiSignal.timestamp)} />
+                          <MetricCard label="Entry Setup" value={effectiveAiSignal.entry_signal ? 'Yes' : 'No'} helper="Potential entry present" />
+                          <MetricCard label="Exit Setup" value={effectiveAiSignal.exit_signal ? 'Yes' : 'No'} helper="Potential exit present" />
+                          <MetricCard label="Suggested Action" value={effectiveAiSignal.suggested_action} helper="Advisory only" />
                         </div>
-                        <p className="text-sm leading-6 text-slate-300">{effectiveWorkstation.ai_signal.explanation}</p>
+                        <p className="text-sm leading-6 text-slate-300">{effectiveAiSignal.explanation}</p>
                       </div>
+                    ) : aiSignal.loading ? (
+                      <StatePanel title="Loading AI signal" message="Reading the latest persisted advisory snapshot for the selected symbol." tone="loading" />
                     ) : (
-                      <StatePanel title="AI signal unavailable" message="The advisory scoring layer needs enough recent candle history before it can produce a market read." tone="empty" />
+                      <StatePanel title="AI signal unavailable" message="No persisted AI advisory snapshot exists yet for the selected symbol." tone="empty" />
                     )}
                   </div>
 
-                  <div className="grid gap-4 lg:grid-cols-2">
-                    <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
-                      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Candle Summary</p>
-                      {effectiveWorkstation.current_candle ? (
-                        <div className="mt-3 grid grid-cols-2 gap-3 text-sm text-slate-200">
-                          <div><span className="text-slate-500">Open</span><p>{formatCurrency(effectiveWorkstation.current_candle.open)}</p></div>
-                          <div><span className="text-slate-500">High</span><p>{formatCurrency(effectiveWorkstation.current_candle.high)}</p></div>
-                          <div><span className="text-slate-500">Low</span><p>{formatCurrency(effectiveWorkstation.current_candle.low)}</p></div>
-                          <div><span className="text-slate-500">Close</span><p>{formatCurrency(effectiveWorkstation.current_candle.close)}</p></div>
-                          <div><span className="text-slate-500">Volume</span><p>{formatDecimal(effectiveWorkstation.current_candle.volume)}</p></div>
-                          <div><span className="text-slate-500">Window</span><p>{formatDateTime(effectiveWorkstation.current_candle.close_time)}</p></div>
-                        </div>
-                      ) : (
-                        <StatePanel title="Waiting for candle" message="No live candle has been received yet for this symbol." tone="empty" />
-                      )}
-                    </div>
-
-                    <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
-                      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Feature Snapshot</p>
-                      {effectiveWorkstation.feature ? (
-                        <div className="mt-3 grid grid-cols-2 gap-3 text-sm text-slate-200">
-                          <div><span className="text-slate-500">EMA Fast</span><p>{formatCurrency(effectiveWorkstation.feature.ema_fast ?? 0)}</p></div>
-                          <div><span className="text-slate-500">EMA Slow</span><p>{formatCurrency(effectiveWorkstation.feature.ema_slow ?? 0)}</p></div>
-                          <div><span className="text-slate-500">ATR</span><p>{formatDecimal(effectiveWorkstation.feature.atr ?? 0)}</p></div>
-                          <div><span className="text-slate-500">Spread</span><p>{formatDecimal(effectiveWorkstation.feature.bid_ask_spread ?? 0)}</p></div>
-                          <div><span className="text-slate-500">Mid Price</span><p>{formatCurrency(effectiveWorkstation.feature.mid_price ?? 0)}</p></div>
-                          <div><span className="text-slate-500">Book Imbalance</span><p>{formatDecimal(effectiveWorkstation.feature.order_book_imbalance ?? 0)}</p></div>
-                        </div>
-                      ) : (
-                        <StatePanel title="Waiting for features" message="More candle history is needed before the feature engine can derive trend and volatility state." tone="empty" />
-                      )}
-                    </div>
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <AIHistorySection
+                      symbol={selectedSymbol}
+                      history={aiHistory.data.items}
+                      loading={aiHistory.loading}
+                      refreshing={aiHistory.refreshing}
+                      error={aiHistory.error}
+                    />
                   </div>
                 </div>
               )}
@@ -435,14 +489,14 @@ function App() {
             <SectionCard
               title="Auto Trade"
               description="Paper-only runtime control and current position for the selected symbol."
-              action={effectiveWorkstation && (workstation.refreshing || workstation.loading) ? <span className="text-xs text-slate-400">Refreshing…</span> : null}
+              action={effectiveWorkstation && (workstation.refreshing || workstation.loading) ? <span className="text-xs text-slate-400">Refreshing...</span> : null}
             >
               {selectedSymbol.length === 0 ? (
                 <StatePanel title="No symbol selected" message="Pick a symbol first, then use the controls above." tone="empty" />
               ) : (
                 <div className="space-y-5">
                   <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-                    <MetricCard label="Runtime Status" value={botStatus.data.state} helper={`Paper only • ${selectedSymbol}`} />
+                    <MetricCard label="Runtime Status" value={botStatus.data.state} helper={`Paper only - ${selectedSymbol}`} />
                     <MetricCard label="Last Action" value={effectiveWorkstation?.last_action?.signal_side ?? 'Waiting'} helper={formatDateTime(effectiveWorkstation?.last_action?.event_time ?? null)} />
                     <MetricCard label="Last Market Event" value={formatDateTime(effectiveWorkstation?.last_market_event ?? botStatus.data.last_event_time)} helper="Most recent live event" />
                     <MetricCard label="Session PnL" value={formatCurrency(effectiveWorkstation?.total_pnl ?? '0')} tone={Number(effectiveWorkstation?.total_pnl ?? '0') >= 0 ? 'positive' : 'negative'} />
@@ -469,11 +523,11 @@ function App() {
                         <div className="mt-3 space-y-3 text-sm text-slate-200">
                           <div>
                             <span className="text-slate-500">Signal</span>
-                            <p>{effectiveWorkstation.last_action.signal_side} • {effectiveWorkstation.last_action.signal_reasons.join(', ')}</p>
+                            <p>{effectiveWorkstation.last_action.signal_side} - {effectiveWorkstation.last_action.signal_reasons.join(', ')}</p>
                           </div>
                           <div>
                             <span className="text-slate-500">Execution</span>
-                            <p>{effectiveWorkstation.last_action.execution_status ?? 'Not executed'}{effectiveWorkstation.last_action.execution_reasons.length > 0 ? ` • ${effectiveWorkstation.last_action.execution_reasons.join(', ')}` : ''}</p>
+                            <p>{effectiveWorkstation.last_action.execution_status ?? 'Not executed'}{effectiveWorkstation.last_action.execution_reasons.length > 0 ? ` - ${effectiveWorkstation.last_action.execution_reasons.join(', ')}` : ''}</p>
                           </div>
                         </div>
                       ) : (

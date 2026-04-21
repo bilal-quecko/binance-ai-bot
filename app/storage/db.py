@@ -68,6 +68,20 @@ SCHEMA_STATEMENTS = (
         event_time TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS ai_signal_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        snapshot_time TEXT NOT NULL,
+        bias TEXT NOT NULL,
+        confidence INTEGER NOT NULL,
+        entry_signal INTEGER NOT NULL,
+        exit_signal INTEGER NOT NULL,
+        suggested_action TEXT NOT NULL,
+        explanation TEXT NOT NULL,
+        feature_summary_json TEXT NOT NULL
+    )
+    """,
 )
 
 

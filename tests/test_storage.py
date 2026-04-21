@@ -4,6 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
+from app.ai.models import AIFeatureVector, AISignalSnapshot
 from app.paper.models import FillResult
 from app.risk.models import RiskDecision
 from app.storage import StorageRepository
@@ -13,6 +14,49 @@ def _db_path(name: str) -> Path:
     base = Path("tests/.tmp_storage")
     base.mkdir(parents=True, exist_ok=True)
     return (base / f"{name}_{uuid4().hex}.sqlite").resolve()
+
+
+def _ai_snapshot(
+    *,
+    symbol: str,
+    timestamp: datetime,
+    bias: str = "bullish",
+    confidence: int = 72,
+    entry_signal: bool = True,
+    exit_signal: bool = False,
+    suggested_action: str = "enter",
+    explanation: str = "Momentum is improving and volatility is controlled.",
+) -> AISignalSnapshot:
+    return AISignalSnapshot(
+        symbol=symbol,
+        bias=bias,
+        confidence=confidence,
+        entry_signal=entry_signal,
+        exit_signal=exit_signal,
+        suggested_action=suggested_action,
+        explanation=explanation,
+        feature_vector=AIFeatureVector(
+            symbol=symbol,
+            timestamp=timestamp,
+            candle_count=5,
+            close_price=Decimal("101"),
+            ema_fast=Decimal("101"),
+            ema_slow=Decimal("100"),
+            rsi=Decimal("60"),
+            atr=Decimal("1"),
+            volatility_pct=Decimal("0.01"),
+            momentum=Decimal("0.02"),
+            recent_returns=(Decimal("0.01"), Decimal("0.005")),
+            wick_body_ratio=Decimal("1.1"),
+            upper_wick_ratio=Decimal("0.2"),
+            lower_wick_ratio=Decimal("0.1"),
+            volume_change_pct=Decimal("0.5"),
+            volume_spike_ratio=Decimal("1.4"),
+            spread_ratio=Decimal("0.001"),
+            order_book_imbalance=Decimal("0.2"),
+            microstructure_healthy=True,
+        ),
+    )
 
 
 def test_storage_repository_creates_required_tables() -> None:
@@ -29,7 +73,14 @@ def test_storage_repository_creates_required_tables() -> None:
         connection.close()
 
     table_names = {row[0] for row in rows}
-    assert {"fills", "pnl_snapshots", "positions_snapshots", "runner_events", "trades"} <= table_names
+    assert {
+        "ai_signal_snapshots",
+        "fills",
+        "pnl_snapshots",
+        "positions_snapshots",
+        "runner_events",
+        "trades",
+    } <= table_names
 
 
 def test_storage_repository_persists_and_reads_trade_history() -> None:
@@ -143,3 +194,74 @@ def test_storage_repository_builds_history_and_drawdown_series() -> None:
     assert drawdown.max_drawdown_pct == Decimal("0.1")
     assert drawdown.current_drawdown == Decimal("60")
     assert drawdown.current_drawdown_pct == Decimal("0.05")
+
+
+def test_storage_repository_persists_ai_signal_snapshots_and_suppresses_duplicates() -> None:
+    db_path = _db_path("ai_signal_snapshots")
+    repository = StorageRepository(f"sqlite:///{db_path}")
+    first_timestamp = datetime(2024, 3, 9, 16, 0, 0, tzinfo=UTC)
+    duplicate_timestamp = datetime(2024, 3, 9, 16, 1, 0, tzinfo=UTC)
+    changed_timestamp = datetime(2024, 3, 9, 16, 2, 0, tzinfo=UTC)
+
+    first_inserted = repository.insert_ai_signal_snapshot(
+        _ai_snapshot(symbol="BTCUSDT", timestamp=first_timestamp)
+    )
+    duplicate_inserted = repository.insert_ai_signal_snapshot(
+        _ai_snapshot(symbol="BTCUSDT", timestamp=duplicate_timestamp)
+    )
+    changed_inserted = repository.insert_ai_signal_snapshot(
+        _ai_snapshot(
+            symbol="BTCUSDT",
+            timestamp=changed_timestamp,
+            bias="sideways",
+            confidence=55,
+            entry_signal=False,
+            suggested_action="wait",
+            explanation="Momentum faded and confirmation is missing.",
+        )
+    )
+
+    latest_snapshot = repository.get_latest_ai_signal("BTCUSDT")
+    history = repository.get_ai_signal_history(symbol="BTCUSDT", limit=10, offset=0)
+    total = repository.count_ai_signal_history(symbol="BTCUSDT")
+    repository.close()
+
+    assert first_inserted is True
+    assert duplicate_inserted is False
+    assert changed_inserted is True
+    assert latest_snapshot is not None
+    assert latest_snapshot.bias == "sideways"
+    assert latest_snapshot.timestamp == changed_timestamp
+    assert total == 2
+    assert [item.bias for item in history] == ["sideways", "bullish"]
+
+
+def test_storage_repository_filters_ai_signal_history_by_symbol() -> None:
+    db_path = _db_path("ai_signal_symbol_history")
+    repository = StorageRepository(f"sqlite:///{db_path}")
+    repository.insert_ai_signal_snapshot(
+        _ai_snapshot(symbol="BTCUSDT", timestamp=datetime(2024, 3, 9, 16, 0, 0, tzinfo=UTC))
+    )
+    repository.insert_ai_signal_snapshot(
+        _ai_snapshot(
+            symbol="ETHUSDT",
+            timestamp=datetime(2024, 3, 9, 16, 1, 0, tzinfo=UTC),
+            bias="bearish",
+            confidence=68,
+            entry_signal=False,
+            exit_signal=True,
+            suggested_action="exit",
+            explanation="Fast EMA rolled under slow EMA.",
+        )
+    )
+
+    btc_history = repository.get_ai_signal_history(symbol="BTCUSDT", limit=10, offset=0)
+    eth_history = repository.get_ai_signal_history(symbol="ETHUSDT", limit=10, offset=0)
+    repository.close()
+
+    assert len(btc_history) == 1
+    assert btc_history[0].symbol == "BTCUSDT"
+    assert btc_history[0].bias == "bullish"
+    assert len(eth_history) == 1
+    assert eth_history[0].symbol == "ETHUSDT"
+    assert eth_history[0].suggested_action == "exit"

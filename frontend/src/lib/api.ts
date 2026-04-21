@@ -1,6 +1,7 @@
 ﻿import type {
-  BotStatusResponse,
+  AISignalHistoryResponse,
   AISignalSummary,
+  BotStatusResponse,
   DrawdownResponse,
   EquityHistoryPoint,
   EquityResponse,
@@ -115,6 +116,20 @@ export function getWorkstation(symbol: string): Promise<WorkstationResponse> {
 export function getAISignal(symbol: string): Promise<AISignalSummary | null> {
   const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
   return requestJson<AISignalSummary | null>('/bot/ai-signal', params);
+}
+
+export function getAISignalHistory(
+  symbol: string,
+  filters?: Omit<Partial<HistoryFilters>, 'symbol'>,
+): Promise<AISignalHistoryResponse> {
+  const params = buildHistoryParams({
+    symbol,
+    startDate: filters?.startDate,
+    endDate: filters?.endDate,
+    limit: filters?.limit ?? 20,
+    offset: filters?.offset ?? 0,
+  });
+  return requestJson<AISignalHistoryResponse>('/bot/ai-signal/history', params);
 }
 
 export function getSymbols(query = '', limit = 20): Promise<SpotSymbolItem[]> {

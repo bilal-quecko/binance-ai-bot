@@ -3,9 +3,9 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
+from app.ai.models import AIFeatureVector, AISignalSnapshot
 from fastapi.testclient import TestClient
 
-from app.ai.models import AIFeatureVector, AISignalSnapshot
 from app.api.bot_api import get_bot_runtime, get_settings_dependency, get_symbol_service
 from app.bot import BotStatus, WorkstationState
 from app.config import Settings
@@ -159,6 +159,70 @@ def test_symbol_and_bot_control_endpoints() -> None:
     settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
     repository = StorageRepository(settings.database_url)
     repository.clear_all()
+    repository.insert_ai_signal_snapshot(
+        AISignalSnapshot(
+            symbol='BTCUSDT',
+            bias='bullish',
+            confidence=68,
+            entry_signal=True,
+            exit_signal=False,
+            suggested_action='enter',
+            explanation='Momentum is constructive.',
+            feature_vector=AIFeatureVector(
+                symbol='BTCUSDT',
+                timestamp=datetime(2024, 3, 9, 15, 59, tzinfo=UTC),
+                candle_count=4,
+                close_price=Decimal('100'),
+                ema_fast=Decimal('101'),
+                ema_slow=Decimal('100'),
+                rsi=Decimal('60'),
+                atr=Decimal('1'),
+                volatility_pct=Decimal('0.01'),
+                momentum=Decimal('0.01'),
+                recent_returns=(Decimal('0.01'),),
+                wick_body_ratio=Decimal('1'),
+                upper_wick_ratio=Decimal('0.2'),
+                lower_wick_ratio=Decimal('0.1'),
+                volume_change_pct=Decimal('0.2'),
+                volume_spike_ratio=Decimal('1.1'),
+                spread_ratio=Decimal('0.001'),
+                order_book_imbalance=Decimal('0.2'),
+                microstructure_healthy=True,
+            ),
+        )
+    )
+    repository.insert_ai_signal_snapshot(
+        AISignalSnapshot(
+            symbol='BTCUSDT',
+            bias='sideways',
+            confidence=55,
+            entry_signal=False,
+            exit_signal=False,
+            suggested_action='wait',
+            explanation='Confirmation is still missing.',
+            feature_vector=AIFeatureVector(
+                symbol='BTCUSDT',
+                timestamp=datetime(2024, 3, 9, 16, 1, tzinfo=UTC),
+                candle_count=5,
+                close_price=Decimal('100.5'),
+                ema_fast=Decimal('100.4'),
+                ema_slow=Decimal('100.3'),
+                rsi=Decimal('52'),
+                atr=Decimal('1'),
+                volatility_pct=Decimal('0.01'),
+                momentum=Decimal('0.005'),
+                recent_returns=(Decimal('0.002'),),
+                wick_body_ratio=Decimal('1'),
+                upper_wick_ratio=Decimal('0.2'),
+                lower_wick_ratio=Decimal('0.1'),
+                volume_change_pct=Decimal('0.1'),
+                volume_spike_ratio=Decimal('1.0'),
+                spread_ratio=Decimal('0.001'),
+                order_book_imbalance=Decimal('0.1'),
+                microstructure_healthy=True,
+            ),
+        )
+    )
     repository.close()
 
     fake_symbol_service = FakeSymbolService()
@@ -175,6 +239,7 @@ def test_symbol_and_bot_control_endpoints() -> None:
         status_response = client.get('/bot/status')
         workstation_response = client.get('/bot/workstation', params={'symbol': 'BTCUSDT'})
         ai_signal_response = client.get('/bot/ai-signal', params={'symbol': 'BTCUSDT'})
+        ai_history_response = client.get('/bot/ai-signal/history', params={'symbol': 'BTCUSDT', 'limit': 10, 'offset': 0})
         pause_response = client.post('/bot/pause')
         resume_response = client.post('/bot/resume')
         reset_response = client.post('/bot/reset')
@@ -211,7 +276,13 @@ def test_symbol_and_bot_control_endpoints() -> None:
 
     assert ai_signal_response.status_code == 200
     assert ai_signal_response.json()['confidence'] == 72
+    assert ai_signal_response.json()['timestamp'] == '2024-03-09T16:02:00Z'
     assert ai_signal_response.json()['features']['candle_count'] == 5
+
+    assert ai_history_response.status_code == 200
+    assert ai_history_response.json()['total'] == 2
+    assert ai_history_response.json()['items'][0]['bias'] == 'sideways'
+    assert ai_history_response.json()['items'][1]['symbol'] == 'BTCUSDT'
 
     assert pause_response.status_code == 200
     assert pause_response.json()['state'] == 'paused'
