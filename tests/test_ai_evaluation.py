@@ -130,6 +130,8 @@ def test_ai_outcome_evaluator_scores_direction_and_calibration() -> None:
     one_hour = summary_by_horizon["1h"]
 
     assert five_minute.sample_size == 3
+    assert five_minute.actionable_sample_size == 3
+    assert five_minute.abstain_count == 0
     assert five_minute.directional_accuracy_pct == Decimal("66.67")
     assert five_minute.confidence_calibration_pct == Decimal("56.67")
     assert five_minute.false_positive_count == 1

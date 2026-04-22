@@ -2,6 +2,7 @@
 export type RangePreset = '1D' | '7D' | '30D' | 'ALL';
 export type AutoRefreshIntervalSeconds = 0 | 5 | 10 | 30;
 export type WorkstationDataState = 'ready' | 'waiting_for_runtime' | 'waiting_for_history' | 'degraded_storage';
+export type PatternHorizon = '1d' | '3d' | '7d' | '14d' | '30d';
 
 export interface SpotSymbolItem {
   symbol: string;
@@ -65,6 +66,20 @@ export interface AISignalFeatureSummary {
   volume_spike_ratio: DecimalString | null;
   spread_ratio: DecimalString | null;
   microstructure_healthy: boolean;
+  momentum_persistence: DecimalString | null;
+  direction_flip_rate: DecimalString | null;
+  structure_quality: DecimalString | null;
+  recent_false_positive_rate_5m: DecimalString | null;
+}
+
+export interface AIHorizonSignalSummary {
+  horizon: '5m' | '15m' | '1h';
+  bias: 'bullish' | 'bearish' | 'sideways';
+  confidence: number;
+  suggested_action: 'wait' | 'enter' | 'hold' | 'exit' | 'abstain';
+  abstain: boolean;
+  confirmation_needed: boolean;
+  explanation: string;
 }
 
 export interface AISignalSummary {
@@ -74,9 +89,102 @@ export interface AISignalSummary {
   confidence: number;
   entry_signal: boolean;
   exit_signal: boolean;
-  suggested_action: 'wait' | 'enter' | 'hold' | 'exit';
+  suggested_action: 'wait' | 'enter' | 'hold' | 'exit' | 'abstain';
+  regime: 'trending' | 'ranging' | 'choppy' | 'breakout_building' | 'reversal_risk' | 'high_volatility_unstable' | 'insufficient_data';
+  noise_level: 'low' | 'moderate' | 'high' | 'extreme' | 'unknown';
+  abstain: boolean;
+  low_confidence: boolean;
+  confirmation_needed: boolean;
+  preferred_horizon: '5m' | '15m' | '1h' | null;
+  weakening_factors: string[];
   explanation: string;
+  horizons: AIHorizonSignalSummary[];
   features: AISignalFeatureSummary;
+}
+
+export interface TechnicalTimeframeSummary {
+  timeframe: string;
+  trend_direction: 'bullish' | 'bearish' | 'sideways';
+  trend_strength: 'weak' | 'moderate' | 'strong';
+}
+
+export interface TechnicalAnalysisResponse {
+  symbol: string;
+  generated_at: string | null;
+  data_state: WorkstationDataState;
+  status_message: string | null;
+  trend_direction: 'bullish' | 'bearish' | 'sideways' | null;
+  trend_strength: 'weak' | 'moderate' | 'strong' | null;
+  trend_strength_score: number | null;
+  support_levels: DecimalString[];
+  resistance_levels: DecimalString[];
+  momentum_state: 'bullish' | 'bearish' | 'neutral' | 'overbought' | 'oversold' | 'unknown' | null;
+  volatility_regime: 'low' | 'normal' | 'high' | 'unknown' | null;
+  breakout_readiness: 'low' | 'medium' | 'high' | 'unknown' | null;
+  breakout_bias: 'upside' | 'downside' | 'none' | null;
+  reversal_risk: 'low' | 'medium' | 'high' | 'unknown' | null;
+  multi_timeframe_agreement: 'bullish_alignment' | 'bearish_alignment' | 'mixed' | 'insufficient_data' | null;
+  timeframe_summaries: TechnicalTimeframeSummary[];
+  explanation: string | null;
+}
+
+export interface PatternAnalysisResponse {
+  symbol: string;
+  horizon: PatternHorizon;
+  generated_at: string | null;
+  data_state: WorkstationDataState;
+  status_message: string | null;
+  coverage_start: string | null;
+  coverage_end: string | null;
+  coverage_ratio_pct: DecimalString;
+  partial_coverage: boolean;
+  overall_direction: 'bullish' | 'bearish' | 'sideways' | null;
+  net_return_pct: DecimalString | null;
+  up_moves: number;
+  down_moves: number;
+  flat_moves: number;
+  up_move_ratio_pct: DecimalString | null;
+  down_move_ratio_pct: DecimalString | null;
+  realized_volatility_pct: DecimalString | null;
+  max_drawdown_pct: DecimalString | null;
+  trend_character: 'persistent' | 'balanced' | 'choppy' | null;
+  breakout_tendency: 'breakout_prone' | 'range_bound' | 'mixed' | null;
+  reversal_tendency: 'elevated' | 'normal' | 'low' | 'unknown' | null;
+  explanation: string | null;
+}
+
+export interface MarketSentimentResponse {
+  symbol: string;
+  generated_at: string | null;
+  data_state: WorkstationDataState;
+  status_message: string | null;
+  market_state: 'risk_on' | 'risk_off' | 'mixed' | 'insufficient_data';
+  sentiment_score: number | null;
+  btc_bias: 'bullish' | 'bearish' | 'neutral' | null;
+  eth_bias: 'bullish' | 'bearish' | 'neutral' | null;
+  selected_symbol_relative_strength: 'outperforming_btc' | 'underperforming_btc' | 'in_line' | 'insufficient_data';
+  relative_strength_pct: DecimalString | null;
+  market_breadth_state: 'positive' | 'negative' | 'mixed' | 'insufficient_data';
+  breadth_advancing_symbols: number;
+  breadth_declining_symbols: number;
+  breadth_sample_size: number;
+  volatility_environment: 'calm' | 'normal' | 'stressed' | 'insufficient_data';
+  explanation: string | null;
+}
+
+export interface SymbolSentimentResponse {
+  symbol: string;
+  generated_at: string | null;
+  data_state: WorkstationDataState;
+  status_message: string | null;
+  sentiment_state: 'bullish' | 'bearish' | 'neutral' | 'mixed' | 'insufficient_data';
+  sentiment_score: number | null;
+  source_count: number;
+  freshness: 'fresh' | 'recent' | 'stale' | 'unknown';
+  freshness_minutes: number | null;
+  confidence: number | null;
+  evidence_summary: string[];
+  explanation: string | null;
 }
 
 export interface TradeReadinessResponse {
@@ -110,6 +218,9 @@ export interface AIOutcomeHorizonSummary {
   sample_size: number;
   directional_accuracy_pct: DecimalString;
   confidence_calibration_pct: DecimalString;
+  actionable_sample_size: number;
+  abstain_count: number;
+  abstain_rate_pct: DecimalString;
   false_positive_count: number;
   false_positive_rate_pct: DecimalString;
   false_reversal_count: number;
@@ -124,7 +235,7 @@ export interface AIOutcomeSampleSummary {
   confidence: number;
   entry_signal: boolean;
   exit_signal: boolean;
-  suggested_action: 'wait' | 'enter' | 'hold' | 'exit';
+  suggested_action: 'wait' | 'enter' | 'hold' | 'exit' | 'abstain';
   baseline_close: DecimalString;
   future_close: DecimalString;
   return_pct: DecimalString;
@@ -132,6 +243,7 @@ export interface AIOutcomeSampleSummary {
   directional_correct: boolean;
   false_positive: boolean;
   false_reversal: boolean;
+  abstained: boolean;
 }
 
 export interface AIOutcomeEvaluationResponse {

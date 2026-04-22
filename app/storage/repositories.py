@@ -80,6 +80,28 @@ def _parse_ai_feature_summary(value: str) -> AISignalFeatureSummaryRecord:
         ),
         spread_ratio=_decimal(raw["spread_ratio"]) if raw.get("spread_ratio") is not None else None,
         microstructure_healthy=bool(raw.get("microstructure_healthy", False)),
+        regime=str(raw["regime"]) if raw.get("regime") is not None else None,
+        noise_level=str(raw["noise_level"]) if raw.get("noise_level") is not None else None,
+        abstain=bool(raw.get("abstain", False)),
+        low_confidence=bool(raw.get("low_confidence", False)),
+        confirmation_needed=bool(raw.get("confirmation_needed", False)),
+        preferred_horizon=str(raw["preferred_horizon"]) if raw.get("preferred_horizon") is not None else None,
+        momentum_persistence=(
+            _decimal(raw["momentum_persistence"]) if raw.get("momentum_persistence") is not None else None
+        ),
+        direction_flip_rate=(
+            _decimal(raw["direction_flip_rate"]) if raw.get("direction_flip_rate") is not None else None
+        ),
+        structure_quality=(
+            _decimal(raw["structure_quality"]) if raw.get("structure_quality") is not None else None
+        ),
+        recent_false_positive_rate_5m=(
+            _decimal(raw["recent_false_positive_rate_5m"])
+            if raw.get("recent_false_positive_rate_5m") is not None
+            else None
+        ),
+        horizons=raw.get("horizons") if isinstance(raw.get("horizons"), dict) else None,
+        weakening_factors=tuple(str(item) for item in raw.get("weakening_factors", [])),
     )
 
 
@@ -95,6 +117,18 @@ def _empty_ai_feature_summary() -> AISignalFeatureSummaryRecord:
         volume_spike_ratio=None,
         spread_ratio=None,
         microstructure_healthy=False,
+        regime=None,
+        noise_level=None,
+        abstain=False,
+        low_confidence=False,
+        confirmation_needed=False,
+        preferred_horizon=None,
+        momentum_persistence=None,
+        direction_flip_rate=None,
+        structure_quality=None,
+        recent_false_positive_rate_5m=None,
+        horizons=None,
+        weakening_factors=(),
     )
 
 
@@ -117,6 +151,38 @@ def _serialize_ai_feature_summary(snapshot: AISignalSnapshot) -> str:
         ),
         "spread_ratio": str(feature_vector.spread_ratio) if feature_vector.spread_ratio is not None else None,
         "microstructure_healthy": feature_vector.microstructure_healthy,
+        "regime": snapshot.regime,
+        "noise_level": snapshot.noise_level,
+        "abstain": snapshot.abstain,
+        "low_confidence": snapshot.low_confidence,
+        "confirmation_needed": snapshot.confirmation_needed,
+        "preferred_horizon": snapshot.preferred_horizon,
+        "momentum_persistence": (
+            str(feature_vector.momentum_persistence) if feature_vector.momentum_persistence is not None else None
+        ),
+        "direction_flip_rate": (
+            str(feature_vector.direction_flip_rate) if feature_vector.direction_flip_rate is not None else None
+        ),
+        "structure_quality": (
+            str(feature_vector.structure_quality) if feature_vector.structure_quality is not None else None
+        ),
+        "recent_false_positive_rate_5m": (
+            str(feature_vector.recent_false_positive_rate_5m)
+            if feature_vector.recent_false_positive_rate_5m is not None
+            else None
+        ),
+        "weakening_factors": list(snapshot.weakening_factors),
+        "horizons": {
+            item.horizon: {
+                "bias": item.bias,
+                "confidence": item.confidence,
+                "suggested_action": item.suggested_action,
+                "abstain": item.abstain,
+                "confirmation_needed": item.confirmation_needed,
+                "explanation": item.explanation,
+            }
+            for item in snapshot.horizon_signals
+        },
     }
     return json.dumps(payload, sort_keys=True)
 

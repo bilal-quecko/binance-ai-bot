@@ -63,7 +63,7 @@ export function badgeTone(value: string): string {
   if (value === 'SELL' || value === 'reject' || value === 'rejected' || value === 'exit') {
     return 'bg-rose-500/10 text-rose-300 ring-1 ring-rose-500/30';
   }
-  if (value === 'wait' || value === 'hold') {
+  if (value === 'wait' || value === 'hold' || value === 'abstain') {
     return 'bg-amber-500/10 text-amber-300 ring-1 ring-amber-500/30';
   }
   return 'bg-slate-700/60 text-slate-200 ring-1 ring-slate-600';

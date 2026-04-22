@@ -2,13 +2,18 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { AIEvaluationCard } from './components/AIEvaluationCard';
 import { AIHistorySection } from './components/AIHistorySection';
+import { AIAdvisorySection } from './components/AIAdvisorySection';
 import { AutoRefreshSelector } from './components/AutoRefreshSelector';
 import { BotControlPanel } from './components/BotControlPanel';
 import { DataStateIndicator } from './components/DataStateIndicator';
+import { MarketSentimentSection } from './components/MarketSentimentSection';
 import { MetricCard } from './components/MetricCard';
 import { PerformanceAnalyticsSection } from './components/PerformanceAnalyticsSection';
+import { PatternAnalysisSection } from './components/PatternAnalysisSection';
 import { SectionCard } from './components/SectionCard';
 import { StatePanel } from './components/StatePanel';
+import { SymbolSentimentSection } from './components/SymbolSentimentSection';
+import { TechnicalAnalysisSection } from './components/TechnicalAnalysisSection';
 import { TradeReadinessPanel } from './components/TradeReadinessPanel';
 import { TradeQualitySection } from './components/TradeQualitySection';
 import {
@@ -17,7 +22,11 @@ import {
   getAISignalHistory,
   getBotStatus,
   getHealth,
+  getMarketSentiment,
+  getPatternAnalysis,
   getPerformanceAnalytics,
+  getSymbolSentiment,
+  getTechnicalAnalysis,
   getTradeQualityAnalytics,
   getSymbols,
   getWorkstation,
@@ -35,8 +44,13 @@ import type {
   AutoRefreshIntervalSeconds,
   BotStatusResponse,
   HealthResponse,
+  MarketSentimentResponse,
+  PatternAnalysisResponse,
+  PatternHorizon,
   PerformanceAnalyticsResponse,
   SpotSymbolItem,
+  SymbolSentimentResponse,
+  TechnicalAnalysisResponse,
   TradeQualityResponse,
   WorkstationResponse,
 } from './lib/types';
@@ -70,14 +84,19 @@ const INITIAL_AI_SIGNAL: AISignalSummary | null = null;
 const INITIAL_AI_HISTORY: AISignalHistoryResponse = {
   items: [],
   total: 0,
-  limit: 20,
+  limit: 3,
   offset: 0,
   data_state: 'waiting_for_runtime',
   status_message: 'Start the live runtime for the selected symbol to generate advisory history.',
 };
 const INITIAL_AI_EVALUATION: AIOutcomeEvaluationResponse | null = null;
+const INITIAL_TECHNICAL_ANALYSIS: TechnicalAnalysisResponse | null = null;
+const INITIAL_MARKET_SENTIMENT: MarketSentimentResponse | null = null;
+const INITIAL_SYMBOL_SENTIMENT: SymbolSentimentResponse | null = null;
+const INITIAL_PATTERN_ANALYSIS: PatternAnalysisResponse | null = null;
 const INITIAL_PERFORMANCE: PerformanceAnalyticsResponse | null = null;
 const INITIAL_TRADE_QUALITY: TradeQualityResponse | null = null;
+const AI_HISTORY_PAGE_SIZE = 3;
 
 function createRemoteState<T>(data: T): RemoteState<T> {
   return {
@@ -108,6 +127,20 @@ function describeSignal(side: string | null | undefined): string {
   return 'No active action';
 }
 
+function formatOptionalCurrency(value: string | number | null | undefined, fallback: string): string {
+  if (value === null || value === undefined) {
+    return fallback;
+  }
+  return formatCurrency(value);
+}
+
+function formatOptionalDecimal(value: string | number | null | undefined, fallback: string): string {
+  if (value === null || value === undefined) {
+    return fallback;
+  }
+  return formatDecimal(value);
+}
+
 function App() {
   const [tab, setTab] = useState<WorkstationTab>('signal');
   const [autoRefreshSeconds, setAutoRefreshSeconds] = useState<AutoRefreshIntervalSeconds>(0);
@@ -119,12 +152,18 @@ function App() {
   const [aiSignal, setAiSignal] = useState<RemoteState<AISignalSummary | null>>(createRemoteState(INITIAL_AI_SIGNAL));
   const [aiHistory, setAiHistory] = useState<RemoteState<AISignalHistoryResponse>>(createRemoteState(INITIAL_AI_HISTORY));
   const [aiEvaluation, setAiEvaluation] = useState<RemoteState<AIOutcomeEvaluationResponse | null>>(createRemoteState(INITIAL_AI_EVALUATION));
+  const [technicalAnalysis, setTechnicalAnalysis] = useState<RemoteState<TechnicalAnalysisResponse | null>>(createRemoteState(INITIAL_TECHNICAL_ANALYSIS));
+  const [marketSentiment, setMarketSentiment] = useState<RemoteState<MarketSentimentResponse | null>>(createRemoteState(INITIAL_MARKET_SENTIMENT));
+  const [symbolSentiment, setSymbolSentiment] = useState<RemoteState<SymbolSentimentResponse | null>>(createRemoteState(INITIAL_SYMBOL_SENTIMENT));
+  const [patternAnalysis, setPatternAnalysis] = useState<RemoteState<PatternAnalysisResponse | null>>(createRemoteState(INITIAL_PATTERN_ANALYSIS));
   const [performanceAnalytics, setPerformanceAnalytics] = useState<RemoteState<PerformanceAnalyticsResponse | null>>(createRemoteState(INITIAL_PERFORMANCE));
   const [tradeQualityAnalytics, setTradeQualityAnalytics] = useState<RemoteState<TradeQualityResponse | null>>(createRemoteState(INITIAL_TRADE_QUALITY));
   const [symbolResults, setSymbolResults] = useState<RemoteState<SpotSymbolItem[]>>(createRemoteState<SpotSymbolItem[]>([]));
 
   const [selectedSymbol, setSelectedSymbol] = useState('');
   const [symbolSearch, setSymbolSearch] = useState('');
+  const [selectedPatternHorizon, setSelectedPatternHorizon] = useState<PatternHorizon>('7d');
+  const [aiHistoryOffset, setAiHistoryOffset] = useState(0);
   const [botActionLoading, setBotActionLoading] = useState(false);
   const [botActionError, setBotActionError] = useState<string | null>(null);
 
@@ -147,6 +186,10 @@ function App() {
     setAiSignal((current) => setPending(current));
     setAiHistory((current) => setPending(current));
     setAiEvaluation((current) => setPending(current));
+    setTechnicalAnalysis((current) => setPending(current));
+    setMarketSentiment((current) => setPending(current));
+    setSymbolSentiment((current) => setPending(current));
+    setPatternAnalysis((current) => setPending(current));
     setPerformanceAnalytics((current) => setPending(current));
     setTradeQualityAnalytics((current) => setPending(current));
 
@@ -158,13 +201,17 @@ function App() {
         setSymbolSearch(botStatusData.symbol);
       }
 
-      const [workstationData, aiSignalData, aiHistoryData, aiEvaluationData, performanceData, tradeQualityData] = await Promise.all([
+      const [workstationData, aiSignalData, aiHistoryData, aiEvaluationData, technicalAnalysisData, marketSentimentData, symbolSentimentData, patternAnalysisData, performanceData, tradeQualityData] = await Promise.all([
         resolvedSymbol ? getWorkstation(resolvedSymbol) : Promise.resolve<WorkstationResponse | null>(null),
         resolvedSymbol ? getAISignal(resolvedSymbol) : Promise.resolve<AISignalSummary | null>(null),
         resolvedSymbol
-          ? getAISignalHistory(resolvedSymbol, { limit: INITIAL_AI_HISTORY.limit, offset: 0 })
+          ? getAISignalHistory(resolvedSymbol, { limit: AI_HISTORY_PAGE_SIZE, offset: aiHistoryOffset })
           : Promise.resolve<AISignalHistoryResponse>(INITIAL_AI_HISTORY),
         resolvedSymbol ? getAISignalEvaluation(resolvedSymbol) : Promise.resolve<AIOutcomeEvaluationResponse | null>(null),
+        resolvedSymbol ? getTechnicalAnalysis(resolvedSymbol) : Promise.resolve<TechnicalAnalysisResponse | null>(null),
+        resolvedSymbol ? getMarketSentiment(resolvedSymbol) : Promise.resolve<MarketSentimentResponse | null>(null),
+        resolvedSymbol ? getSymbolSentiment(resolvedSymbol) : Promise.resolve<SymbolSentimentResponse | null>(null),
+        resolvedSymbol ? getPatternAnalysis(resolvedSymbol, selectedPatternHorizon) : Promise.resolve<PatternAnalysisResponse | null>(null),
         resolvedSymbol ? getPerformanceAnalytics(resolvedSymbol) : Promise.resolve<PerformanceAnalyticsResponse | null>(null),
         resolvedSymbol ? getTradeQualityAnalytics(resolvedSymbol) : Promise.resolve<TradeQualityResponse | null>(null),
       ]);
@@ -175,6 +222,10 @@ function App() {
       setAiSignal({ data: aiSignalData, loading: false, refreshing: false, error: null });
       setAiHistory({ data: aiHistoryData, loading: false, refreshing: false, error: null });
       setAiEvaluation({ data: aiEvaluationData, loading: false, refreshing: false, error: null });
+      setTechnicalAnalysis({ data: technicalAnalysisData, loading: false, refreshing: false, error: null });
+      setMarketSentiment({ data: marketSentimentData, loading: false, refreshing: false, error: null });
+      setSymbolSentiment({ data: symbolSentimentData, loading: false, refreshing: false, error: null });
+      setPatternAnalysis({ data: patternAnalysisData, loading: false, refreshing: false, error: null });
       setPerformanceAnalytics({ data: performanceData, loading: false, refreshing: false, error: null });
       setTradeQualityAnalytics({ data: tradeQualityData, loading: false, refreshing: false, error: null });
       setLastUpdatedAt(new Date());
@@ -187,11 +238,15 @@ function App() {
         setAiSignal((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setAiHistory((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setAiEvaluation((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setTechnicalAnalysis((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setMarketSentiment((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setSymbolSentiment((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setPatternAnalysis((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setPerformanceAnalytics((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setTradeQualityAnalytics((current) => ({ ...current, loading: false, refreshing: false, error: message }));
       }
     }
-  }, []);
+  }, [aiHistoryOffset, selectedPatternHorizon]);
 
   useEffect(() => {
     void loadSymbols(symbolSearch);
@@ -220,12 +275,14 @@ function App() {
   }, [selectedSymbol]);
 
   const handleSelectSymbol = useCallback((symbol: string) => {
+    setAiHistoryOffset(0);
     setSelectedSymbol(symbol);
     setSymbolSearch(symbol);
     setBotActionError(null);
   }, []);
 
   const handleClearSelection = useCallback(() => {
+    setAiHistoryOffset(0);
     setSelectedSymbol('');
     setSymbolSearch('');
     setBotActionError(null);
@@ -233,6 +290,10 @@ function App() {
     setAiSignal({ data: null, loading: false, refreshing: false, error: null });
     setAiHistory({ data: INITIAL_AI_HISTORY, loading: false, refreshing: false, error: null });
     setAiEvaluation({ data: null, loading: false, refreshing: false, error: null });
+    setTechnicalAnalysis({ data: null, loading: false, refreshing: false, error: null });
+    setMarketSentiment({ data: null, loading: false, refreshing: false, error: null });
+    setSymbolSentiment({ data: null, loading: false, refreshing: false, error: null });
+    setPatternAnalysis({ data: null, loading: false, refreshing: false, error: null });
     setPerformanceAnalytics({ data: null, loading: false, refreshing: false, error: null });
     setTradeQualityAnalytics({ data: null, loading: false, refreshing: false, error: null });
   }, []);
@@ -244,6 +305,7 @@ function App() {
       const nextStatus = await action();
       setBotStatus({ data: nextStatus, loading: false, refreshing: false, error: null });
       if (nextStatus.symbol) {
+        setAiHistoryOffset(0);
         setSelectedSymbol(nextStatus.symbol);
         setSymbolSearch(nextStatus.symbol);
       }
@@ -261,11 +323,16 @@ function App() {
     setBotActionError(null);
     try {
       const nextStatus = await resetBotSession();
+      setAiHistoryOffset(0);
       setBotStatus({ data: nextStatus, loading: false, refreshing: false, error: null });
       setWorkstation({ data: null, loading: false, refreshing: false, error: null });
       setAiSignal({ data: null, loading: false, refreshing: false, error: null });
       setAiHistory({ data: INITIAL_AI_HISTORY, loading: false, refreshing: false, error: null });
       setAiEvaluation({ data: null, loading: false, refreshing: false, error: null });
+      setTechnicalAnalysis({ data: null, loading: false, refreshing: false, error: null });
+      setMarketSentiment({ data: null, loading: false, refreshing: false, error: null });
+      setSymbolSentiment({ data: null, loading: false, refreshing: false, error: null });
+      setPatternAnalysis({ data: null, loading: false, refreshing: false, error: null });
       setPerformanceAnalytics({ data: null, loading: false, refreshing: false, error: null });
       setTradeQualityAnalytics({ data: null, loading: false, refreshing: false, error: null });
       setLastUpdatedAt(new Date());
@@ -296,6 +363,18 @@ function App() {
   const signalExplanation = effectiveWorkstation?.explanation ?? 'Select a symbol, then start or pause the live paper runtime to populate live signal state.';
   const refreshLabel = autoRefreshSeconds === 0 ? 'Off' : `${autoRefreshSeconds}s`;
   const readiness = effectiveWorkstation?.trade_readiness ?? null;
+  const handleAiHistoryPrevious = useCallback(() => {
+    setAiHistoryOffset((current) => Math.max(current - AI_HISTORY_PAGE_SIZE, 0));
+  }, []);
+  const handleAiHistoryNext = useCallback(() => {
+    setAiHistoryOffset((current) => {
+      const total = aiHistory.data.total;
+      if (current + AI_HISTORY_PAGE_SIZE >= total) {
+        return current;
+      }
+      return current + AI_HISTORY_PAGE_SIZE;
+    });
+  }, [aiHistory.data.total]);
 
   return (
     <div className="min-h-screen bg-transparent text-slate-100">
@@ -388,7 +467,7 @@ function App() {
             <SectionCard
               title="Signal"
               description="Live symbol context plus persisted advisory history for the selected symbol."
-              action={workstation.refreshing || workstation.loading || aiSignal.refreshing || aiHistory.refreshing ? <span className="text-xs text-slate-400">Refreshing...</span> : null}
+              action={workstation.refreshing || workstation.loading || aiSignal.refreshing || aiHistory.refreshing || technicalAnalysis.refreshing || marketSentiment.refreshing || symbolSentiment.refreshing || patternAnalysis.refreshing ? <span className="text-xs text-slate-400">Refreshing...</span> : null}
             >
               {selectedSymbol.length === 0 ? (
                 <StatePanel title="No symbol selected" message="Pick a symbol to load live signal state." tone="empty" />
@@ -474,12 +553,12 @@ function App() {
                           <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Feature Snapshot</p>
                           {effectiveWorkstation.feature ? (
                             <div className="mt-3 grid grid-cols-2 gap-3 text-sm text-slate-200">
-                              <div><span className="text-slate-500">EMA Fast</span><p>{formatCurrency(effectiveWorkstation.feature.ema_fast ?? 0)}</p></div>
-                              <div><span className="text-slate-500">EMA Slow</span><p>{formatCurrency(effectiveWorkstation.feature.ema_slow ?? 0)}</p></div>
-                              <div><span className="text-slate-500">ATR</span><p>{formatDecimal(effectiveWorkstation.feature.atr ?? 0)}</p></div>
-                              <div><span className="text-slate-500">Spread</span><p>{formatDecimal(effectiveWorkstation.feature.bid_ask_spread ?? 0)}</p></div>
-                              <div><span className="text-slate-500">Mid Price</span><p>{formatCurrency(effectiveWorkstation.feature.mid_price ?? 0)}</p></div>
-                              <div><span className="text-slate-500">Book Imbalance</span><p>{formatDecimal(effectiveWorkstation.feature.order_book_imbalance ?? 0)}</p></div>
+                              <div><span className="text-slate-500">EMA Fast</span><p>{formatOptionalCurrency(effectiveWorkstation.feature.ema_fast, 'Not yet populated')}</p></div>
+                              <div><span className="text-slate-500">EMA Slow</span><p>{formatOptionalCurrency(effectiveWorkstation.feature.ema_slow, 'Not yet populated')}</p></div>
+                              <div><span className="text-slate-500">ATR</span><p>{formatOptionalDecimal(effectiveWorkstation.feature.atr, 'Not yet populated')}</p></div>
+                              <div><span className="text-slate-500">Spread</span><p>{formatOptionalDecimal(effectiveWorkstation.feature.bid_ask_spread, effectiveWorkstation.top_of_book ? 'Not yet populated' : 'Waiting for live snapshot')}</p></div>
+                              <div><span className="text-slate-500">Mid Price</span><p>{formatOptionalCurrency(effectiveWorkstation.feature.mid_price, effectiveWorkstation.top_of_book ? 'Not yet populated' : 'Waiting for live snapshot')}</p></div>
+                              <div><span className="text-slate-500">Book Imbalance</span><p>{formatOptionalDecimal(effectiveWorkstation.feature.order_book_imbalance, effectiveWorkstation.top_of_book ? 'Not yet populated' : 'Unavailable')}</p></div>
                             </div>
                           ) : (
                             <StatePanel title="Waiting for features" message="More candle history is needed before the feature engine can derive trend and volatility state." tone="empty" />
@@ -490,26 +569,55 @@ function App() {
                   )}
 
                   <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
-                    <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">AI Advisory</p>
-                    {aiSignal.error ? (
-                      <StatePanel title="AI signal unavailable" message={aiSignal.error} tone="error" />
-                    ) : effectiveAiSignal ? (
-                      <div className="mt-3 space-y-4">
-                        <p className="text-xs uppercase tracking-[0.16em] text-slate-500">Advisory only - execution still follows deterministic strategy plus risk gating.</p>
-                        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
-                          <MetricCard label="Bias" value={effectiveAiSignal.bias} helper="Probable market direction" />
-                          <MetricCard label="Confidence" value={`${effectiveAiSignal.confidence}%`} helper={formatDateTime(effectiveAiSignal.timestamp)} />
-                          <MetricCard label="Entry Setup" value={effectiveAiSignal.entry_signal ? 'Yes' : 'No'} helper="Potential entry present" />
-                          <MetricCard label="Exit Setup" value={effectiveAiSignal.exit_signal ? 'Yes' : 'No'} helper="Potential exit present" />
-                          <MetricCard label="Suggested Action" value={effectiveAiSignal.suggested_action} helper="Advisory only" />
-                        </div>
-                        <p className="text-sm leading-6 text-slate-300">{effectiveAiSignal.explanation}</p>
-                      </div>
-                    ) : aiSignal.loading ? (
-                      <StatePanel title="Loading AI signal" message="Reading the latest persisted advisory snapshot for the selected symbol." tone="loading" />
-                    ) : (
-                      <StatePanel title="AI signal unavailable" message="No persisted AI advisory snapshot exists yet for the selected symbol." tone="empty" />
-                    )}
+                    <TechnicalAnalysisSection
+                      symbol={selectedSymbol}
+                      analysis={technicalAnalysis.data}
+                      loading={technicalAnalysis.loading}
+                      refreshing={technicalAnalysis.refreshing}
+                      error={technicalAnalysis.error}
+                    />
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <MarketSentimentSection
+                      symbol={selectedSymbol}
+                      sentiment={marketSentiment.data}
+                      loading={marketSentiment.loading}
+                      refreshing={marketSentiment.refreshing}
+                      error={marketSentiment.error}
+                    />
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <SymbolSentimentSection
+                      symbol={selectedSymbol}
+                      sentiment={symbolSentiment.data}
+                      loading={symbolSentiment.loading}
+                      refreshing={symbolSentiment.refreshing}
+                      error={symbolSentiment.error}
+                    />
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <PatternAnalysisSection
+                      symbol={selectedSymbol}
+                      selectedHorizon={selectedPatternHorizon}
+                      analysis={patternAnalysis.data}
+                      loading={patternAnalysis.loading}
+                      refreshing={patternAnalysis.refreshing}
+                      error={patternAnalysis.error}
+                      onSelectHorizon={setSelectedPatternHorizon}
+                    />
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <AIAdvisorySection
+                      symbol={selectedSymbol}
+                      signal={effectiveAiSignal}
+                      loading={aiSignal.loading}
+                      refreshing={aiSignal.refreshing}
+                      error={aiSignal.error}
+                    />
                   </div>
 
                   <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
@@ -521,6 +629,11 @@ function App() {
                       error={aiHistory.error}
                       dataState={aiHistory.data.data_state}
                       statusMessage={aiHistory.data.status_message}
+                      total={aiHistory.data.total}
+                      limit={aiHistory.data.limit}
+                      offset={aiHistory.data.offset}
+                      onPrevious={handleAiHistoryPrevious}
+                      onNext={handleAiHistoryNext}
                     />
                   </div>
 

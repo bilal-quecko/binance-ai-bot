@@ -10,13 +10,19 @@ from decimal import Decimal
 from uuid import uuid4
 from typing import Literal
 
-from app.ai import AISignalService, AISignalSnapshot
+from app.analysis import TechnicalAnalysisService, TechnicalAnalysisSnapshot
+from app.analysis.market_sentiment import MarketSentimentService, MarketSentimentSnapshot
+from app.ai.evaluation import AIOutcomeEvaluator
+from app.ai.models import AISignalSnapshot
+from app.ai.service import AISignalService
 from app.config import Settings
+from app.data import MarketContextService
 from app.execution.execution_engine import ExecutionEngine
 from app.exchange.binance_ws import BinanceWebSocketClient
 from app.features.feature_store import FeatureEngine
 from app.features.models import FeatureSnapshot
 from app.features.models import FeatureConfig
+from app.market_data.candles import Candle
 from app.market_data.stream_manager import StreamManager
 from app.market_data.models import MarketSnapshot
 from app.paper.broker import PaperBroker
@@ -88,6 +94,8 @@ class PaperBotRuntime:
         self._logger = logger or logging.getLogger(__name__)
         self._stream_manager = stream_manager or StreamManager(websocket_client=websocket_client)
         self._ai_signal_service = AISignalService()
+        self._market_sentiment_service = MarketSentimentService()
+        self._technical_analysis_service = TechnicalAnalysisService()
         self._task: asyncio.Task[None] | None = None
         self._runner: StrategyRunner | None = None
         self._storage_repository = StorageRepository(self._settings.database_url)
@@ -278,6 +286,26 @@ class PaperBotRuntime:
             recovery_message=self._status.recovery_message,
         )
 
+    def technical_analysis(self, symbol: str) -> TechnicalAnalysisSnapshot | None:
+        """Return the current technical analysis for one symbol."""
+
+        normalized_symbol = symbol.strip().upper()
+        if not normalized_symbol or self._runner is None or self._status.symbol != normalized_symbol:
+            return None
+        return self._technical_analysis_service.analyze(
+            symbol=normalized_symbol,
+            candles=self._runner.get_candle_history(normalized_symbol),
+            feature_snapshot=self._runner.get_feature_snapshot(normalized_symbol),
+        )
+
+    def candle_history(self, symbol: str) -> list[Candle]:
+        """Return recent live candle history for one symbol."""
+
+        normalized_symbol = symbol.strip().upper()
+        if not normalized_symbol or self._runner is None:
+            return []
+        return self._runner.get_candle_history(normalized_symbol)
+
     def _build_ai_signal(
         self,
         symbol: str,
@@ -290,11 +318,46 @@ class PaperBotRuntime:
         candles = self._runner.get_candle_history(symbol)
         if not candles:
             return None
+        technical_analysis = self._technical_analysis_service.analyze(
+            symbol=symbol,
+            candles=candles,
+            feature_snapshot=feature_snapshot,
+        )
+        market_sentiment = self._build_market_sentiment(symbol)
+        recent_false_positive_rate_5m = None
+        recent_false_reversal_rate_5m = None
+        if self._storage_repository is not None:
+            evaluation = AIOutcomeEvaluator(self._storage_repository).evaluate(symbol=symbol)
+            summary_5m = next(
+                (summary for summary in evaluation.horizons if summary.horizon == "5m"),
+                None,
+            )
+            if summary_5m is not None and summary_5m.sample_size > 0:
+                recent_false_positive_rate_5m = summary_5m.false_positive_rate_pct
+                recent_false_reversal_rate_5m = summary_5m.false_reversal_rate_pct
         return self._ai_signal_service.build_signal(
             symbol=symbol,
             candles=candles,
             feature_snapshot=feature_snapshot,
             top_of_book=self._runner.get_top_of_book(symbol),
+            technical_analysis=technical_analysis,
+            market_sentiment=market_sentiment,
+            recent_false_positive_rate_5m=recent_false_positive_rate_5m,
+            recent_false_reversal_rate_5m=recent_false_reversal_rate_5m,
+        )
+
+    def _build_market_sentiment(self, symbol: str) -> MarketSentimentSnapshot | None:
+        """Build broader-market sentiment from persisted and live market context."""
+
+        if self._storage_repository is None:
+            return None
+        symbol_points = MarketContextService(
+            repository=self._storage_repository,
+            runtime=self,
+        ).load_market_context(selected_symbol=symbol)
+        return self._market_sentiment_service.analyze(
+            symbol=symbol,
+            symbol_points=symbol_points,
         )
 
     def _persist_ai_signal_if_needed(

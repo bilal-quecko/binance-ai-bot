@@ -155,3 +155,122 @@ Chronological implementation checkpoints for Binance AI Bot.
   - added storage, runtime, and API tests for restart-style recovery, corrupt persisted state, and reset clearing
   - full backend test suite: passed
   - frontend production build: passed
+
+## No. 9 - Technical Analysis Engine Maturity
+
+- Status: Completed
+- Scope:
+  - added a dedicated technical-analysis layer for the selected symbol
+  - exposed symbol-scoped trend, momentum, structure, volatility, breakout, reversal, and multi-timeframe summaries
+  - added a separate Signal-tab technical-analysis section distinct from AI advisory
+- Backend:
+  - added `app/analysis/technical.py`, `app/analysis/support_resistance.py`, `app/analysis/patterns.py`, `app/analysis/multi_timeframe.py`, and `app/analysis/volatility.py`
+  - added `/bot/technical-analysis` with typed empty/incomplete vs ready responses
+  - reused live runner candle history and existing feature snapshots without allowing technical output to bypass deterministic risk or execution
+- Frontend:
+  - added a dedicated `Technical Analysis` section in the Signal tab
+  - kept technical state visually separate from AI advisory and current runtime state
+  - kept symbol-scoped empty and refreshing states explicit
+- Validation:
+  - added backend service and API tests for bullish, bearish, sideways, support/resistance, and incomplete-data paths
+  - full backend test suite: passed
+  - frontend production build: passed
+
+## No. 10 - Multi-Horizon Pattern Analysis
+
+- Status: Completed
+- Scope:
+  - added a symbol-scoped multi-horizon pattern-analysis layer over user-selectable day ranges
+  - exposed range behavior, return, volatility, drawdown, persistence, and breakout/range/reversal tendencies
+  - added a dedicated Signal-tab `Pattern Analysis` section with horizon selection
+- Backend:
+  - added `app/analysis/horizon_analysis.py`, `app/analysis/range_behavior.py`, and `app/analysis/pattern_summary.py`
+  - added `/bot/pattern-analysis?symbol=...&horizon=...` with typed `ready`, `waiting_for_runtime`, `waiting_for_history`, and `degraded_storage` states
+  - merged persisted close-price history with current live closed candles without allowing pattern analysis to bypass deterministic execution controls
+- Frontend:
+  - added a separate `Pattern Analysis` Signal-tab section with `1D`, `3D`, `7D`, `14D`, and `30D` selectors
+  - kept pattern analysis visually distinct from technical analysis, current bot state, and AI advisory
+  - kept horizon-specific refresh behavior in-place without full-page flicker
+- Validation:
+  - added backend service and API tests for bullish, bearish, choppy, insufficient-history, and drawdown/return calculation paths
+  - full backend test suite: passed
+  - frontend production build: passed
+
+## No. 11 - Market Sentiment Layer
+
+- Status: Completed
+- Scope:
+  - added a broader-market sentiment layer for the selected symbol
+  - exposed BTC/ETH context, relative strength, market breadth, and volatility environment through a symbol-scoped API
+  - added a separate Signal-tab `Market Sentiment` section distinct from technical analysis, pattern analysis, and AI advisory
+- Backend:
+  - added `app/analysis/market_sentiment.py`, `app/analysis/market_breadth.py`, and `app/data/market_context_service.py`
+  - added `/bot/market-sentiment?symbol=...` with typed `ready`, `waiting_for_runtime`, `waiting_for_history`, and `degraded_storage` states
+  - reused persisted close-price history plus live closed candles when available, without allowing market sentiment to bypass deterministic execution or risk controls
+- Frontend:
+  - added a dedicated `Market Sentiment` Signal-tab section with broader-market state, score, BTC/ETH bias, relative strength, breadth, volatility environment, and explanation
+  - kept market sentiment visually separate from current bot state, technical analysis, pattern analysis, and AI advisory
+  - kept symbol-scoped refresh behavior in-place without full-page flicker
+- Validation:
+  - added backend service and API tests for bullish, bearish, mixed, insufficient-data, and API-shape paths
+  - full backend test suite: passed
+  - frontend production build: passed
+
+## No. 12 - AI Robustness Upgrade for Short Timeframes
+
+- Status: Completed
+- Scope:
+  - upgraded the advisory AI layer with explicit regime classification, short-timeframe noise filters, horizon-specific scoring, and confidence shaping
+  - added abstain, low-confidence, and confirmation-needed behavior so the AI can decline weak 5m-style setups
+  - extended persisted AI snapshots, API responses, and the Signal-tab AI section with richer advisory context
+- Backend:
+  - added `app/ai/regime.py`, `app/ai/noise_filters.py`, `app/ai/calibration.py`, and `app/ai/horizon_scoring.py`
+  - expanded AI feature extraction to combine technical state, market sentiment context, microstructure sanity, momentum persistence, flip-rate noise, breakout/reversal context, and recent 5m false-signal profile when available
+  - added distinct `5m`, `15m`, and `1h` horizon reads with separate confidence, action, and abstain/confirmation behavior
+  - extended AI evaluation to track actionable sample size, abstain count/rate, and horizon-specific confidence usage
+- Frontend:
+  - replaced the old compact AI card with a richer `AI Advisory` section showing regime, noise level, preferred horizon, recommendation, abstain/confirmation flags, horizon reads, and confidence headwinds
+  - kept the AI section visually separate from technical analysis, market sentiment, and pattern analysis
+- Validation:
+  - added backend tests for noisy/choppy abstention, clean trending confidence, breakout-building confirmation, reversal-risk behavior, and horizon differentiation
+  - full backend test suite: passed
+  - frontend production build: passed
+
+## No. 13 - Symbol Sentiment Layer
+
+- Status: Completed
+- Scope:
+  - added a symbol-scoped external sentiment layer for the selected symbol
+  - exposed a typed `/bot/symbol-sentiment` endpoint with honest `insufficient_data` fallback when no source-backed evidence exists
+  - added a separate Signal-tab `Symbol Sentiment` section distinct from technical analysis, pattern analysis, market sentiment, and AI advisory
+- Backend:
+  - added `app/analysis/symbol_sentiment.py` and `app/analysis/sentiment_scoring.py`
+  - added `app/data/news_service.py` and `app/data/sentiment_sources.py` for source-backed evidence abstractions
+  - kept the default local setup source-free, so sentiment returns `insufficient_data` instead of fabricating external tone
+- Frontend:
+  - added a dedicated `Symbol Sentiment` Signal-tab section with state, score, confidence, freshness, source count, explanation, and evidence summary
+  - kept symbol sentiment visually separate from current bot state, technical analysis, pattern analysis, market sentiment, and AI advisory
+- Validation:
+  - added backend service and API tests for bullish, bearish, mixed, insufficient-data, and API-shape paths
+  - full backend test suite: passed
+  - frontend production build: passed
+
+## No. 14 - Workstation UX Clarity and Log Pagination
+
+- Status: Completed
+- Scope:
+  - clarified partial and incomplete workstation states in the Signal tab
+  - replaced technical execution wording with clearer operator-facing language
+  - reduced advisory history noise by showing the latest three entries first with pagination for older history
+- Backend:
+  - reused existing typed AI-history pagination without changing trading logic or paper-only execution behavior
+- Frontend:
+  - clarified pattern coverage using covered duration versus requested duration and explicit preliminary labels
+  - removed repetitive market-sentiment incomplete messaging in favor of one compact status plus one explanation
+  - stopped showing misleading zeroes in the Feature Snapshot when live market data is not available yet
+  - humanized execution-readiness actions and hid cost/edge metrics until live readiness inputs exist
+  - paginated AI advisory history to three items per page and made the latest three entries visually prominent
+- Validation:
+  - full backend test suite: passed
+  - frontend helper tests: passed
+  - frontend production build: passed

@@ -10,12 +10,27 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from app.ai import AIOutcomeEvaluator
+from app.analysis import (
+    HorizonPatternAnalysisService,
+    MarketSentimentSnapshot,
+    MarketSentimentService,
+    PatternAnalysisSnapshot,
+    PatternPricePoint,
+    SymbolSentimentSnapshot,
+    SymbolSentimentService,
+    TechnicalAnalysisSnapshot,
+    TimeframeTechnicalSummary,
+    merge_pattern_points,
+    normalize_horizon,
+)
+from app.ai.evaluation import AIOutcomeEvaluator
 from app.bot import BotStatus, PaperBotRuntime, WorkstationState
 from app.config import Settings, get_settings
+from app.data import MarketContextService
 from app.exchange.symbol_service import SpotSymbolRecord, SpotSymbolService
 from app.runner.models import TradeReadiness
 from app.storage import StorageRepository
+from app.storage.models import MarketCandleSnapshotRecord
 
 router = APIRouter()
 LOGGER = logging.getLogger(__name__)
@@ -131,6 +146,22 @@ class AIFeatureResponse(BaseModel):
     volume_spike_ratio: Decimal | None = None
     spread_ratio: Decimal | None = None
     microstructure_healthy: bool
+    momentum_persistence: Decimal | None = None
+    direction_flip_rate: Decimal | None = None
+    structure_quality: Decimal | None = None
+    recent_false_positive_rate_5m: Decimal | None = None
+
+
+class AIHorizonResponse(BaseModel):
+    """Serialized horizon-specific AI advisory view."""
+
+    horizon: str
+    bias: str
+    confidence: int
+    suggested_action: str
+    abstain: bool = False
+    confirmation_needed: bool = False
+    explanation: str
 
 
 class AISignalResponse(BaseModel):
@@ -143,7 +174,15 @@ class AISignalResponse(BaseModel):
     entry_signal: bool
     exit_signal: bool
     suggested_action: str
+    regime: str = "insufficient_data"
+    noise_level: str = "unknown"
+    abstain: bool = False
+    low_confidence: bool = False
+    confirmation_needed: bool = False
+    preferred_horizon: str | None = None
+    weakening_factors: tuple[str, ...] = ()
     explanation: str
+    horizons: list[AIHorizonResponse] = []
     features: AIFeatureResponse
 
 
@@ -166,6 +205,101 @@ class TradeReadinessResponse(BaseModel):
     estimated_round_trip_cost_pct: Decimal | None = None
 
 
+class TechnicalTimeframeSummaryResponse(BaseModel):
+    """Technical trend summary for one derived timeframe."""
+
+    timeframe: str
+    trend_direction: str
+    trend_strength: str
+
+
+class TechnicalAnalysisResponse(BaseModel):
+    """Symbol-scoped technical analysis payload."""
+
+    symbol: str
+    generated_at: datetime | None = None
+    data_state: DataState
+    status_message: str | None = None
+    trend_direction: str | None = None
+    trend_strength: str | None = None
+    trend_strength_score: int | None = None
+    support_levels: list[Decimal] = []
+    resistance_levels: list[Decimal] = []
+    momentum_state: str | None = None
+    volatility_regime: str | None = None
+    breakout_readiness: str | None = None
+    breakout_bias: str | None = None
+    reversal_risk: str | None = None
+    multi_timeframe_agreement: str | None = None
+    timeframe_summaries: list[TechnicalTimeframeSummaryResponse] = []
+    explanation: str | None = None
+
+
+class PatternAnalysisResponse(BaseModel):
+    """Symbol-scoped multi-horizon pattern-analysis payload."""
+
+    symbol: str
+    horizon: str
+    generated_at: datetime | None = None
+    data_state: DataState
+    status_message: str | None = None
+    coverage_start: datetime | None = None
+    coverage_end: datetime | None = None
+    coverage_ratio_pct: Decimal = Decimal("0")
+    partial_coverage: bool = False
+    overall_direction: str | None = None
+    net_return_pct: Decimal | None = None
+    up_moves: int = 0
+    down_moves: int = 0
+    flat_moves: int = 0
+    up_move_ratio_pct: Decimal | None = None
+    down_move_ratio_pct: Decimal | None = None
+    realized_volatility_pct: Decimal | None = None
+    max_drawdown_pct: Decimal | None = None
+    trend_character: str | None = None
+    breakout_tendency: str | None = None
+    reversal_tendency: str | None = None
+    explanation: str | None = None
+
+
+class MarketSentimentResponse(BaseModel):
+    """Symbol-scoped broader-market sentiment payload."""
+
+    symbol: str
+    generated_at: datetime | None = None
+    data_state: DataState
+    status_message: str | None = None
+    market_state: str
+    sentiment_score: int | None = None
+    btc_bias: str | None = None
+    eth_bias: str | None = None
+    selected_symbol_relative_strength: str = "insufficient_data"
+    relative_strength_pct: Decimal | None = None
+    market_breadth_state: str = "insufficient_data"
+    breadth_advancing_symbols: int = 0
+    breadth_declining_symbols: int = 0
+    breadth_sample_size: int = 0
+    volatility_environment: str = "insufficient_data"
+    explanation: str | None = None
+
+
+class SymbolSentimentResponse(BaseModel):
+    """Symbol-scoped external sentiment payload."""
+
+    symbol: str
+    generated_at: datetime | None = None
+    data_state: DataState
+    status_message: str | None = None
+    sentiment_state: str = "insufficient_data"
+    sentiment_score: int | None = None
+    source_count: int = 0
+    freshness: str = "unknown"
+    freshness_minutes: int | None = None
+    confidence: int | None = None
+    evidence_summary: list[str] = []
+    explanation: str | None = None
+
+
 class AISignalHistoryResponse(BaseModel):
     """Paginated AI advisory history for one symbol."""
 
@@ -184,6 +318,9 @@ class AIOutcomeSummaryResponse(BaseModel):
     sample_size: int
     directional_accuracy_pct: Decimal
     confidence_calibration_pct: Decimal
+    actionable_sample_size: int
+    abstain_count: int
+    abstain_rate_pct: Decimal
     false_positive_count: int
     false_positive_rate_pct: Decimal
     false_reversal_count: int
@@ -208,6 +345,7 @@ class AIOutcomeSampleResponse(BaseModel):
     directional_correct: bool
     false_positive: bool
     false_reversal: bool
+    abstained: bool
 
 
 class AIOutcomeEvaluationResponse(BaseModel):
@@ -282,6 +420,99 @@ def _safe_workstation_state(
         )
 
 
+def _safe_technical_analysis(
+    runtime: PaperBotRuntime,
+    symbol: str,
+) -> tuple[TechnicalAnalysisSnapshot | None, bool]:
+    """Return technical analysis without allowing runtime failures to escape the API."""
+
+    try:
+        return runtime.technical_analysis(symbol), False
+    except Exception:
+        LOGGER.exception("Failed to build technical analysis for symbol %s.", symbol)
+        return None, True
+
+
+def _safe_pattern_analysis(
+    runtime: PaperBotRuntime,
+    *,
+    symbol: str,
+    horizon: str,
+    repository: StorageRepository,
+) -> tuple[PatternAnalysisSnapshot | None, bool]:
+    """Return pattern analysis without allowing runtime errors to escape the API."""
+
+    try:
+        persisted_points = [
+            _to_pattern_point(record)
+            for record in repository.get_market_candle_history(symbol=symbol, timeframe="1m")
+        ]
+        live_points = [
+            PatternPricePoint(
+                symbol=candle.symbol,
+                timestamp=candle.close_time,
+                close_price=candle.close,
+            )
+            for candle in runtime.candle_history(symbol)
+            if candle.is_closed
+        ]
+        merged_points = merge_pattern_points(
+            persisted_points=persisted_points,
+            live_points=live_points,
+        )
+        return (
+            HorizonPatternAnalysisService().analyze(
+                symbol=symbol,
+                horizon=horizon,
+                points=merged_points,
+                runtime_active=_runtime_matches_symbol(runtime.status(), symbol),
+            ),
+            False,
+        )
+    except Exception:
+        LOGGER.exception("Failed to build pattern analysis for symbol %s horizon %s.", symbol, horizon)
+        return None, True
+
+
+def _safe_market_sentiment(
+    runtime: PaperBotRuntime,
+    *,
+    symbol: str,
+    repository: StorageRepository,
+) -> tuple[MarketSentimentSnapshot | None, bool]:
+    """Return market sentiment without allowing runtime failures to escape the API."""
+
+    try:
+        symbol_points = MarketContextService(
+            repository=repository,
+            runtime=runtime,
+        ).load_market_context(selected_symbol=symbol)
+        return (
+            MarketSentimentService().analyze(
+                symbol=symbol,
+                symbol_points=symbol_points,
+            ),
+            False,
+        )
+    except Exception:
+        LOGGER.exception("Failed to build market sentiment for symbol %s.", symbol)
+        return None, True
+
+
+def _safe_symbol_sentiment(
+    service: SymbolSentimentService,
+    *,
+    symbol: str,
+) -> tuple[SymbolSentimentSnapshot | None, bool]:
+    """Return symbol sentiment without allowing source/service errors to escape the API."""
+
+    try:
+        return service.analyze(symbol=symbol), False
+    except Exception:
+        LOGGER.exception("Failed to build symbol sentiment for symbol %s.", symbol)
+        return None, True
+
+
 def _empty_ai_signal_history_response(
     limit: int,
     offset: int,
@@ -318,6 +549,9 @@ def _empty_ai_outcome_evaluation_response(
                 sample_size=0,
                 directional_accuracy_pct=Decimal("0"),
                 confidence_calibration_pct=Decimal("0"),
+                actionable_sample_size=0,
+                abstain_count=0,
+                abstain_rate_pct=Decimal("0"),
                 false_positive_count=0,
                 false_positive_rate_pct=Decimal("0"),
                 false_reversal_count=0,
@@ -425,10 +659,136 @@ def _derive_evaluation_data_state(
     )
 
 
+def _derive_technical_analysis_data_state(
+    *,
+    symbol: str,
+    status: BotStatus,
+    analysis: TechnicalAnalysisSnapshot | None,
+    analysis_failed: bool,
+) -> tuple[DataState, str]:
+    """Derive a symbol-scoped technical-analysis readiness state."""
+
+    if analysis_failed:
+        return (
+            "degraded_storage",
+            f"Technical analysis for {symbol} is temporarily unavailable.",
+        )
+    if not _runtime_matches_symbol(status, symbol):
+        return (
+            "waiting_for_runtime",
+            f"Start or attach the live runtime for {symbol} to build technical analysis.",
+        )
+    if analysis is None or analysis.data_state == "incomplete":
+        return (
+            "waiting_for_history",
+            analysis.status_message
+            if analysis is not None
+            else f"Technical analysis for {symbol} needs more closed-candle history.",
+        )
+    return ("ready", analysis.status_message or f"Technical analysis is ready for {symbol}.")
+
+
+def _derive_pattern_analysis_data_state(
+    *,
+    symbol: str,
+    horizon: str,
+    status: BotStatus,
+    analysis: PatternAnalysisSnapshot | None,
+    analysis_failed: bool,
+    storage_degraded: bool,
+    storage_message: str | None,
+) -> tuple[DataState, str]:
+    """Derive a symbol-scoped pattern-analysis readiness state."""
+
+    if analysis_failed or storage_degraded:
+        return (
+            "degraded_storage",
+            storage_message or f"Pattern analysis for {symbol} is temporarily unavailable.",
+        )
+    if analysis is None:
+        return (
+            "waiting_for_runtime" if not _runtime_matches_symbol(status, symbol) else "waiting_for_history",
+            (
+                f"Start the runtime for {symbol} to accumulate {horizon.upper()} pattern history."
+                if not _runtime_matches_symbol(status, symbol)
+                else f"Pattern analysis for {symbol} needs more closed candles for {horizon.upper()}."
+            ),
+        )
+    return (analysis.data_state, analysis.status_message or f"Pattern analysis is ready for {symbol}.")
+
+
+def _derive_market_sentiment_data_state(
+    *,
+    symbol: str,
+    status: BotStatus,
+    analysis: MarketSentimentSnapshot | None,
+    analysis_failed: bool,
+    storage_degraded: bool,
+    storage_message: str | None,
+) -> tuple[DataState, str]:
+    """Derive a symbol-scoped market-sentiment readiness state."""
+
+    if analysis_failed or storage_degraded:
+        return (
+            "degraded_storage",
+            storage_message or f"Market sentiment for {symbol} is temporarily unavailable.",
+        )
+    if analysis is None:
+        return (
+            "waiting_for_runtime" if not _runtime_matches_symbol(status, symbol) else "waiting_for_history",
+            (
+                f"Start the runtime for {symbol} to accumulate broader market context."
+                if not _runtime_matches_symbol(status, symbol)
+                else f"Market sentiment for {symbol} still needs more broader market history."
+            ),
+        )
+    if analysis.data_state == "incomplete":
+        return (
+            "waiting_for_runtime" if not _runtime_matches_symbol(status, symbol) else "waiting_for_history",
+            analysis.status_message
+            or (
+                f"Start the runtime for {symbol} to build broader market context."
+                if not _runtime_matches_symbol(status, symbol)
+                else f"Market sentiment for {symbol} needs more history."
+            ),
+        )
+    return ("ready", analysis.status_message or f"Market sentiment is ready for {symbol}.")
+
+
+def _derive_symbol_sentiment_data_state(
+    *,
+    symbol: str,
+    analysis: SymbolSentimentSnapshot | None,
+    analysis_failed: bool,
+) -> tuple[DataState, str]:
+    """Derive a symbol-scoped external sentiment state without fabricating evidence."""
+
+    if analysis_failed:
+        return (
+            "degraded_storage",
+            f"Symbol sentiment for {symbol} is temporarily unavailable.",
+        )
+    if analysis is None:
+        return (
+            "degraded_storage",
+            f"Symbol sentiment for {symbol} could not be built.",
+        )
+    return (
+        "ready",
+        analysis.status_message or f"Symbol sentiment is ready for {symbol}.",
+    )
+
+
 def get_symbol_service(request: Request) -> SpotSymbolService:
     """Return the shared symbol service instance from FastAPI app state."""
 
     return request.app.state.symbol_service
+
+
+def get_symbol_sentiment_service(request: Request) -> SymbolSentimentService:
+    """Return the shared symbol-sentiment service instance from app state."""
+
+    return request.app.state.symbol_sentiment_service
 
 
 def get_bot_runtime(request: Request) -> PaperBotRuntime:
@@ -562,6 +922,18 @@ def _to_ai_signal_response(
     volume_spike_ratio: Decimal | None,
     spread_ratio: Decimal | None,
     microstructure_healthy: bool,
+    momentum_persistence: Decimal | None = None,
+    direction_flip_rate: Decimal | None = None,
+    structure_quality: Decimal | None = None,
+    recent_false_positive_rate_5m: Decimal | None = None,
+    regime: str = "insufficient_data",
+    noise_level: str = "unknown",
+    abstain: bool = False,
+    low_confidence: bool = False,
+    confirmation_needed: bool = False,
+    preferred_horizon: str | None = None,
+    weakening_factors: tuple[str, ...] = (),
+    horizons: list[AIHorizonResponse] | None = None,
 ) -> AISignalResponse:
     """Build a stable AI advisory API response."""
 
@@ -573,7 +945,15 @@ def _to_ai_signal_response(
         entry_signal=entry_signal,
         exit_signal=exit_signal,
         suggested_action=suggested_action,
+        regime=regime,
+        noise_level=noise_level,
+        abstain=abstain,
+        low_confidence=low_confidence,
+        confirmation_needed=confirmation_needed,
+        preferred_horizon=preferred_horizon,
+        weakening_factors=weakening_factors,
         explanation=explanation,
+        horizons=horizons or [],
         features=AIFeatureResponse(
             candle_count=candle_count,
             close_price=close_price,
@@ -583,7 +963,173 @@ def _to_ai_signal_response(
             volume_spike_ratio=volume_spike_ratio,
             spread_ratio=spread_ratio,
             microstructure_healthy=microstructure_healthy,
+            momentum_persistence=momentum_persistence,
+            direction_flip_rate=direction_flip_rate,
+            structure_quality=structure_quality,
+            recent_false_positive_rate_5m=recent_false_positive_rate_5m,
         ),
+    )
+
+
+def _to_technical_analysis_response(
+    *,
+    symbol: str,
+    analysis: TechnicalAnalysisSnapshot | None,
+    data_state: DataState,
+    status_message: str | None,
+) -> TechnicalAnalysisResponse:
+    """Build a stable technical-analysis API response."""
+
+    if analysis is None:
+        return TechnicalAnalysisResponse(
+            symbol=symbol,
+            data_state=data_state,
+            status_message=status_message,
+        )
+
+    return TechnicalAnalysisResponse(
+        symbol=analysis.symbol,
+        generated_at=analysis.timestamp,
+        data_state=data_state,
+        status_message=status_message,
+        trend_direction=analysis.trend_direction,
+        trend_strength=analysis.trend_strength,
+        trend_strength_score=analysis.trend_strength_score,
+        support_levels=analysis.support_levels,
+        resistance_levels=analysis.resistance_levels,
+        momentum_state=analysis.momentum_state,
+        volatility_regime=analysis.volatility_regime,
+        breakout_readiness=analysis.breakout_readiness,
+        breakout_bias=analysis.breakout_bias,
+        reversal_risk=analysis.reversal_risk,
+        multi_timeframe_agreement=analysis.multi_timeframe_agreement,
+        timeframe_summaries=[
+            _to_technical_timeframe_response(summary)
+            for summary in analysis.timeframe_summaries
+        ],
+        explanation=analysis.explanation,
+    )
+
+
+def _to_technical_timeframe_response(
+    summary: TimeframeTechnicalSummary,
+) -> TechnicalTimeframeSummaryResponse:
+    """Convert a timeframe technical summary into an API response."""
+
+    return TechnicalTimeframeSummaryResponse(
+        timeframe=summary.timeframe,
+        trend_direction=summary.trend_direction,
+        trend_strength=summary.trend_strength,
+    )
+
+
+def _to_pattern_point(record: MarketCandleSnapshotRecord) -> PatternPricePoint:
+    """Convert a persisted close-price record into a pattern-analysis point."""
+
+    return PatternPricePoint(
+        symbol=record.symbol,
+        timestamp=record.close_time,
+        close_price=record.close_price,
+    )
+
+
+def _to_pattern_analysis_response(
+    *,
+    symbol: str,
+    horizon: str,
+    analysis: PatternAnalysisSnapshot | None,
+    data_state: DataState,
+    status_message: str | None,
+) -> PatternAnalysisResponse:
+    """Build a stable pattern-analysis API response."""
+
+    if analysis is None:
+        return PatternAnalysisResponse(
+            symbol=symbol,
+            horizon=horizon,
+            data_state=data_state,
+            status_message=status_message,
+        )
+
+    return PatternAnalysisResponse(
+        symbol=analysis.symbol,
+        horizon=analysis.horizon,
+        generated_at=analysis.generated_at,
+        data_state=data_state,
+        status_message=status_message,
+        coverage_start=analysis.coverage_start,
+        coverage_end=analysis.coverage_end,
+        coverage_ratio_pct=analysis.coverage_ratio_pct,
+        partial_coverage=analysis.partial_coverage,
+        overall_direction=analysis.overall_direction,
+        net_return_pct=analysis.net_return_pct,
+        up_moves=analysis.up_moves,
+        down_moves=analysis.down_moves,
+        flat_moves=analysis.flat_moves,
+        up_move_ratio_pct=analysis.up_move_ratio_pct,
+        down_move_ratio_pct=analysis.down_move_ratio_pct,
+        realized_volatility_pct=analysis.realized_volatility_pct,
+        max_drawdown_pct=analysis.max_drawdown_pct,
+        trend_character=analysis.trend_character,
+        breakout_tendency=analysis.breakout_tendency,
+        reversal_tendency=analysis.reversal_tendency,
+        explanation=analysis.explanation,
+    )
+
+
+def _to_market_sentiment_response(
+    *,
+    symbol: str,
+    analysis: MarketSentimentSnapshot | None,
+    data_state: DataState,
+    status_message: str | None,
+) -> MarketSentimentResponse:
+    """Build a stable market-sentiment API response."""
+
+    return MarketSentimentResponse(
+        symbol=symbol,
+        generated_at=analysis.generated_at if analysis is not None else None,
+        data_state=data_state,
+        status_message=status_message,
+        market_state=analysis.market_state if analysis is not None else "insufficient_data",
+        sentiment_score=analysis.sentiment_score if analysis is not None else None,
+        btc_bias=analysis.btc_bias if analysis is not None else None,
+        eth_bias=analysis.eth_bias if analysis is not None else None,
+        selected_symbol_relative_strength=(
+            analysis.selected_symbol_relative_strength if analysis is not None else "insufficient_data"
+        ),
+        relative_strength_pct=analysis.relative_strength_pct if analysis is not None else None,
+        market_breadth_state=analysis.market_breadth_state if analysis is not None else "insufficient_data",
+        breadth_advancing_symbols=analysis.breadth_advancing_symbols if analysis is not None else 0,
+        breadth_declining_symbols=analysis.breadth_declining_symbols if analysis is not None else 0,
+        breadth_sample_size=analysis.breadth_sample_size if analysis is not None else 0,
+        volatility_environment=analysis.volatility_environment if analysis is not None else "insufficient_data",
+        explanation=analysis.explanation if analysis is not None else None,
+    )
+
+
+def _to_symbol_sentiment_response(
+    *,
+    symbol: str,
+    analysis: SymbolSentimentSnapshot | None,
+    data_state: DataState,
+    status_message: str | None,
+) -> SymbolSentimentResponse:
+    """Build a stable symbol-sentiment API response."""
+
+    return SymbolSentimentResponse(
+        symbol=symbol,
+        generated_at=analysis.generated_at if analysis is not None else None,
+        data_state=data_state,
+        status_message=status_message,
+        sentiment_state=analysis.sentiment_state if analysis is not None else "insufficient_data",
+        sentiment_score=analysis.sentiment_score if analysis is not None else None,
+        source_count=analysis.source_count if analysis is not None else 0,
+        freshness=analysis.freshness if analysis is not None else "unknown",
+        freshness_minutes=analysis.freshness_minutes if analysis is not None else None,
+        confidence=analysis.confidence if analysis is not None else None,
+        evidence_summary=list(analysis.evidence_summary) if analysis is not None else [],
+        explanation=analysis.explanation if analysis is not None else None,
     )
 
 
@@ -609,6 +1155,9 @@ def _to_ai_outcome_evaluation_response(
                 sample_size=item.sample_size,
                 directional_accuracy_pct=item.directional_accuracy_pct,
                 confidence_calibration_pct=item.confidence_calibration_pct,
+                actionable_sample_size=item.actionable_sample_size,
+                abstain_count=item.abstain_count,
+                abstain_rate_pct=item.abstain_rate_pct,
                 false_positive_count=item.false_positive_count,
                 false_positive_rate_pct=item.false_positive_rate_pct,
                 false_reversal_count=item.false_reversal_count,
@@ -633,6 +1182,7 @@ def _to_ai_outcome_evaluation_response(
                 directional_correct=item.directional_correct,
                 false_positive=item.false_positive,
                 false_reversal=item.false_reversal,
+                abstained=item.abstained,
             )
             for item in recent_samples
         ],
@@ -753,6 +1303,29 @@ def _to_workstation_response(
                 volume_spike_ratio=ai_signal.feature_vector.volume_spike_ratio,
                 spread_ratio=ai_signal.feature_vector.spread_ratio,
                 microstructure_healthy=ai_signal.feature_vector.microstructure_healthy,
+                momentum_persistence=ai_signal.feature_vector.momentum_persistence,
+                direction_flip_rate=ai_signal.feature_vector.direction_flip_rate,
+                structure_quality=ai_signal.feature_vector.structure_quality,
+                recent_false_positive_rate_5m=ai_signal.feature_vector.recent_false_positive_rate_5m,
+                regime=ai_signal.regime,
+                noise_level=ai_signal.noise_level,
+                abstain=ai_signal.abstain,
+                low_confidence=ai_signal.low_confidence,
+                confirmation_needed=ai_signal.confirmation_needed,
+                preferred_horizon=ai_signal.preferred_horizon,
+                weakening_factors=ai_signal.weakening_factors,
+                horizons=[
+                    AIHorizonResponse(
+                        horizon=item.horizon,
+                        bias=item.bias,
+                        confidence=item.confidence,
+                        suggested_action=item.suggested_action,
+                        abstain=item.abstain,
+                        confirmation_needed=item.confirmation_needed,
+                        explanation=item.explanation,
+                    )
+                    for item in ai_signal.horizon_signals
+                ],
             )
             if ai_signal is not None
             else None
@@ -907,6 +1480,153 @@ def get_workstation(
     )
 
 
+@router.get("/bot/technical-analysis", response_model=TechnicalAnalysisResponse)
+def get_technical_analysis(
+    symbol: Annotated[str, Query(min_length=1)],
+    runtime: Annotated[PaperBotRuntime, Depends(get_bot_runtime)],
+) -> TechnicalAnalysisResponse:
+    """Return symbol-scoped technical analysis for the workstation."""
+
+    normalized_symbol = symbol.strip().upper()
+    status = runtime.status()
+    analysis, analysis_failed = _safe_technical_analysis(runtime, normalized_symbol)
+    data_state, status_message = _derive_technical_analysis_data_state(
+        symbol=normalized_symbol,
+        status=status,
+        analysis=analysis,
+        analysis_failed=analysis_failed,
+    )
+    return _to_technical_analysis_response(
+        symbol=normalized_symbol,
+        analysis=analysis,
+        data_state=data_state,
+        status_message=status_message,
+    )
+
+
+@router.get("/bot/pattern-analysis", response_model=PatternAnalysisResponse)
+def get_pattern_analysis(
+    symbol: Annotated[str, Query(min_length=1)],
+    horizon: str = Query(default="7d"),
+    runtime: Annotated[PaperBotRuntime, Depends(get_bot_runtime)] = None,
+    settings: Annotated[Settings, Depends(get_settings_dependency)] = None,
+) -> PatternAnalysisResponse:
+    """Return symbol-scoped multi-horizon pattern analysis."""
+
+    normalized_symbol = symbol.strip().upper()
+    try:
+        normalized_horizon = normalize_horizon(horizon)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    runtime_status = runtime.status()
+    try:
+        repository = StorageRepository(settings.database_url)
+    except Exception:
+        LOGGER.exception(
+            "Failed to open storage while reading pattern analysis for %s horizon %s.",
+            normalized_symbol,
+            normalized_horizon,
+        )
+        return _to_pattern_analysis_response(
+            symbol=normalized_symbol,
+            horizon=normalized_horizon,
+            analysis=None,
+            data_state="degraded_storage",
+            status_message="Pattern-analysis storage is unavailable.",
+        )
+    try:
+        analysis, analysis_failed = _safe_pattern_analysis(
+            runtime,
+            symbol=normalized_symbol,
+            horizon=normalized_horizon,
+            repository=repository,
+        )
+        data_state, status_message = _derive_pattern_analysis_data_state(
+            symbol=normalized_symbol,
+            horizon=normalized_horizon,
+            status=runtime_status,
+            analysis=analysis,
+            analysis_failed=analysis_failed,
+            storage_degraded=repository.optional_storage_degraded,
+            storage_message=repository.optional_storage_message,
+        )
+    finally:
+        repository.close()
+    return _to_pattern_analysis_response(
+        symbol=normalized_symbol,
+        horizon=normalized_horizon,
+        analysis=analysis,
+        data_state=data_state,
+        status_message=status_message,
+    )
+
+
+@router.get("/bot/market-sentiment", response_model=MarketSentimentResponse)
+def get_market_sentiment(
+    symbol: Annotated[str, Query(min_length=1)],
+    runtime: Annotated[PaperBotRuntime, Depends(get_bot_runtime)],
+    settings: Annotated[Settings, Depends(get_settings_dependency)],
+) -> MarketSentimentResponse:
+    """Return symbol-scoped broader-market sentiment for the workstation."""
+
+    normalized_symbol = symbol.strip().upper()
+    runtime_status = runtime.status()
+    try:
+        repository = StorageRepository(settings.database_url)
+    except Exception:
+        LOGGER.exception("Failed to open storage while reading market sentiment for %s.", normalized_symbol)
+        return _to_market_sentiment_response(
+            symbol=normalized_symbol,
+            analysis=None,
+            data_state="degraded_storage",
+            status_message="Market-sentiment storage is unavailable.",
+        )
+    try:
+        analysis, analysis_failed = _safe_market_sentiment(
+            runtime,
+            symbol=normalized_symbol,
+            repository=repository,
+        )
+        data_state, status_message = _derive_market_sentiment_data_state(
+            symbol=normalized_symbol,
+            status=runtime_status,
+            analysis=analysis,
+            analysis_failed=analysis_failed,
+            storage_degraded=repository.optional_storage_degraded,
+            storage_message=repository.optional_storage_message,
+        )
+    finally:
+        repository.close()
+    return _to_market_sentiment_response(
+        symbol=normalized_symbol,
+        analysis=analysis,
+        data_state=data_state,
+        status_message=status_message,
+    )
+
+
+@router.get("/bot/symbol-sentiment", response_model=SymbolSentimentResponse)
+def get_symbol_sentiment(
+    symbol: Annotated[str, Query(min_length=1)],
+    service: Annotated[SymbolSentimentService, Depends(get_symbol_sentiment_service)],
+) -> SymbolSentimentResponse:
+    """Return symbol-scoped external sentiment for the workstation."""
+
+    normalized_symbol = symbol.strip().upper()
+    analysis, analysis_failed = _safe_symbol_sentiment(service, symbol=normalized_symbol)
+    data_state, status_message = _derive_symbol_sentiment_data_state(
+        symbol=normalized_symbol,
+        analysis=analysis,
+        analysis_failed=analysis_failed,
+    )
+    return _to_symbol_sentiment_response(
+        symbol=normalized_symbol,
+        analysis=analysis,
+        data_state=data_state,
+        status_message=status_message,
+    )
+
+
 @router.get("/bot/ai-signal", response_model=AISignalResponse | None)
 def get_ai_signal(
     symbol: Annotated[str, Query(min_length=1)],
@@ -949,6 +1669,29 @@ def get_ai_signal(
             volume_spike_ratio=latest_snapshot.feature_summary.volume_spike_ratio,
             spread_ratio=latest_snapshot.feature_summary.spread_ratio,
             microstructure_healthy=latest_snapshot.feature_summary.microstructure_healthy,
+            momentum_persistence=latest_snapshot.feature_summary.momentum_persistence,
+            direction_flip_rate=latest_snapshot.feature_summary.direction_flip_rate,
+            structure_quality=latest_snapshot.feature_summary.structure_quality,
+            recent_false_positive_rate_5m=latest_snapshot.feature_summary.recent_false_positive_rate_5m,
+            regime=latest_snapshot.feature_summary.regime or "insufficient_data",
+            noise_level=latest_snapshot.feature_summary.noise_level or "unknown",
+            abstain=latest_snapshot.feature_summary.abstain,
+            low_confidence=latest_snapshot.feature_summary.low_confidence,
+            confirmation_needed=latest_snapshot.feature_summary.confirmation_needed,
+            preferred_horizon=latest_snapshot.feature_summary.preferred_horizon,
+            weakening_factors=latest_snapshot.feature_summary.weakening_factors,
+            horizons=[
+                AIHorizonResponse(
+                    horizon=horizon,
+                    bias=str(data.get("bias", "sideways")),
+                    confidence=int(data.get("confidence", latest_snapshot.confidence)),
+                    suggested_action=str(data.get("suggested_action", latest_snapshot.suggested_action)),
+                    abstain=bool(data.get("abstain", False)),
+                    confirmation_needed=bool(data.get("confirmation_needed", False)),
+                    explanation=str(data.get("explanation", latest_snapshot.explanation)),
+                )
+                for horizon, data in (latest_snapshot.feature_summary.horizons or {}).items()
+            ],
         )
     workstation_status = runtime.status()
     workstation_data_state, workstation_status_message = _derive_workstation_data_state(
@@ -1041,6 +1784,29 @@ def get_ai_signal_history(
                 volume_spike_ratio=item.feature_summary.volume_spike_ratio,
                 spread_ratio=item.feature_summary.spread_ratio,
                 microstructure_healthy=item.feature_summary.microstructure_healthy,
+                momentum_persistence=item.feature_summary.momentum_persistence,
+                direction_flip_rate=item.feature_summary.direction_flip_rate,
+                structure_quality=item.feature_summary.structure_quality,
+                recent_false_positive_rate_5m=item.feature_summary.recent_false_positive_rate_5m,
+                regime=item.feature_summary.regime or "insufficient_data",
+                noise_level=item.feature_summary.noise_level or "unknown",
+                abstain=item.feature_summary.abstain,
+                low_confidence=item.feature_summary.low_confidence,
+                confirmation_needed=item.feature_summary.confirmation_needed,
+                preferred_horizon=item.feature_summary.preferred_horizon,
+                weakening_factors=item.feature_summary.weakening_factors,
+                horizons=[
+                    AIHorizonResponse(
+                        horizon=horizon,
+                        bias=str(data.get("bias", "sideways")),
+                        confidence=int(data.get("confidence", item.confidence)),
+                        suggested_action=str(data.get("suggested_action", item.suggested_action)),
+                        abstain=bool(data.get("abstain", False)),
+                        confirmation_needed=bool(data.get("confirmation_needed", False)),
+                        explanation=str(data.get("explanation", item.explanation)),
+                    )
+                    for horizon, data in (item.feature_summary.horizons or {}).items()
+                ],
             )
             for item in items
         ],

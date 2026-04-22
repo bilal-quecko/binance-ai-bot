@@ -133,6 +133,18 @@ class AISignalFeatureSummaryRecord:
     volume_spike_ratio: Decimal | None
     spread_ratio: Decimal | None
     microstructure_healthy: bool
+    regime: str | None = None
+    noise_level: str | None = None
+    abstain: bool = False
+    low_confidence: bool = False
+    confirmation_needed: bool = False
+    preferred_horizon: str | None = None
+    momentum_persistence: Decimal | None = None
+    direction_flip_rate: Decimal | None = None
+    structure_quality: Decimal | None = None
+    recent_false_positive_rate_5m: Decimal | None = None
+    horizons: dict[str, dict[str, object]] | None = None
+    weakening_factors: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)

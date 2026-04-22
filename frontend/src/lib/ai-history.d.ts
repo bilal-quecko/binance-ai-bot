@@ -5,7 +5,7 @@ export interface AIHistoryItemSummary {
   confidence: number;
   entry_signal: boolean;
   exit_signal: boolean;
-  suggested_action: 'wait' | 'enter' | 'hold' | 'exit';
+  suggested_action: 'wait' | 'enter' | 'hold' | 'exit' | 'abstain';
   explanation: string;
 }
 

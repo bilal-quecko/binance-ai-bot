@@ -60,6 +60,7 @@ class AIOutcomeSample:
     directional_correct: bool
     false_positive: bool
     false_reversal: bool
+    abstained: bool
 
 
 @dataclass(slots=True)
@@ -70,6 +71,9 @@ class AIOutcomeSummary:
     sample_size: int
     directional_accuracy_pct: Decimal
     confidence_calibration_pct: Decimal
+    actionable_sample_size: int
+    abstain_count: int
+    abstain_rate_pct: Decimal
     false_positive_count: int
     false_positive_rate_pct: Decimal
     false_reversal_count: int
@@ -184,7 +188,15 @@ class AIOutcomeEvaluator:
             return_pct = (future_candle.close_price - baseline_close) / baseline_close
         observed_direction = _classify_direction(return_pct)
         directional_correct = snapshot.bias == observed_direction
-        false_positive = (snapshot.entry_signal or snapshot.exit_signal) and not directional_correct
+        horizon_state = (snapshot.feature_summary.horizons or {}).get(horizon, {})
+        effective_confidence = int(horizon_state.get("confidence", snapshot.confidence))
+        horizon_action = str(horizon_state.get("suggested_action", snapshot.suggested_action))
+        abstained = bool(horizon_state.get("abstain", snapshot.feature_summary.abstain))
+        false_positive = (
+            not abstained
+            and (snapshot.entry_signal or snapshot.exit_signal or horizon_action in {"enter", "exit"})
+            and not directional_correct
+        )
         false_reversal = (
             (snapshot.bias == "bullish" and observed_direction == "bearish")
             or (snapshot.bias == "bearish" and observed_direction == "bullish")
@@ -194,10 +206,10 @@ class AIOutcomeEvaluator:
             snapshot_time=snapshot.timestamp,
             horizon=horizon,
             bias=snapshot.bias,
-            confidence=snapshot.confidence,
+            confidence=effective_confidence,
             entry_signal=snapshot.entry_signal,
             exit_signal=snapshot.exit_signal,
-            suggested_action=snapshot.suggested_action,
+            suggested_action=horizon_action,
             baseline_close=baseline_close,
             future_close=future_candle.close_price,
             return_pct=return_pct,
@@ -205,6 +217,7 @@ class AIOutcomeEvaluator:
             directional_correct=directional_correct,
             false_positive=false_positive,
             false_reversal=false_reversal,
+            abstained=abstained,
         )
 
     def _build_summary(
@@ -221,6 +234,9 @@ class AIOutcomeEvaluator:
                 sample_size=0,
                 directional_accuracy_pct=Decimal("0"),
                 confidence_calibration_pct=Decimal("0"),
+                actionable_sample_size=0,
+                abstain_count=0,
+                abstain_rate_pct=Decimal("0"),
                 false_positive_count=0,
                 false_positive_rate_pct=Decimal("0"),
                 false_reversal_count=0,
@@ -228,6 +244,8 @@ class AIOutcomeEvaluator:
             )
 
         correct_count = sum(1 for sample in samples if sample.directional_correct)
+        actionable_sample_size = sum(1 for sample in samples if not sample.abstained)
+        abstain_count = sample_size - actionable_sample_size
         false_positive_count = sum(1 for sample in samples if sample.false_positive)
         false_reversal_count = sum(1 for sample in samples if sample.false_reversal)
         total_calibration_error = sum(
@@ -241,8 +259,15 @@ class AIOutcomeEvaluator:
             sample_size=sample_size,
             directional_accuracy_pct=_round_percent(Decimal(correct_count) / Decimal(sample_size)),
             confidence_calibration_pct=_round_percent(calibration_score),
+            actionable_sample_size=actionable_sample_size,
+            abstain_count=abstain_count,
+            abstain_rate_pct=_round_percent(Decimal(abstain_count) / Decimal(sample_size)),
             false_positive_count=false_positive_count,
-            false_positive_rate_pct=_round_percent(Decimal(false_positive_count) / Decimal(sample_size)),
+            false_positive_rate_pct=_round_percent(
+                Decimal(false_positive_count) / Decimal(actionable_sample_size)
+            )
+            if actionable_sample_size > 0
+            else Decimal("0"),
             false_reversal_count=false_reversal_count,
             false_reversal_rate_pct=_round_percent(Decimal(false_reversal_count) / Decimal(sample_size)),
         )

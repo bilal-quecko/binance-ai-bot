@@ -11,15 +11,19 @@
   HealthResponse,
   HistoryFilters,
   MetricsResponse,
+  MarketSentimentResponse,
   PaginatedResponse,
   PnlHistoryResponse,
   PerformanceAnalyticsResponse,
+  PatternAnalysisResponse,
   PositionItem,
+  TechnicalAnalysisResponse,
   TradeQualityResponse,
   WorkstationResponse,
   RangeFilters,
   SpotSymbolItem,
   SymbolSummaryItem,
+  SymbolSentimentResponse,
   TradeItem,
 } from './types';
 
@@ -134,6 +138,32 @@ export function getBotStatus(): Promise<BotStatusResponse> {
 export function getWorkstation(symbol: string): Promise<WorkstationResponse> {
   const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
   return requestJson<WorkstationResponse>('/bot/workstation', params);
+}
+
+export function getTechnicalAnalysis(symbol: string): Promise<TechnicalAnalysisResponse> {
+  const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
+  return requestJson<TechnicalAnalysisResponse>('/bot/technical-analysis', params);
+}
+
+export function getPatternAnalysis(
+  symbol: string,
+  horizon: string,
+): Promise<PatternAnalysisResponse> {
+  const params = new URLSearchParams({
+    symbol: symbol.trim().toUpperCase(),
+    horizon: horizon.trim().toLowerCase(),
+  });
+  return requestJson<PatternAnalysisResponse>('/bot/pattern-analysis', params);
+}
+
+export function getMarketSentiment(symbol: string): Promise<MarketSentimentResponse> {
+  const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
+  return requestJson<MarketSentimentResponse>('/bot/market-sentiment', params);
+}
+
+export function getSymbolSentiment(symbol: string): Promise<SymbolSentimentResponse> {
+  const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
+  return requestJson<SymbolSentimentResponse>('/bot/symbol-sentiment', params);
 }
 
 export function getAISignal(symbol: string): Promise<AISignalSummary | null> {

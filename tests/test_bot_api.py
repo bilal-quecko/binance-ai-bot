@@ -1,12 +1,20 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
+from app.analysis.symbol_sentiment import SymbolSentimentSnapshot
+from app.analysis.technical import TechnicalAnalysisSnapshot, TimeframeTechnicalSummary
+from app.analysis.pattern_summary import PatternAnalysisSnapshot
 from app.ai.models import AIFeatureVector, AISignalSnapshot
 from fastapi.testclient import TestClient
 
-from app.api.bot_api import get_bot_runtime, get_settings_dependency, get_symbol_service
+from app.api.bot_api import (
+    get_bot_runtime,
+    get_settings_dependency,
+    get_symbol_sentiment_service,
+    get_symbol_service,
+)
 from app.bot import BotStatus, PaperBotRuntime, WorkstationState
 from app.config import Settings
 from app.exchange.symbol_service import SpotSymbolRecord
@@ -32,6 +40,29 @@ class FakeSymbolService:
         if not query:
             return records[:limit]
         return [record for record in records if query.upper() in record.symbol][:limit]
+
+
+class FakeSymbolSentimentService:
+    def __init__(self, snapshot: SymbolSentimentSnapshot | None = None) -> None:
+        self._snapshot = snapshot
+
+    def analyze(self, *, symbol: str) -> SymbolSentimentSnapshot:
+        if self._snapshot is not None:
+            return self._snapshot
+        return SymbolSentimentSnapshot(
+            symbol=symbol,
+            generated_at=datetime(2024, 3, 9, 16, 2, tzinfo=UTC),
+            data_state='incomplete',
+            status_message=f'Symbol sentiment for {symbol} is insufficient until source-backed evidence becomes available.',
+            sentiment_state='insufficient_data',
+            sentiment_score=None,
+            source_count=0,
+            freshness='unknown',
+            freshness_minutes=None,
+            confidence=None,
+            evidence_summary=(),
+            explanation=f'No configured symbol-sentiment sources returned usable external evidence for {symbol}, so sentiment stays insufficient.',
+        )
 
 
 class FakeRuntime:
@@ -93,6 +124,60 @@ class FakeRuntime:
         self.reset_called = True
         self.state = BotStatus(state='stopped', mode='stopped', timeframe='1m')
         return self.state
+
+    def candle_history(self, symbol: str) -> list[Candle]:
+        return []
+
+    def technical_analysis(self, symbol: str) -> TechnicalAnalysisSnapshot | None:
+        snapshot_time = datetime(2024, 3, 9, 16, 2, tzinfo=UTC)
+        return TechnicalAnalysisSnapshot(
+            symbol=symbol,
+            timestamp=snapshot_time,
+            data_state='ready',
+            status_message=f'Technical analysis is ready for {symbol}.',
+            trend_direction='bullish',
+            trend_strength='moderate',
+            trend_strength_score=61,
+            support_levels=[Decimal('99.5'), Decimal('100')],
+            resistance_levels=[Decimal('101.5'), Decimal('102')],
+            momentum_state='bullish',
+            volatility_regime='normal',
+            breakout_readiness='medium',
+            breakout_bias='upside',
+            reversal_risk='low',
+            multi_timeframe_agreement='bullish_alignment',
+            timeframe_summaries=[
+                TimeframeTechnicalSummary(timeframe='1m', trend_direction='bullish', trend_strength='moderate'),
+                TimeframeTechnicalSummary(timeframe='5m', trend_direction='bullish', trend_strength='moderate'),
+            ],
+            explanation='Trend is bullish with moderate strength and improving momentum.',
+        )
+
+    def pattern_analysis(self, symbol: str) -> PatternAnalysisSnapshot | None:
+        return PatternAnalysisSnapshot(
+            symbol=symbol,
+            horizon='7d',
+            generated_at=datetime(2024, 3, 9, 16, 2, tzinfo=UTC),
+            data_state='ready',
+            status_message=f'Pattern analysis is ready for {symbol} over 7D.',
+            coverage_start=datetime(2024, 3, 2, 16, 2, tzinfo=UTC),
+            coverage_end=datetime(2024, 3, 9, 16, 2, tzinfo=UTC),
+            coverage_ratio_pct=Decimal('100'),
+            partial_coverage=False,
+            overall_direction='bullish',
+            net_return_pct=Decimal('5.5'),
+            up_moves=8,
+            down_moves=3,
+            flat_moves=1,
+            up_move_ratio_pct=Decimal('66.67'),
+            down_move_ratio_pct=Decimal('25'),
+            realized_volatility_pct=Decimal('1.2'),
+            max_drawdown_pct=Decimal('2.5'),
+            trend_character='persistent',
+            breakout_tendency='breakout_prone',
+            reversal_tendency='low',
+            explanation='BTCUSDT trended higher over the selected horizon with contained drawdowns.',
+        )
 
     def workstation_state(self, symbol: str) -> WorkstationState:
         snapshot_time = datetime(2024, 3, 9, 16, 2, tzinfo=UTC)
@@ -199,6 +284,9 @@ class FakeRuntime:
 
 
 class NeutralRuntime(FakeRuntime):
+    def technical_analysis(self, symbol: str) -> TechnicalAnalysisSnapshot | None:
+        return None
+
     def workstation_state(self, symbol: str) -> WorkstationState:
         return WorkstationState(
             symbol=symbol,
@@ -269,6 +357,27 @@ class HistoryWaitingRuntime(FakeRuntime):
             realized_pnl=Decimal('0'),
         )
 
+    def technical_analysis(self, symbol: str) -> TechnicalAnalysisSnapshot | None:
+        return TechnicalAnalysisSnapshot(
+            symbol=symbol,
+            timestamp=datetime(2024, 3, 9, 16, 2, tzinfo=UTC),
+            data_state='incomplete',
+            status_message=f'Technical analysis for {symbol} needs more closed candles before trend and structure can be assessed.',
+            trend_direction=None,
+            trend_strength=None,
+            trend_strength_score=None,
+            support_levels=[],
+            resistance_levels=[],
+            momentum_state=None,
+            volatility_regime=None,
+            breakout_readiness=None,
+            breakout_bias=None,
+            reversal_risk=None,
+            multi_timeframe_agreement=None,
+            timeframe_summaries=[],
+            explanation=None,
+        )
+
 
 def _db_path() -> Path:
     base = Path("tests/.tmp_storage")
@@ -280,6 +389,34 @@ class IdleStreamManager:
     async def stream(self, streams: list[str], *, websocket_client=None):
         if False:
             yield streams
+
+
+def _insert_close_series(
+    repository: StorageRepository,
+    *,
+    symbol: str,
+    closes: list[Decimal],
+    start: datetime,
+) -> None:
+    for index, close_price in enumerate(closes):
+        open_time = start + timedelta(minutes=index)
+        repository.insert_market_candle_snapshot(
+            Candle(
+                symbol=symbol,
+                timeframe='1m',
+                open=close_price,
+                high=close_price,
+                low=close_price,
+                close=close_price,
+                volume=Decimal('10'),
+                quote_volume=close_price * Decimal('10'),
+                open_time=open_time,
+                close_time=open_time + timedelta(minutes=1),
+                event_time=open_time + timedelta(minutes=1),
+                trade_count=10,
+                is_closed=True,
+            )
+        )
 
 
 def test_symbol_and_bot_control_endpoints() -> None:
@@ -317,6 +454,57 @@ def test_symbol_and_bot_control_endpoints() -> None:
                 order_book_imbalance=Decimal('0.2'),
                 microstructure_healthy=True,
             ),
+        )
+    )
+    repository.insert_market_candle_snapshot(
+        Candle(
+            symbol='BTCUSDT',
+            timeframe='1m',
+            open=Decimal('95'),
+            high=Decimal('96'),
+            low=Decimal('94'),
+            close=Decimal('95'),
+            volume=Decimal('10'),
+            quote_volume=Decimal('950'),
+            open_time=datetime(2024, 3, 8, 16, 4, 0, 1000, tzinfo=UTC),
+            close_time=datetime(2024, 3, 8, 16, 5, tzinfo=UTC),
+            event_time=datetime(2024, 3, 8, 16, 5, tzinfo=UTC),
+            trade_count=10,
+            is_closed=True,
+        )
+    )
+    repository.insert_market_candle_snapshot(
+        Candle(
+            symbol='BTCUSDT',
+            timeframe='1m',
+            open=Decimal('97'),
+            high=Decimal('98'),
+            low=Decimal('96'),
+            close=Decimal('97'),
+            volume=Decimal('10'),
+            quote_volume=Decimal('970'),
+            open_time=datetime(2024, 3, 8, 20, 4, 0, 1000, tzinfo=UTC),
+            close_time=datetime(2024, 3, 8, 20, 5, tzinfo=UTC),
+            event_time=datetime(2024, 3, 8, 20, 5, tzinfo=UTC),
+            trade_count=10,
+            is_closed=True,
+        )
+    )
+    repository.insert_market_candle_snapshot(
+        Candle(
+            symbol='BTCUSDT',
+            timeframe='1m',
+            open=Decimal('99'),
+            high=Decimal('100'),
+            low=Decimal('98'),
+            close=Decimal('99'),
+            volume=Decimal('10'),
+            quote_volume=Decimal('990'),
+            open_time=datetime(2024, 3, 9, 8, 4, 0, 1000, tzinfo=UTC),
+            close_time=datetime(2024, 3, 9, 8, 5, tzinfo=UTC),
+            event_time=datetime(2024, 3, 9, 8, 5, tzinfo=UTC),
+            trade_count=10,
+            is_closed=True,
         )
     )
     repository.insert_market_candle_snapshot(
@@ -383,6 +571,8 @@ def test_symbol_and_bot_control_endpoints() -> None:
         start_response = client.post('/bot/start', json={'symbol': 'BTCUSDT'})
         status_response = client.get('/bot/status')
         workstation_response = client.get('/bot/workstation', params={'symbol': 'BTCUSDT'})
+        technical_analysis_response = client.get('/bot/technical-analysis', params={'symbol': 'BTCUSDT'})
+        pattern_analysis_response = client.get('/bot/pattern-analysis', params={'symbol': 'BTCUSDT', 'horizon': '1d'})
         ai_signal_response = client.get('/bot/ai-signal', params={'symbol': 'BTCUSDT'})
         ai_history_response = client.get('/bot/ai-signal/history', params={'symbol': 'BTCUSDT', 'limit': 10, 'offset': 0})
         ai_evaluation_response = client.get('/bot/ai-signal/evaluation', params={'symbol': 'BTCUSDT'})
@@ -428,10 +618,25 @@ def test_symbol_and_bot_control_endpoints() -> None:
     assert workstation_response.json()['trade_readiness']['risk_ready'] is True
     assert workstation_response.json()['ai_signal']['bias'] == 'bullish'
 
+    assert technical_analysis_response.status_code == 200
+    assert technical_analysis_response.json()['data_state'] == 'ready'
+    assert technical_analysis_response.json()['trend_direction'] == 'bullish'
+    assert technical_analysis_response.json()['support_levels'] == ['99.5', '100']
+    assert technical_analysis_response.json()['timeframe_summaries'][0]['timeframe'] == '1m'
+    assert pattern_analysis_response.status_code == 200
+    assert pattern_analysis_response.json()['symbol'] == 'BTCUSDT'
+    assert pattern_analysis_response.json()['horizon'] == '1d'
+    assert pattern_analysis_response.json()['overall_direction'] == 'bullish'
+    assert 'net_return_pct' in pattern_analysis_response.json()
+
     assert ai_signal_response.status_code == 200
     assert ai_signal_response.json()['confidence'] == 72
     assert ai_signal_response.json()['timestamp'] == '2024-03-09T16:02:00Z'
     assert ai_signal_response.json()['features']['candle_count'] == 5
+    assert ai_signal_response.json()['regime'] == 'insufficient_data'
+    assert ai_signal_response.json()['noise_level'] == 'unknown'
+    assert ai_signal_response.json()['abstain'] is False
+    assert isinstance(ai_signal_response.json()['horizons'], list)
 
     assert ai_history_response.status_code == 200
     assert ai_history_response.json()['total'] == 2
@@ -489,6 +694,68 @@ def test_runtime_status_remains_stable_across_repeated_reads() -> None:
     assert status_response_b.json()['symbol'] == 'BTCUSDT'
     assert workstation_response.status_code == 200
     assert workstation_response.json()['runtime_status']['session_id'] == 'session-btcusdt'
+
+
+def test_market_sentiment_endpoint_returns_ready_shape() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    repository = StorageRepository(settings.database_url)
+    try:
+        start = datetime(2024, 3, 9, 12, 0, tzinfo=UTC)
+        _insert_close_series(
+            repository,
+            symbol='BTCUSDT',
+            closes=[Decimal('100') + (Decimal('0.35') * Decimal(index)) for index in range(90)],
+            start=start,
+        )
+        _insert_close_series(
+            repository,
+            symbol='ETHUSDT',
+            closes=[Decimal('50') + (Decimal('0.20') * Decimal(index)) for index in range(90)],
+            start=start,
+        )
+        _insert_close_series(
+            repository,
+            symbol='SOLUSDT',
+            closes=[Decimal('20') + (Decimal('0.16') * Decimal(index)) for index in range(90)],
+            start=start,
+        )
+        _insert_close_series(
+            repository,
+            symbol='BNBUSDT',
+            closes=[Decimal('30') + (Decimal('0.10') * Decimal(index)) for index in range(90)],
+            start=start,
+        )
+        _insert_close_series(
+            repository,
+            symbol='XRPUSDT',
+            closes=[Decimal('10') + (Decimal('0.04') * Decimal(index)) for index in range(90)],
+            start=start,
+        )
+    finally:
+        repository.close()
+
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_bot_runtime] = lambda: NeutralRuntime()
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    client = TestClient(app)
+
+    try:
+        response = client.get('/bot/market-sentiment', params={'symbol': 'SOLUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['symbol'] == 'SOLUSDT'
+    assert payload['data_state'] == 'ready'
+    assert payload['market_state'] == 'risk_on'
+    assert payload['btc_bias'] == 'bullish'
+    assert payload['eth_bias'] == 'bullish'
+    assert payload['market_breadth_state'] == 'positive'
+    assert payload['selected_symbol_relative_strength'] == 'outperforming_btc'
+    assert isinstance(payload['sentiment_score'], int)
+    assert 'explanation' in payload
 
 
 def test_recovered_runtime_state_is_visible_after_restart_style_reconstruction() -> None:
@@ -557,12 +824,17 @@ def test_workstation_endpoints_return_empty_states_without_runtime_data() -> Non
     fake_symbol_service = FakeSymbolService()
     neutral_runtime = NeutralRuntime()
     app.dependency_overrides[get_symbol_service] = lambda: fake_symbol_service
+    app.dependency_overrides[get_symbol_sentiment_service] = lambda: FakeSymbolSentimentService()
     app.dependency_overrides[get_bot_runtime] = lambda: neutral_runtime
     app.dependency_overrides[get_settings_dependency] = lambda: settings
     client = TestClient(app)
 
     try:
         workstation_response = client.get('/bot/workstation', params={'symbol': 'ETHUSDT'})
+        technical_analysis_response = client.get('/bot/technical-analysis', params={'symbol': 'ETHUSDT'})
+        pattern_analysis_response = client.get('/bot/pattern-analysis', params={'symbol': 'ETHUSDT', 'horizon': '7d'})
+        market_sentiment_response = client.get('/bot/market-sentiment', params={'symbol': 'ETHUSDT'})
+        symbol_sentiment_response = client.get('/bot/symbol-sentiment', params={'symbol': 'ETHUSDT'})
         ai_signal_response = client.get('/bot/ai-signal', params={'symbol': 'ETHUSDT'})
         ai_history_response = client.get('/bot/ai-signal/history', params={'symbol': 'ETHUSDT', 'limit': 10, 'offset': 0})
         ai_evaluation_response = client.get('/bot/ai-signal/evaluation', params={'symbol': 'ETHUSDT'})
@@ -620,6 +892,19 @@ def test_workstation_endpoints_return_empty_states_without_runtime_data() -> Non
         'total_pnl': '0',
         'realized_pnl': '0',
     }
+    assert technical_analysis_response.status_code == 200
+    assert technical_analysis_response.json()['data_state'] == 'waiting_for_runtime'
+    assert technical_analysis_response.json()['trend_direction'] is None
+    assert pattern_analysis_response.status_code == 200
+    assert pattern_analysis_response.json()['data_state'] == 'waiting_for_runtime'
+    assert pattern_analysis_response.json()['overall_direction'] is None
+    assert market_sentiment_response.status_code == 200
+    assert market_sentiment_response.json()['data_state'] == 'waiting_for_runtime'
+    assert market_sentiment_response.json()['market_state'] == 'insufficient_data'
+    assert symbol_sentiment_response.status_code == 200
+    assert symbol_sentiment_response.json()['data_state'] == 'ready'
+    assert symbol_sentiment_response.json()['sentiment_state'] == 'insufficient_data'
+    assert symbol_sentiment_response.json()['source_count'] == 0
     assert ai_signal_response.status_code == 200
     assert ai_signal_response.json() is None
     assert ai_history_response.status_code == 200
@@ -635,6 +920,51 @@ def test_workstation_endpoints_return_empty_states_without_runtime_data() -> Non
     assert ai_evaluation_response.json()['data_state'] == 'waiting_for_runtime'
     assert [item['sample_size'] for item in ai_evaluation_response.json()['horizons']] == [0, 0, 0]
     assert ai_evaluation_response.json()['recent_samples'] == []
+
+
+def test_symbol_sentiment_endpoint_returns_ready_shape_with_source_backing() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    snapshot = SymbolSentimentSnapshot(
+        symbol='XRPUSDT',
+        generated_at=datetime(2024, 3, 9, 16, 2, tzinfo=UTC),
+        data_state='ready',
+        status_message='Symbol sentiment is ready for XRPUSDT.',
+        sentiment_state='bullish',
+        sentiment_score=74,
+        source_count=2,
+        freshness='fresh',
+        freshness_minutes=18,
+        confidence=67,
+        evidence_summary=('DeskA: Listing momentum stays positive', 'DeskB: Network activity improves'),
+        explanation='Symbol sentiment for XRPUSDT reads bullish from two fresh source-backed items.',
+    )
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_symbol_sentiment_service] = lambda: FakeSymbolSentimentService(snapshot)
+    app.dependency_overrides[get_bot_runtime] = lambda: NeutralRuntime()
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    client = TestClient(app)
+
+    try:
+        response = client.get('/bot/symbol-sentiment', params={'symbol': 'XRPUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        'symbol': 'XRPUSDT',
+        'generated_at': '2024-03-09T16:02:00Z',
+        'data_state': 'ready',
+        'status_message': 'Symbol sentiment is ready for XRPUSDT.',
+        'sentiment_state': 'bullish',
+        'sentiment_score': 74,
+        'source_count': 2,
+        'freshness': 'fresh',
+        'freshness_minutes': 18,
+        'confidence': 67,
+        'evidence_summary': ['DeskA: Listing momentum stays positive', 'DeskB: Network activity improves'],
+        'explanation': 'Symbol sentiment for XRPUSDT reads bullish from two fresh source-backed items.',
+    }
 
 
 def test_workstation_endpoint_does_not_crash_when_runtime_state_errors() -> None:
@@ -668,6 +998,9 @@ def test_workstation_reports_waiting_for_history_when_runtime_is_live_but_featur
 
     try:
         workstation_response = client.get('/bot/workstation', params={'symbol': 'BTCUSDT'})
+        technical_analysis_response = client.get('/bot/technical-analysis', params={'symbol': 'BTCUSDT'})
+        pattern_analysis_response = client.get('/bot/pattern-analysis', params={'symbol': 'BTCUSDT', 'horizon': '7d'})
+        market_sentiment_response = client.get('/bot/market-sentiment', params={'symbol': 'BTCUSDT'})
         ai_history_response = client.get('/bot/ai-signal/history', params={'symbol': 'BTCUSDT', 'limit': 5, 'offset': 0})
         ai_evaluation_response = client.get('/bot/ai-signal/evaluation', params={'symbol': 'BTCUSDT'})
     finally:
@@ -676,6 +1009,12 @@ def test_workstation_reports_waiting_for_history_when_runtime_is_live_but_featur
     assert workstation_response.status_code == 200
     assert workstation_response.json()['data_state'] == 'waiting_for_history'
     assert workstation_response.json()['trade_readiness']['next_action'] == 'wait_for_history'
+    assert technical_analysis_response.status_code == 200
+    assert technical_analysis_response.json()['data_state'] == 'waiting_for_history'
+    assert pattern_analysis_response.status_code == 200
+    assert pattern_analysis_response.json()['data_state'] == 'waiting_for_history'
+    assert market_sentiment_response.status_code == 200
+    assert market_sentiment_response.json()['data_state'] == 'waiting_for_history'
     assert ai_history_response.status_code == 200
     assert ai_history_response.json()['data_state'] == 'waiting_for_history'
     assert ai_evaluation_response.status_code == 200

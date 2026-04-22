@@ -1,3 +1,4 @@
+import { PaginationControls } from './PaginationControls';
 import { TimeSeriesChart } from './TimeSeriesChart';
 import { StatePanel } from './StatePanel';
 import { badgeTone, classNames, formatDateTime } from '../lib/format';
@@ -12,6 +13,11 @@ interface AIHistorySectionProps {
   error: string | null;
   dataState: WorkstationDataState;
   statusMessage: string | null;
+  total: number;
+  limit: number;
+  offset: number;
+  onPrevious: () => void;
+  onNext: () => void;
 }
 
 function biasTone(bias: AISignalSummary['bias']): string {
@@ -24,14 +30,28 @@ function biasTone(bias: AISignalSummary['bias']): string {
   return 'bg-amber-500/10 text-amber-300 ring-1 ring-amber-500/30';
 }
 
-export function AIHistorySection({ symbol, history, loading, refreshing, error, dataState, statusMessage }: AIHistorySectionProps) {
+export function AIHistorySection({
+  symbol,
+  history,
+  loading,
+  refreshing,
+  error,
+  dataState,
+  statusMessage,
+  total,
+  limit,
+  offset,
+  onPrevious,
+  onNext,
+}: AIHistorySectionProps) {
   const viewModel = buildAiHistoryViewModel(symbol, history);
+  const latestPage = offset === 0;
 
   if (!symbol) {
     return (
       <StatePanel
         title="No symbol selected"
-        message="Select one symbol to load advisory history for that workstation." 
+        message="Select one symbol to load advisory history for that workstation."
         tone="empty"
       />
     );
@@ -74,7 +94,7 @@ export function AIHistorySection({ symbol, history, loading, refreshing, error, 
 
       <TimeSeriesChart
         title="Confidence Trend"
-        subtitle="Confidence is persisted when the advisory output materially changes on a closed candle."
+        subtitle={latestPage ? 'Latest three persisted advisory changes for the selected symbol.' : 'Older persisted advisory changes for the selected symbol.'}
         labels={viewModel.labels}
         series={[
           {
@@ -90,9 +110,9 @@ export function AIHistorySection({ symbol, history, loading, refreshing, error, 
 
       <div className="grid gap-4 lg:grid-cols-[1.1fr,0.9fr]">
         <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
-          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Bias Changes Over Time</p>
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">{latestPage ? 'Latest Bias Changes' : 'Older Bias Changes'}</p>
           <div className="mt-4 space-y-3">
-            {viewModel.recentItems.slice(0, 6).map((item) => (
+            {viewModel.recentItems.slice(0, 3).map((item) => (
               <div key={`${item.symbol}-${item.timestamp}`} className="rounded-xl border border-slate-800 bg-slate-900/70 p-3">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className={classNames('rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em]', biasTone(item.bias))}>
@@ -110,9 +130,9 @@ export function AIHistorySection({ symbol, history, loading, refreshing, error, 
         </div>
 
         <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
-          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Recent Suggested Action Changes</p>
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">{latestPage ? 'Latest Action Changes' : 'Older Action Changes'}</p>
           <div className="mt-4 space-y-3">
-            {viewModel.recentActionChanges.slice(0, 5).map((item) => (
+            {viewModel.recentActionChanges.length > 0 ? viewModel.recentActionChanges.slice(0, 3).map((item) => (
               <div key={`${item.symbol}-${item.timestamp}-action`} className="rounded-xl border border-slate-800 bg-slate-900/70 p-3 text-sm text-slate-300">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className={classNames('rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em]', badgeTone(item.suggested_action))}>
@@ -120,16 +140,18 @@ export function AIHistorySection({ symbol, history, loading, refreshing, error, 
                   </span>
                   <span className="text-xs text-slate-500">{formatDateTime(item.timestamp)}</span>
                 </div>
-                <p className="mt-2 text-slate-400">{item.bias} bias � confidence {item.confidence}%</p>
+                <p className="mt-2 text-slate-400">{item.bias} bias - confidence {item.confidence}%</p>
               </div>
-            ))}
+            )) : (
+              <p className="text-sm text-slate-400">No action changes are available on this page yet.</p>
+            )}
           </div>
         </div>
       </div>
 
       <div className="overflow-hidden rounded-2xl border border-slate-800 bg-slate-950/50">
         <div className="border-b border-slate-800 px-4 py-3">
-          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Recent Advisory Snapshots</p>
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">{latestPage ? 'Latest 3 Advisory Snapshots' : 'Older Advisory Snapshots'}</p>
         </div>
         <div className="overflow-x-auto">
           <table className="min-w-full divide-y divide-slate-800 text-sm">
@@ -145,7 +167,7 @@ export function AIHistorySection({ symbol, history, loading, refreshing, error, 
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800 text-slate-200">
-              {viewModel.recentItems.slice(0, 10).map((item) => (
+              {viewModel.recentItems.map((item) => (
                 <tr key={`${item.symbol}-${item.timestamp}-row`}>
                   <td className="px-4 py-3 text-slate-400">{formatDateTime(item.timestamp)}</td>
                   <td className="px-4 py-3">
@@ -167,6 +189,11 @@ export function AIHistorySection({ symbol, history, loading, refreshing, error, 
             </tbody>
           </table>
         </div>
+        {total > limit ? (
+          <div className="px-4 pb-4">
+            <PaginationControls total={total} limit={limit} offset={offset} onPrevious={onPrevious} onNext={onNext} />
+          </div>
+        ) : null}
       </div>
     </div>
   );

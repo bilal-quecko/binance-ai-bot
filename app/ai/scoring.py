@@ -1,140 +1,133 @@
-"""Deterministic advisory AI-style scoring."""
+"""Deterministic advisory AI-style scoring with regime awareness."""
 
 from __future__ import annotations
 
-from decimal import Decimal
-
+from app.ai.horizon_scoring import score_horizons
 from app.ai.models import AIFeatureVector, AISignalSnapshot
-
-
-def _clamp_confidence(value: int) -> int:
-    """Clamp confidence to a user-facing 0..100 range."""
-
-    return max(0, min(100, value))
+from app.ai.noise_filters import assess_noise
+from app.ai.regime import classify_ai_regime
 
 
 def score_ai_signal(features: AIFeatureVector) -> AISignalSnapshot:
-    """Score advisory market bias and action from a deterministic feature vector."""
+    """Score advisory market bias and action from a richer deterministic feature vector."""
 
-    bias_score = Decimal("0")
-    confidence = 50
-    explanation_parts: list[str] = []
+    regime = classify_ai_regime(features)
+    noise = assess_noise(features, regime=regime.regime)
+    horizon_signals = score_horizons(
+        features,
+        regime=regime.regime,
+        noise=noise,
+    )
 
-    if features.ema_fast is not None and features.ema_slow is not None:
-        if features.ema_fast > features.ema_slow:
-            bias_score += Decimal("2")
-            confidence += 10
-            explanation_parts.append("fast EMA is above slow EMA")
-        elif features.ema_fast < features.ema_slow:
-            bias_score -= Decimal("2")
-            confidence += 10
-            explanation_parts.append("fast EMA is below slow EMA")
-        else:
-            explanation_parts.append("EMAs are flat")
+    preferred = _pick_preferred_horizon(horizon_signals)
+    aligned_bias = _aligned_bias(horizon_signals)
+    selected_signal = preferred or horizon_signals[-1]
 
-    if features.momentum is not None:
-        if features.momentum > Decimal("0.004"):
-            bias_score += Decimal("1.5")
-            confidence += 8
-            explanation_parts.append("recent momentum is improving")
-        elif features.momentum < Decimal("-0.004"):
-            bias_score -= Decimal("1.5")
-            confidence += 8
-            explanation_parts.append("recent momentum is weakening")
+    bias = aligned_bias or selected_signal.bias
+    confidence = selected_signal.confidence
+    suggested_action = selected_signal.suggested_action
+    abstain = noise.abstain or all(signal.abstain or signal.suggested_action == "abstain" for signal in horizon_signals)
+    confirmation_needed = regime.regime == "breakout_building" or any(
+        signal.confirmation_needed for signal in horizon_signals
+    )
 
-    if features.rsi is not None:
-        if features.rsi >= Decimal("58"):
-            bias_score += Decimal("1")
-            confidence += 6
-            explanation_parts.append("RSI is leaning bullish")
-        elif features.rsi <= Decimal("42"):
-            bias_score -= Decimal("1")
-            confidence += 6
-            explanation_parts.append("RSI is leaning bearish")
-        else:
-            explanation_parts.append("RSI is neutral")
-
-    if features.volume_spike_ratio is not None:
-        if features.volume_spike_ratio >= Decimal("1.4"):
-            confidence += 7
-            explanation_parts.append("volume is above its recent baseline")
-        elif features.volume_spike_ratio < Decimal("0.8"):
-            confidence -= 5
-            explanation_parts.append("volume is light")
-
-    if features.volatility_pct is not None:
-        if Decimal("0.001") <= features.volatility_pct <= Decimal("0.03"):
-            confidence += 6
-            explanation_parts.append("volatility is in a workable range")
-        elif features.volatility_pct > Decimal("0.05"):
-            confidence -= 8
-            explanation_parts.append("volatility is elevated")
-        else:
-            confidence -= 3
-            explanation_parts.append("volatility is muted")
-
-    if features.microstructure_healthy:
-        confidence += 5
-        explanation_parts.append("spread and top-of-book look healthy")
-    elif features.spread_ratio is not None:
-        confidence -= 6
-        explanation_parts.append("spread or top-of-book conditions are less favorable")
-
-    if features.wick_body_ratio is not None and features.wick_body_ratio > Decimal("3"):
-        confidence -= 4
-        explanation_parts.append("the latest candle has high wick noise")
-
-    if bias_score >= Decimal("2.5"):
-        bias = "bullish"
-    elif bias_score <= Decimal("-2.5"):
-        bias = "bearish"
-    else:
+    if abstain:
+        suggested_action = "abstain"
         bias = "sideways"
-
-    entry_signal = (
-        bias == "bullish"
-        and features.momentum is not None
-        and features.momentum > Decimal("0")
-        and features.rsi is not None
-        and features.rsi < Decimal("72")
-        and (features.volatility_pct is None or features.volatility_pct <= Decimal("0.035"))
-        and (features.spread_ratio is None or features.spread_ratio <= Decimal("0.0025"))
-    )
-    exit_signal = (
-        bias == "bearish"
-        or (
-            features.rsi is not None
-            and features.rsi >= Decimal("74")
-        )
-        or (
-            features.momentum is not None
-            and features.momentum < Decimal("-0.003")
-        )
-    )
-
-    suggested_action = "wait"
-    if exit_signal:
-        suggested_action = "exit"
-    elif entry_signal:
-        suggested_action = "enter"
-    elif bias == "bullish":
-        suggested_action = "hold"
-
-    if suggested_action == "enter" and confidence < 60:
-        suggested_action = "wait"
-        explanation_parts.append("setup exists but confidence is still moderate")
-    if bias == "sideways" and suggested_action != "exit":
+        confidence = min(confidence, 35)
+    elif suggested_action == "enter" and confirmation_needed:
         suggested_action = "wait"
 
-    explanation = ", ".join(dict.fromkeys(explanation_parts)) or "insufficient context"
+    entry_signal = suggested_action == "enter"
+    exit_signal = any(signal.suggested_action == "exit" for signal in horizon_signals) or (
+        regime.regime == "reversal_risk" and bias == "bearish"
+    )
+    low_confidence = noise.low_confidence or confidence < 50
+
+    weakening_factors = tuple(
+        dict.fromkeys((*regime.weakening_factors, *noise.weakening_factors))
+    )
+    explanation = _build_explanation(
+        regime=regime.regime,
+        preferred_horizon=preferred.horizon if preferred is not None else None,
+        suggested_action=suggested_action,
+        abstain=abstain,
+        confirmation_needed=confirmation_needed,
+        selected_signal=selected_signal,
+        weakening_factors=weakening_factors,
+    )
 
     return AISignalSnapshot(
         symbol=features.symbol,
         bias=bias,
-        confidence=_clamp_confidence(confidence),
+        confidence=confidence,
         entry_signal=entry_signal,
         exit_signal=exit_signal,
         suggested_action=suggested_action,
-        explanation=explanation[0].upper() + explanation[1:] + ".",
+        explanation=explanation,
         feature_vector=features,
+        regime=regime.regime,
+        noise_level=noise.noise_level,
+        abstain=abstain,
+        low_confidence=low_confidence,
+        confirmation_needed=confirmation_needed,
+        preferred_horizon=preferred.horizon if preferred is not None else None,
+        weakening_factors=weakening_factors,
+        horizon_signals=horizon_signals,
     )
+
+
+def _pick_preferred_horizon(horizon_signals):
+    candidates = [
+        signal
+        for signal in horizon_signals
+        if not signal.abstain and signal.suggested_action != "abstain"
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda signal: (signal.confidence, signal.horizon == "15m", signal.horizon == "1h"))
+
+
+def _aligned_bias(horizon_signals):
+    directional = [signal.bias for signal in horizon_signals if signal.bias != "sideways" and not signal.abstain]
+    if not directional:
+        return None
+    if len(set(directional)) == 1:
+        return directional[0]
+    return None
+
+
+def _build_explanation(
+    *,
+    regime: str,
+    preferred_horizon: str | None,
+    suggested_action: str,
+    abstain: bool,
+    confirmation_needed: bool,
+    selected_signal,
+    weakening_factors: tuple[str, ...],
+) -> str:
+    """Build a concise advisory explanation with abstention clarity."""
+
+    parts = [
+        f"Regime is {regime.replace('_', ' ')}.",
+    ]
+    if preferred_horizon is not None:
+        parts.append(
+            f"The strongest current read comes from the {preferred_horizon} horizon with a {selected_signal.bias} bias."
+        )
+    if abstain:
+        parts.append("AI is abstaining because short-timeframe conditions look too noisy.")
+    elif confirmation_needed:
+        parts.append("AI wants confirmation before treating the setup as actionable.")
+    else:
+        parts.append(f"Recommended action is {suggested_action}.")
+    if weakening_factors:
+        parts.append(
+            "Confidence is being reduced by "
+            + ", ".join(factor.replace("_", " ") for factor in weakening_factors[:3])
+            + "."
+        )
+    else:
+        parts.append(selected_signal.explanation)
+    return " ".join(parts)
