@@ -96,3 +96,62 @@ Chronological implementation checkpoints for Binance AI Bot.
   - added backend metric and API coverage
   - full backend test suite: passed
   - frontend production build: passed
+
+## No. 6 — Trade Quality Attribution
+
+- Status: Completed
+- Scope:
+  - added deterministic trade-quality attribution for closed paper trades
+  - exposed symbol/date-scoped trade-quality analytics plus recent closed-trade details
+  - added an Auto Trade workstation section for entry/exit quality and trade-management quality
+- Backend:
+  - added `app/monitoring/trade_quality.py` for MFE, MAE, captured move, giveback, entry quality, exit quality, no-trade gap, and hold-time distribution calculations
+  - added `/performance/trade-quality` with `symbol`, `start_date`, `end_date`, `limit`, and `offset`
+  - reused persisted `trades` and `market_candle_snapshots` so attribution stays explainable and paper-only
+- Frontend:
+  - added a `Trade Quality` section in the Auto Trade tab
+  - showed recent closed-trade attribution details without returning to a cluttered monitoring dashboard
+- Validation:
+  - added backend formula and API coverage
+  - full backend test suite: passed
+  - frontend production build: passed
+
+## No. 7 — Runtime Persistence and Trade Readiness
+
+- Status: Completed
+- Scope:
+  - made backend runtime/session ownership explicit with stable session metadata and reconnect-friendly status reads
+  - added symbol-scoped deterministic trade-readiness payloads so the workstation can explain why the bot is waiting, blocked, entering, exiting, or holding
+  - added fee/slippage-aware minimum-edge blocking before paper entries
+- Backend:
+  - extended runtime status with backend-owned `mode` and `session_id`
+  - added workstation `trade_readiness` with runtime activity, signal readiness, risk state, broker readiness, next action, and human-readable blocking reasons
+  - added fee-aware entry gating using expected edge versus estimated round-trip fees and slippage
+- Frontend:
+  - reconnected to backend runtime state after refresh/reopen by adopting the active backend symbol when needed
+  - added deterministic execution-readiness panels in Signal and Auto Trade views
+  - clarified that AI remains advisory while execution follows deterministic strategy plus risk gating
+- Validation:
+  - added backend tests for reconnect-style status rereads, paused/readiness states, and fee-aware blocking
+  - full backend test suite: passed
+  - frontend production build: passed
+
+## No. 8 - Runtime Session Persistence and Broker Recovery
+
+- Status: Completed
+- Scope:
+  - persisted backend-owned runtime session state across backend restart
+  - persisted paper broker balances and open positions for safe recovery
+  - restored prior runtime ownership and recovered paper positions visibly without auto-resuming trading
+- Backend:
+  - added `runtime_session_state`, `paper_broker_state`, and `paper_broker_positions` SQLite tables
+  - restored prior runtime state on startup and normalized previously running sessions into a safe paused recovery state
+  - restored recovered paper broker balances, realized PnL, and open positions into the runtime runner
+  - exposed recovery metadata through bot status and workstation reads
+- Frontend:
+  - surfaced recovery status, restored broker-state visibility, and recovery guidance in the live control panel
+  - kept the workstation symbol-scoped and read-only
+- Validation:
+  - added storage, runtime, and API tests for restart-style recovery, corrupt persisted state, and reset clearing
+  - full backend test suite: passed
+  - frontend production build: passed

@@ -22,9 +22,30 @@ class RunnerConfig:
     max_open_positions: int = 3
     min_stop_distance_ratio: Decimal = Decimal("0.001")
     quantity_step: Decimal = Decimal("0.00000001")
+    min_expected_edge_buffer_pct: Decimal = Decimal("0.0015")
     quote_asset: str = "USDT"
     mode: Literal["paper"] = "paper"
     history_limit: int = 200
+
+
+@dataclass(slots=True)
+class TradeReadiness:
+    """Current deterministic trade-readiness state for one symbol."""
+
+    selected_symbol: str
+    runtime_active: bool
+    mode: str
+    enough_candle_history: bool
+    deterministic_entry_signal: bool
+    deterministic_exit_signal: bool
+    risk_ready: bool
+    risk_blocked: bool
+    broker_ready: bool
+    next_action: str
+    reason_if_not_trading: str | None
+    risk_reason_codes: tuple[str, ...]
+    expected_edge_pct: Decimal | None = None
+    estimated_round_trip_cost_pct: Decimal | None = None
 
 
 @dataclass(slots=True)

@@ -7,7 +7,7 @@ from app.ai.models import AIFeatureVector, AISignalSnapshot
 from fastapi.testclient import TestClient
 
 from app.api.bot_api import get_bot_runtime, get_settings_dependency, get_symbol_service
-from app.bot import BotStatus, WorkstationState
+from app.bot import BotStatus, PaperBotRuntime, WorkstationState
 from app.config import Settings
 from app.exchange.symbol_service import SpotSymbolRecord
 from app.features.models import FeatureSnapshot
@@ -16,6 +16,7 @@ from app.market_data.candles import Candle
 from app.market_data.models import MarketSnapshot
 from app.market_data.orderbook import TopOfBook
 from app.paper.models import Position
+from app.runner.models import TradeReadiness
 from app.storage import StorageRepository
 from app.strategies.models import StrategySignal
 
@@ -35,7 +36,7 @@ class FakeSymbolService:
 
 class FakeRuntime:
     def __init__(self) -> None:
-        self.state = BotStatus(state='stopped', timeframe='1m')
+        self.state = BotStatus(state='stopped', mode='stopped', timeframe='1m')
         self.reset_called = False
 
     def status(self) -> BotStatus:
@@ -48,28 +49,55 @@ class FakeRuntime:
         return None
 
     async def start(self, symbol: str) -> BotStatus:
-        self.state = BotStatus(state='running', symbol=symbol, timeframe='1m', started_at=datetime(2024, 3, 9, 16, 0, tzinfo=UTC))
+        self.state = BotStatus(
+            state='running',
+            mode='auto_paper',
+            symbol=symbol,
+            timeframe='1m',
+            session_id='session-btcusdt',
+            started_at=datetime(2024, 3, 9, 16, 0, tzinfo=UTC),
+        )
         return self.state
 
     async def stop(self) -> BotStatus:
-        self.state = BotStatus(state='stopped', symbol=self.state.symbol, timeframe='1m')
+        self.state = BotStatus(
+            state='stopped',
+            mode='stopped',
+            symbol=self.state.symbol,
+            timeframe='1m',
+            session_id=self.state.session_id,
+        )
         return self.state
 
     async def pause(self) -> BotStatus:
-        self.state = BotStatus(state='paused', symbol=self.state.symbol, timeframe='1m')
+        self.state = BotStatus(
+            state='paused',
+            mode='paused',
+            symbol=self.state.symbol,
+            timeframe='1m',
+            session_id=self.state.session_id,
+        )
         return self.state
 
     async def resume(self) -> BotStatus:
-        self.state = BotStatus(state='running', symbol=self.state.symbol, timeframe='1m')
+        self.state = BotStatus(
+            state='running',
+            mode='auto_paper',
+            symbol=self.state.symbol,
+            timeframe='1m',
+            session_id=self.state.session_id,
+        )
         return self.state
 
     async def reset_session(self) -> BotStatus:
         self.reset_called = True
-        self.state = BotStatus(state='stopped', timeframe='1m')
+        self.state = BotStatus(state='stopped', mode='stopped', timeframe='1m')
         return self.state
 
     def workstation_state(self, symbol: str) -> WorkstationState:
         snapshot_time = datetime(2024, 3, 9, 16, 2, tzinfo=UTC)
+        next_action = 'enter' if self.state.mode == 'auto_paper' else 'resume_auto_trade'
+        reason_if_not_trading = None if self.state.mode == 'auto_paper' else 'An entry signal exists, but auto paper trading is paused.'
         candle = Candle(
             symbol=symbol,
             timeframe='1m',
@@ -145,6 +173,22 @@ class FakeRuntime:
                     microstructure_healthy=True,
                 ),
             ),
+            trade_readiness=TradeReadiness(
+                selected_symbol=symbol,
+                runtime_active=True,
+                mode=self.state.mode,
+                enough_candle_history=True,
+                deterministic_entry_signal=True,
+                deterministic_exit_signal=False,
+                risk_ready=True,
+                risk_blocked=False,
+                broker_ready=True,
+                next_action=next_action,
+                reason_if_not_trading=reason_if_not_trading,
+                risk_reason_codes=('APPROVED',),
+                expected_edge_pct=Decimal('0.02985074626865671641791044776'),
+                estimated_round_trip_cost_pct=Decimal('0.001'),
+            ),
             entry_signal=StrategySignal(symbol=symbol, side='BUY', confidence=Decimal('0.6'), reason_codes=('EMA_BULLISH',)),
             exit_signal=StrategySignal(symbol=symbol, side='HOLD', confidence=Decimal('1.0'), reason_codes=('POSITION_OPEN',)),
             current_position=Position(symbol=symbol, quantity=Decimal('1'), avg_entry_price=Decimal('99'), realized_pnl=Decimal('2')),
@@ -162,6 +206,7 @@ class NeutralRuntime(FakeRuntime):
             market_snapshot=None,
             feature_snapshot=None,
             ai_signal=None,
+            trade_readiness=None,
             entry_signal=None,
             exit_signal=None,
             current_position=None,
@@ -179,7 +224,14 @@ class BrokenRuntime(NeutralRuntime):
 class HistoryWaitingRuntime(FakeRuntime):
     def __init__(self) -> None:
         super().__init__()
-        self.state = BotStatus(state='running', symbol='BTCUSDT', timeframe='1m', started_at=datetime(2024, 3, 9, 16, 0, tzinfo=UTC))
+        self.state = BotStatus(
+            state='running',
+            mode='auto_paper',
+            symbol='BTCUSDT',
+            timeframe='1m',
+            session_id='session-btcusdt',
+            started_at=datetime(2024, 3, 9, 16, 0, tzinfo=UTC),
+        )
 
     def workstation_state(self, symbol: str) -> WorkstationState:
         return WorkstationState(
@@ -195,6 +247,20 @@ class HistoryWaitingRuntime(FakeRuntime):
             ),
             feature_snapshot=None,
             ai_signal=None,
+            trade_readiness=TradeReadiness(
+                selected_symbol=symbol,
+                runtime_active=True,
+                mode='auto_paper',
+                enough_candle_history=False,
+                deterministic_entry_signal=False,
+                deterministic_exit_signal=False,
+                risk_ready=False,
+                risk_blocked=False,
+                broker_ready=True,
+                next_action='wait_for_history',
+                reason_if_not_trading=f'Waiting for enough closed candle history to build deterministic signals for {symbol}.',
+                risk_reason_codes=(),
+            ),
             entry_signal=None,
             exit_signal=None,
             current_position=None,
@@ -208,6 +274,12 @@ def _db_path() -> Path:
     base = Path("tests/.tmp_storage")
     base.mkdir(parents=True, exist_ok=True)
     return (base / f"bot_api_{uuid4().hex}.sqlite").resolve()
+
+
+class IdleStreamManager:
+    async def stream(self, streams: list[str], *, websocket_client=None):
+        if False:
+            yield streams
 
 
 def test_symbol_and_bot_control_endpoints() -> None:
@@ -315,6 +387,7 @@ def test_symbol_and_bot_control_endpoints() -> None:
         ai_history_response = client.get('/bot/ai-signal/history', params={'symbol': 'BTCUSDT', 'limit': 10, 'offset': 0})
         ai_evaluation_response = client.get('/bot/ai-signal/evaluation', params={'symbol': 'BTCUSDT'})
         pause_response = client.post('/bot/pause')
+        paused_workstation_response = client.get('/bot/workstation', params={'symbol': 'BTCUSDT'})
         resume_response = client.post('/bot/resume')
         reset_response = client.post('/bot/reset')
         stop_response = client.post('/bot/stop')
@@ -338,15 +411,21 @@ def test_symbol_and_bot_control_endpoints() -> None:
 
     assert start_response.status_code == 200
     assert start_response.json()['state'] == 'running'
+    assert start_response.json()['mode'] == 'auto_paper'
     assert start_response.json()['symbol'] == 'BTCUSDT'
+    assert start_response.json()['session_id'] == 'session-btcusdt'
 
     assert status_response.status_code == 200
     assert status_response.json()['state'] == 'running'
+    assert status_response.json()['session_id'] == 'session-btcusdt'
 
     assert workstation_response.status_code == 200
     assert workstation_response.json()['symbol'] == 'BTCUSDT'
     assert workstation_response.json()['data_state'] == 'ready'
+    assert workstation_response.json()['runtime_status']['mode'] == 'auto_paper'
     assert workstation_response.json()['entry_signal']['side'] == 'BUY'
+    assert workstation_response.json()['trade_readiness']['next_action'] == 'enter'
+    assert workstation_response.json()['trade_readiness']['risk_ready'] is True
     assert workstation_response.json()['ai_signal']['bias'] == 'bullish'
 
     assert ai_signal_response.status_code == 200
@@ -368,9 +447,13 @@ def test_symbol_and_bot_control_endpoints() -> None:
 
     assert pause_response.status_code == 200
     assert pause_response.json()['state'] == 'paused'
+    assert pause_response.json()['mode'] == 'paused'
+    assert paused_workstation_response.status_code == 200
+    assert paused_workstation_response.json()['trade_readiness']['next_action'] == 'resume_auto_trade'
 
     assert resume_response.status_code == 200
     assert resume_response.json()['state'] == 'running'
+    assert resume_response.json()['mode'] == 'auto_paper'
 
     assert reset_response.status_code == 200
     assert reset_response.json()['state'] == 'stopped'
@@ -378,6 +461,94 @@ def test_symbol_and_bot_control_endpoints() -> None:
 
     assert stop_response.status_code == 200
     assert stop_response.json()['state'] == 'stopped'
+
+
+def test_runtime_status_remains_stable_across_repeated_reads() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    fake_runtime = FakeRuntime()
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_bot_runtime] = lambda: fake_runtime
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    client = TestClient(app)
+
+    try:
+        start_response = client.post('/bot/start', json={'symbol': 'BTCUSDT'})
+        status_response_a = client.get('/bot/status')
+        status_response_b = client.get('/bot/status')
+        workstation_response = client.get('/bot/workstation', params={'symbol': 'BTCUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert start_response.status_code == 200
+    assert status_response_a.status_code == 200
+    assert status_response_b.status_code == 200
+    assert status_response_a.json()['session_id'] == 'session-btcusdt'
+    assert status_response_b.json()['session_id'] == 'session-btcusdt'
+    assert status_response_a.json()['symbol'] == 'BTCUSDT'
+    assert status_response_b.json()['symbol'] == 'BTCUSDT'
+    assert workstation_response.status_code == 200
+    assert workstation_response.json()['runtime_status']['session_id'] == 'session-btcusdt'
+
+
+def test_recovered_runtime_state_is_visible_after_restart_style_reconstruction() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}", APP_MODE='paper')
+    repository = StorageRepository(settings.database_url)
+    try:
+        repository.upsert_runtime_session_state(
+            state='running',
+            mode='auto_paper',
+            symbol='BTCUSDT',
+            session_id='recovered-session',
+            started_at=datetime(2024, 3, 9, 16, 0, tzinfo=UTC),
+            last_event_time=datetime(2024, 3, 9, 16, 5, tzinfo=UTC),
+            last_error=None,
+        )
+        repository.upsert_paper_broker_state(
+            balances={'USDT': Decimal('9950')},
+            positions={
+                'BTCUSDT': Position(
+                    symbol='BTCUSDT',
+                    quantity=Decimal('0.5'),
+                    avg_entry_price=Decimal('100'),
+                    realized_pnl=Decimal('12'),
+                    quote_asset='USDT',
+                )
+            },
+            realized_pnl=Decimal('12'),
+            snapshot_time=datetime(2024, 3, 9, 16, 6, tzinfo=UTC),
+        )
+    finally:
+        repository.close()
+
+    runtime = PaperBotRuntime(settings=settings, websocket_client=None, stream_manager=IdleStreamManager())  # type: ignore[arg-type]
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_bot_runtime] = lambda: runtime
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    client = TestClient(app)
+
+    try:
+        status_response = client.get('/bot/status')
+        workstation_response = client.get('/bot/workstation', params={'symbol': 'BTCUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert status_response.status_code == 200
+    assert status_response.json()['state'] == 'paused'
+    assert status_response.json()['mode'] == 'paused'
+    assert status_response.json()['symbol'] == 'BTCUSDT'
+    assert status_response.json()['recovered_from_prior_session'] is True
+    assert status_response.json()['broker_state_restored'] is True
+    assert 'Manual resume is required' in status_response.json()['recovery_message']
+
+    assert workstation_response.status_code == 200
+    assert workstation_response.json()['data_state'] == 'waiting_for_history'
+    assert workstation_response.json()['runtime_status']['recovered_from_prior_session'] is True
+    assert workstation_response.json()['runtime_status']['broker_state_restored'] is True
+    assert workstation_response.json()['current_position']['quantity'] == '0.5'
+    assert workstation_response.json()['trade_readiness']['next_action'] == 'resume_runtime'
+    assert 'Manual resume is required' in workstation_response.json()['trade_readiness']['reason_if_not_trading']
 
 
 def test_workstation_endpoints_return_empty_states_without_runtime_data() -> None:
@@ -406,17 +577,38 @@ def test_workstation_endpoints_return_empty_states_without_runtime_data() -> Non
         'is_runtime_symbol': False,
         'runtime_status': {
             'state': 'stopped',
+            'mode': 'stopped',
             'symbol': None,
             'timeframe': '1m',
             'paper_only': True,
+            'session_id': None,
             'started_at': None,
             'last_event_time': None,
             'last_error': None,
+            'recovered_from_prior_session': False,
+            'broker_state_restored': False,
+            'recovery_message': None,
         },
         'last_price': None,
         'current_candle': None,
         'top_of_book': None,
         'feature': None,
+        'trade_readiness': {
+            'selected_symbol': 'ETHUSDT',
+            'runtime_active': False,
+            'mode': 'stopped',
+            'enough_candle_history': False,
+            'deterministic_entry_signal': False,
+            'deterministic_exit_signal': False,
+            'risk_ready': False,
+            'risk_blocked': False,
+            'broker_ready': False,
+            'next_action': 'start_runtime',
+            'reason_if_not_trading': 'Start the live runtime for ETHUSDT before auto paper trading can act.',
+            'risk_reason_codes': [],
+            'expected_edge_pct': None,
+            'estimated_round_trip_cost_pct': None,
+        },
         'ai_signal': None,
         'trend_bias': None,
         'entry_signal': None,
@@ -483,6 +675,7 @@ def test_workstation_reports_waiting_for_history_when_runtime_is_live_but_featur
 
     assert workstation_response.status_code == 200
     assert workstation_response.json()['data_state'] == 'waiting_for_history'
+    assert workstation_response.json()['trade_readiness']['next_action'] == 'wait_for_history'
     assert ai_history_response.status_code == 200
     assert ai_history_response.json()['data_state'] == 'waiting_for_history'
     assert ai_evaluation_response.status_code == 200
@@ -509,8 +702,73 @@ def test_reset_session_followed_by_workstation_read_stays_safe() -> None:
     assert workstation_response.status_code == 200
     assert workstation_response.json()['data_state'] == 'waiting_for_runtime'
     assert workstation_response.json()['is_runtime_symbol'] is False
+    assert workstation_response.json()['trade_readiness']['next_action'] == 'start_runtime'
     assert ai_history_response.status_code == 200
     assert ai_history_response.json()['items'] == []
+
+
+def test_reset_clears_persisted_runtime_and_broker_recovery_state() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}", APP_MODE='paper')
+    repository = StorageRepository(settings.database_url)
+    try:
+        repository.upsert_runtime_session_state(
+            state='running',
+            mode='auto_paper',
+            symbol='BTCUSDT',
+            session_id='recovered-session',
+            started_at=datetime(2024, 3, 9, 16, 0, tzinfo=UTC),
+            last_event_time=datetime(2024, 3, 9, 16, 5, tzinfo=UTC),
+            last_error=None,
+        )
+        repository.upsert_paper_broker_state(
+            balances={'USDT': Decimal('9950')},
+            positions={
+                'BTCUSDT': Position(
+                    symbol='BTCUSDT',
+                    quantity=Decimal('0.5'),
+                    avg_entry_price=Decimal('100'),
+                    realized_pnl=Decimal('12'),
+                    quote_asset='USDT',
+                )
+            },
+            realized_pnl=Decimal('12'),
+            snapshot_time=datetime(2024, 3, 9, 16, 6, tzinfo=UTC),
+        )
+    finally:
+        repository.close()
+
+    runtime = PaperBotRuntime(settings=settings, websocket_client=None, stream_manager=IdleStreamManager())  # type: ignore[arg-type]
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_bot_runtime] = lambda: runtime
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    client = TestClient(app)
+
+    try:
+        reset_response = client.post('/bot/reset')
+        status_response = client.get('/bot/status')
+        workstation_response = client.get('/bot/workstation', params={'symbol': 'BTCUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    reopened = StorageRepository(settings.database_url)
+    try:
+        persisted_status = reopened.get_runtime_session_state()
+        persisted_broker = reopened.get_paper_broker_state()
+    finally:
+        reopened.close()
+
+    assert reset_response.status_code == 200
+    assert status_response.status_code == 200
+    assert status_response.json()['state'] == 'stopped'
+    assert status_response.json()['recovered_from_prior_session'] is False
+    assert status_response.json()['broker_state_restored'] is False
+    assert status_response.json()['recovery_message'] is None
+    assert workstation_response.status_code == 200
+    assert workstation_response.json()['current_position'] is None
+    assert workstation_response.json()['trade_readiness']['next_action'] == 'start_runtime'
+    assert persisted_status is None
+    assert persisted_broker is None
 
 
 def test_ai_evaluation_returns_empty_metrics_when_no_candle_history_exists() -> None:

@@ -13,21 +13,38 @@ class PaperBroker:
         self,
         *,
         initial_balances: dict[str, Decimal] | None = None,
+        initial_positions: dict[str, Position] | None = None,
+        initial_realized_pnl: Decimal = Decimal("0"),
         fee_rate: Decimal = Decimal("0.001"),
         slippage_pct: Decimal = Decimal("0"),
     ) -> None:
         self._balances: dict[str, Decimal] = dict(initial_balances or {"USDT": Decimal("10000")})
-        self._positions: dict[str, Position] = {}
+        self._positions: dict[str, Position] = {
+            symbol.upper(): replace(position)
+            for symbol, position in (initial_positions or {}).items()
+        }
         self._fee_rate = fee_rate
         self._slippage_pct = slippage_pct
         self._order_counter = 0
-        self._realized_pnl = Decimal("0")
+        self._realized_pnl = initial_realized_pnl
 
     @property
     def realized_pnl(self) -> Decimal:
         """Return cumulative realized PnL across closed paper trades."""
 
         return self._realized_pnl
+
+    @property
+    def fee_rate(self) -> Decimal:
+        """Return the configured paper fee rate."""
+
+        return self._fee_rate
+
+    @property
+    def slippage_pct(self) -> Decimal:
+        """Return the configured paper slippage percentage."""
+
+        return self._slippage_pct
 
     def balances(self) -> dict[str, Decimal]:
         """Return a copy of the current in-memory balances."""

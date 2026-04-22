@@ -23,9 +23,11 @@ from app.storage.models import (
     EquityHistoryPoint,
     FillRecord,
     MarketCandleSnapshotRecord,
+    PaperBrokerStateRecord,
     PnlHistoryPoint,
     PnlSnapshotRecord,
     PositionSnapshotRecord,
+    RuntimeSessionRecord,
     RunnerEventRecord,
     TradeRecord,
 )
@@ -38,6 +40,17 @@ def _decimal(value: Any) -> Decimal:
     """Convert a stored numeric value into Decimal."""
 
     return Decimal(str(value))
+
+
+def _safe_datetime(value: Any) -> datetime | None:
+    """Convert an ISO string into datetime, returning ``None`` when invalid."""
+
+    if value in {None, ""}:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
 
 
 def _parse_reason_codes(value: str) -> tuple[str, ...]:
@@ -199,6 +212,9 @@ class StorageRepository:
                 "runner_events",
                 "ai_signal_snapshots",
                 "market_candle_snapshots",
+                "runtime_session_state",
+                "paper_broker_state",
+                "paper_broker_positions",
             ):
                 try:
                     self._connection.execute(f"DELETE FROM {table_name}")
@@ -207,6 +223,189 @@ class StorageRepository:
                         raise
                     self._mark_optional_storage_degraded(f"Optional storage table {table_name} is unavailable.")
                     LOGGER.warning("Skipping clear for missing table %s: %s", table_name, exc)
+
+    def upsert_runtime_session_state(
+        self,
+        *,
+        state: str,
+        mode: str,
+        symbol: str | None,
+        session_id: str | None,
+        started_at: datetime | None,
+        last_event_time: datetime | None,
+        last_error: str | None,
+    ) -> None:
+        """Persist the backend-owned runtime session state."""
+
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO runtime_session_state (
+                    singleton_id, state, mode, symbol, session_id, started_at, last_event_time, last_error
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(singleton_id) DO UPDATE SET
+                    state = excluded.state,
+                    mode = excluded.mode,
+                    symbol = excluded.symbol,
+                    session_id = excluded.session_id,
+                    started_at = excluded.started_at,
+                    last_event_time = excluded.last_event_time,
+                    last_error = excluded.last_error
+                """,
+                (
+                    state,
+                    mode,
+                    symbol,
+                    session_id,
+                    started_at.isoformat() if started_at is not None else None,
+                    last_event_time.isoformat() if last_event_time is not None else None,
+                    last_error,
+                ),
+            )
+
+    def get_runtime_session_state(self) -> RuntimeSessionRecord | None:
+        """Return the persisted backend-owned runtime session state."""
+
+        row = self._connection.execute(
+            """
+            SELECT state, mode, symbol, session_id, started_at, last_event_time, last_error
+            FROM runtime_session_state
+            WHERE singleton_id = 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        return RuntimeSessionRecord(
+            state=row["state"],
+            mode=row["mode"],
+            symbol=row["symbol"],
+            session_id=row["session_id"],
+            started_at=_safe_datetime(row["started_at"]),
+            last_event_time=_safe_datetime(row["last_event_time"]),
+            last_error=row["last_error"],
+        )
+
+    def clear_runtime_session_state(self) -> None:
+        """Clear any persisted runtime recovery state."""
+
+        with self._connection:
+            self._connection.execute("DELETE FROM runtime_session_state")
+
+    def upsert_paper_broker_state(
+        self,
+        *,
+        balances: dict[str, Decimal],
+        positions: dict[str, Position],
+        realized_pnl: Decimal,
+        snapshot_time: datetime,
+    ) -> None:
+        """Persist paper broker balances and open positions for restart recovery."""
+
+        balances_json = json.dumps(
+            {asset.upper(): str(balance) for asset, balance in balances.items()},
+            sort_keys=True,
+        )
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO paper_broker_state (
+                    singleton_id, balances_json, realized_pnl, snapshot_time
+                ) VALUES (1, ?, ?, ?)
+                ON CONFLICT(singleton_id) DO UPDATE SET
+                    balances_json = excluded.balances_json,
+                    realized_pnl = excluded.realized_pnl,
+                    snapshot_time = excluded.snapshot_time
+                """,
+                (
+                    balances_json,
+                    str(realized_pnl),
+                    snapshot_time.isoformat(),
+                ),
+            )
+            self._connection.execute("DELETE FROM paper_broker_positions")
+            for symbol, position in positions.items():
+                self._connection.execute(
+                    """
+                    INSERT INTO paper_broker_positions (
+                        symbol, quantity, avg_entry_price, realized_pnl, quote_asset, snapshot_time
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        symbol.upper(),
+                        str(position.quantity),
+                        str(position.avg_entry_price),
+                        str(position.realized_pnl),
+                        position.quote_asset,
+                        snapshot_time.isoformat(),
+                    ),
+                )
+
+    def get_paper_broker_state(self) -> PaperBrokerStateRecord | None:
+        """Return persisted paper broker recovery state."""
+
+        row = self._connection.execute(
+            """
+            SELECT balances_json, realized_pnl, snapshot_time
+            FROM paper_broker_state
+            WHERE singleton_id = 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            raw_balances = json.loads(row["balances_json"])
+            balances = {
+                str(asset).upper(): _decimal(value)
+                for asset, value in dict(raw_balances).items()
+            }
+        except (TypeError, ValueError, json.JSONDecodeError):
+            LOGGER.warning("Ignoring corrupt persisted paper broker balances during recovery.")
+            return None
+
+        snapshot_time = _safe_datetime(row["snapshot_time"])
+        if snapshot_time is None:
+            LOGGER.warning("Ignoring corrupt persisted paper broker snapshot time during recovery.")
+            return None
+
+        position_rows = self._connection.execute(
+            """
+            SELECT symbol, quantity, avg_entry_price, realized_pnl, quote_asset, snapshot_time
+            FROM paper_broker_positions
+            ORDER BY symbol ASC
+            """
+        ).fetchall()
+        positions: list[PositionSnapshotRecord] = []
+        for position_row in position_rows:
+            position_snapshot_time = _safe_datetime(position_row["snapshot_time"])
+            if position_snapshot_time is None:
+                LOGGER.warning(
+                    "Skipping corrupt persisted paper broker position timestamp for %s.",
+                    position_row["symbol"],
+                )
+                continue
+            positions.append(
+                PositionSnapshotRecord(
+                    symbol=position_row["symbol"],
+                    quantity=_decimal(position_row["quantity"]),
+                    avg_entry_price=_decimal(position_row["avg_entry_price"]),
+                    realized_pnl=_decimal(position_row["realized_pnl"]),
+                    quote_asset=position_row["quote_asset"],
+                    snapshot_time=position_snapshot_time,
+                )
+            )
+        return PaperBrokerStateRecord(
+            balances=balances,
+            positions=positions,
+            realized_pnl=_decimal(row["realized_pnl"]),
+            snapshot_time=snapshot_time,
+        )
+
+    def clear_paper_broker_state(self) -> None:
+        """Clear persisted paper broker recovery state."""
+
+        with self._connection:
+            self._connection.execute("DELETE FROM paper_broker_state")
+            self._connection.execute("DELETE FROM paper_broker_positions")
 
     def insert_market_candle_snapshot(self, candle: Candle) -> None:
         """Persist a closed candle for later AI outcome validation."""

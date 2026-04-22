@@ -112,3 +112,20 @@ def test_risk_engine_resizes_sell_to_existing_position() -> None:
     assert decision.decision == "resize"
     assert decision.approved_quantity == Decimal("1.5")
     assert decision.reason_codes == ("RESIZED_TO_POSITION",)
+
+
+def test_risk_engine_blocks_trade_when_expected_edge_is_below_costs() -> None:
+    engine = RiskEngine()
+
+    decision = engine.evaluate(
+        build_risk_input(
+            expected_edge_pct=Decimal("0.0020"),
+            estimated_round_trip_cost_pct=Decimal("0.0015"),
+            min_expected_edge_buffer_pct=Decimal("0.0010"),
+        )
+    )
+
+    assert decision.decision == "reject"
+    assert decision.reason_codes == ("EDGE_BELOW_COSTS", "EXPECTED_EDGE_TOO_SMALL")
+    assert decision.expected_edge_pct == Decimal("0.0020")
+    assert decision.estimated_round_trip_cost_pct == Decimal("0.0015")

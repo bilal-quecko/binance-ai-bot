@@ -28,13 +28,19 @@ class RiskEngine:
     """Evaluate strategy signals against deterministic paper-trading risk rules."""
 
     @staticmethod
-    def _reject(*reason_codes: str) -> RiskDecision:
+    def _reject(
+        *reason_codes: str,
+        expected_edge_pct: Decimal | None = None,
+        estimated_round_trip_cost_pct: Decimal | None = None,
+    ) -> RiskDecision:
         """Return a rejection decision with zero approved quantity."""
 
         return RiskDecision(
             decision="reject",
             approved_quantity=Decimal("0"),
             reason_codes=tuple(reason_codes),
+            expected_edge_pct=expected_edge_pct,
+            estimated_round_trip_cost_pct=estimated_round_trip_cost_pct,
         )
 
     @staticmethod
@@ -99,6 +105,18 @@ class RiskEngine:
         if risk_distance / risk_input.entry_price < risk_input.min_stop_distance_ratio:
             return self._reject("STOP_DISTANCE_TOO_TIGHT")
 
+        if risk_input.expected_edge_pct is not None:
+            minimum_required_edge = (
+                risk_input.estimated_round_trip_cost_pct + risk_input.min_expected_edge_buffer_pct
+            )
+            if risk_input.expected_edge_pct <= minimum_required_edge:
+                return self._reject(
+                    "EDGE_BELOW_COSTS",
+                    "EXPECTED_EDGE_TOO_SMALL",
+                    expected_edge_pct=risk_input.expected_edge_pct,
+                    estimated_round_trip_cost_pct=risk_input.estimated_round_trip_cost_pct,
+                )
+
         allowed_quantity = size_for_risk(
             equity=risk_input.equity,
             risk_per_trade=risk_input.risk_per_trade,
@@ -113,10 +131,14 @@ class RiskEngine:
                 decision="resize",
                 approved_quantity=allowed_quantity,
                 reason_codes=("RESIZED_FOR_RISK",),
+                expected_edge_pct=risk_input.expected_edge_pct,
+                estimated_round_trip_cost_pct=risk_input.estimated_round_trip_cost_pct,
             )
 
         return RiskDecision(
             decision="approve",
             approved_quantity=risk_input.requested_quantity,
             reason_codes=("APPROVED",),
+            expected_edge_pct=risk_input.expected_edge_pct,
+            estimated_round_trip_cost_pct=risk_input.estimated_round_trip_cost_pct,
         )

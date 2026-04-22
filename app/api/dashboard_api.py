@@ -14,6 +14,12 @@ from pydantic import BaseModel, Field, model_validator
 from app.api.dependencies import DashboardDataAccess, get_dashboard_data_access
 from app.config import Settings, get_settings
 from app.monitoring.metrics import build_performance_analytics
+from app.monitoring.trade_quality import (
+    HoldTimeDistributionSummary,
+    TradeQualityAnalytics,
+    TradeQualityDetail,
+    build_trade_quality_analytics,
+)
 from app.monitoring.health import HealthStatus
 from app.storage.models import (
     DailyPnlRecord,
@@ -279,6 +285,81 @@ class PerformanceAnalyticsResponse(BaseModel):
     current_drawdown: Decimal
 
 
+class TradeQualityQueryParams(BaseModel):
+    """Query parameters for symbol-scoped trade-quality analytics."""
+
+    symbol: str
+    start_date: date | None = None
+    end_date: date | None = None
+    limit: int = Field(default=5, ge=1, le=50)
+    offset: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "TradeQualityQueryParams":
+        """Validate the requested trade-quality filters."""
+
+        if self.end_date is not None and self.start_date is not None and self.end_date < self.start_date:
+            raise ValueError("end_date must be greater than or equal to start_date")
+        self.symbol = self.symbol.upper()
+        return self
+
+
+class HoldTimeDistributionResponse(BaseModel):
+    """Serialized hold-time distribution summary."""
+
+    average_seconds: int | None = None
+    median_seconds: int | None = None
+    p75_seconds: int | None = None
+    max_seconds: int | None = None
+
+
+class TradeQualityDetailResponse(BaseModel):
+    """Serialized attribution details for one closed trade."""
+
+    order_id: str
+    symbol: str
+    entry_time: datetime
+    exit_time: datetime
+    quantity: Decimal
+    entry_price: Decimal
+    exit_price: Decimal
+    realized_pnl: Decimal
+    hold_seconds: int
+    mfe_pct: Decimal
+    mae_pct: Decimal
+    captured_move_pct: Decimal
+    giveback_pct: Decimal
+    entry_quality_score: Decimal
+    exit_quality_score: Decimal
+
+
+class TradeQualitySummaryResponse(BaseModel):
+    """Symbol/date-scoped trade-quality summary metrics."""
+
+    total_closed_trades: int
+    average_mfe_pct: Decimal | None = None
+    average_mae_pct: Decimal | None = None
+    average_captured_move_pct: Decimal | None = None
+    average_giveback_pct: Decimal | None = None
+    average_entry_quality_score: Decimal | None = None
+    average_exit_quality_score: Decimal | None = None
+    longest_no_trade_seconds: int | None = None
+    hold_time_distribution: HoldTimeDistributionResponse
+
+
+class TradeQualityResponse(BaseModel):
+    """Trade-quality summary plus recent attribution details."""
+
+    symbol: str
+    start_date: date | None = None
+    end_date: date | None = None
+    total_details: int
+    limit: int
+    offset: int
+    summary: TradeQualitySummaryResponse
+    details: list[TradeQualityDetailResponse]
+
+
 def _to_trade_response(record: TradeRecord) -> TradeResponse:
     """Convert a trade record to a response model."""
 
@@ -350,6 +431,54 @@ def _to_drawdown_response(record: DrawdownSummary) -> DrawdownResponse:
         max_drawdown=record.max_drawdown,
         max_drawdown_pct=record.max_drawdown_pct,
         points=[_to_drawdown_point_response(point) for point in record.points],
+    )
+
+
+def _to_hold_time_distribution_response(record: HoldTimeDistributionSummary) -> HoldTimeDistributionResponse:
+    """Convert a hold-time summary into a response model."""
+
+    return HoldTimeDistributionResponse(**asdict(record))
+
+
+def _to_trade_quality_detail_response(record: TradeQualityDetail) -> TradeQualityDetailResponse:
+    """Convert one trade-quality detail into a response model."""
+
+    return TradeQualityDetailResponse(**asdict(record))
+
+
+def _to_trade_quality_response(
+    *,
+    symbol: str,
+    start_date: date | None,
+    end_date: date | None,
+    limit: int,
+    offset: int,
+    analytics: TradeQualityAnalytics,
+) -> TradeQualityResponse:
+    """Convert trade-quality analytics into an API response."""
+
+    paged_details = analytics.details[offset: offset + limit]
+    return TradeQualityResponse(
+        symbol=symbol,
+        start_date=start_date,
+        end_date=end_date,
+        total_details=len(analytics.details),
+        limit=limit,
+        offset=offset,
+        summary=TradeQualitySummaryResponse(
+            total_closed_trades=analytics.summary.total_closed_trades,
+            average_mfe_pct=analytics.summary.average_mfe_pct,
+            average_mae_pct=analytics.summary.average_mae_pct,
+            average_captured_move_pct=analytics.summary.average_captured_move_pct,
+            average_giveback_pct=analytics.summary.average_giveback_pct,
+            average_entry_quality_score=analytics.summary.average_entry_quality_score,
+            average_exit_quality_score=analytics.summary.average_exit_quality_score,
+            longest_no_trade_seconds=analytics.summary.longest_no_trade_seconds,
+            hold_time_distribution=_to_hold_time_distribution_response(
+                analytics.summary.hold_time_distribution
+            ),
+        ),
+        details=[_to_trade_quality_detail_response(record) for record in paged_details],
     )
 
 
@@ -613,6 +742,36 @@ def get_performance_analytics(
         symbol_realized_pnl=analytics.symbol_realized_pnl,
         max_drawdown=analytics.max_drawdown,
         current_drawdown=analytics.current_drawdown,
+    )
+
+
+@router.get("/performance/trade-quality", response_model=TradeQualityResponse)
+def get_trade_quality_analytics(
+    query: Annotated[TradeQualityQueryParams, Depends()],
+    data_access: Annotated[DashboardDataAccess, Depends(get_dashboard_data_access)],
+) -> TradeQualityResponse:
+    """Return symbol/date-scoped trade-quality attribution analytics."""
+
+    analytics = build_trade_quality_analytics(
+        trades=data_access.get_trades(
+            symbol=query.symbol,
+            start_date=None,
+            end_date=query.end_date,
+        ),
+        candles=data_access.get_market_candles(
+            symbol=query.symbol,
+            end_date=query.end_date,
+        ),
+        start_date=query.start_date,
+        end_date=query.end_date,
+    )
+    return _to_trade_quality_response(
+        symbol=query.symbol,
+        start_date=query.start_date,
+        end_date=query.end_date,
+        limit=query.limit,
+        offset=query.offset,
+        analytics=analytics,
     )
 
 

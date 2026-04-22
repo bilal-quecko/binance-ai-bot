@@ -14,6 +14,7 @@ from app.ai import AIOutcomeEvaluator
 from app.bot import BotStatus, PaperBotRuntime, WorkstationState
 from app.config import Settings, get_settings
 from app.exchange.symbol_service import SpotSymbolRecord, SpotSymbolService
+from app.runner.models import TradeReadiness
 from app.storage import StorageRepository
 
 router = APIRouter()
@@ -41,12 +42,17 @@ class BotStatusResponse(BaseModel):
     """Serialized paper-bot runtime status."""
 
     state: str
+    mode: str
     symbol: str | None = None
     timeframe: str
     paper_only: bool
+    session_id: str | None = None
     started_at: datetime | None = None
     last_event_time: datetime | None = None
     last_error: str | None = None
+    recovered_from_prior_session: bool = False
+    broker_state_restored: bool = False
+    recovery_message: str | None = None
 
 
 class CandleSummaryResponse(BaseModel):
@@ -141,6 +147,25 @@ class AISignalResponse(BaseModel):
     features: AIFeatureResponse
 
 
+class TradeReadinessResponse(BaseModel):
+    """Serialized deterministic trade-readiness state."""
+
+    selected_symbol: str
+    runtime_active: bool
+    mode: str
+    enough_candle_history: bool
+    deterministic_entry_signal: bool
+    deterministic_exit_signal: bool
+    risk_ready: bool
+    risk_blocked: bool
+    broker_ready: bool
+    next_action: str
+    reason_if_not_trading: str | None = None
+    risk_reason_codes: tuple[str, ...] = ()
+    expected_edge_pct: Decimal | None = None
+    estimated_round_trip_cost_pct: Decimal | None = None
+
+
 class AISignalHistoryResponse(BaseModel):
     """Paginated AI advisory history for one symbol."""
 
@@ -208,6 +233,7 @@ class WorkstationResponse(BaseModel):
     current_candle: CandleSummaryResponse | None = None
     top_of_book: TopOfBookResponse | None = None
     feature: FeatureSummaryResponse | None = None
+    trade_readiness: TradeReadinessResponse
     ai_signal: AISignalResponse | None = None
     trend_bias: str | None = None
     entry_signal: SignalSummaryResponse | None = None
@@ -229,6 +255,7 @@ def _empty_workstation_state(symbol: str) -> WorkstationState:
         market_snapshot=None,
         feature_snapshot=None,
         ai_signal=None,
+        trade_readiness=None,
         entry_signal=None,
         exit_signal=None,
         current_position=None,
@@ -432,12 +459,88 @@ def _to_status_response(status: BotStatus) -> BotStatusResponse:
 
     return BotStatusResponse(
         state=status.state,
+        mode=status.mode,
         symbol=status.symbol,
         timeframe=status.timeframe,
         paper_only=status.paper_only,
+        session_id=status.session_id,
         started_at=status.started_at,
         last_event_time=status.last_event_time,
         last_error=status.last_error,
+        recovered_from_prior_session=status.recovered_from_prior_session,
+        broker_state_restored=status.broker_state_restored,
+        recovery_message=status.recovery_message,
+    )
+
+
+def _default_trade_readiness_response(symbol: str, status: BotStatus) -> TradeReadinessResponse:
+    """Return a neutral deterministic readiness payload for one symbol."""
+
+    runtime_active = status.symbol == symbol and status.state in {"running", "paused"}
+    return TradeReadinessResponse(
+        selected_symbol=symbol,
+        runtime_active=runtime_active,
+        mode=status.mode,
+        enough_candle_history=False,
+        deterministic_entry_signal=False,
+        deterministic_exit_signal=False,
+        risk_ready=False,
+        risk_blocked=False,
+        broker_ready=runtime_active and status.paper_only,
+        next_action=(
+            "resume_runtime"
+            if status.recovered_from_prior_session and status.symbol == symbol and status.mode == "paused"
+            else ("start_runtime" if not runtime_active else "wait_for_history")
+        ),
+        reason_if_not_trading=(
+            status.recovery_message
+            if status.recovered_from_prior_session and status.symbol == symbol and status.mode == "paused"
+            else (
+                f"Start the live runtime for {symbol} before auto paper trading can act."
+                if not runtime_active
+                else f"Waiting for enough closed candle history to build deterministic signals for {symbol}."
+            )
+        ),
+        risk_reason_codes=(),
+    )
+
+
+def _to_trade_readiness_response(
+    readiness: TradeReadiness | None,
+    *,
+    symbol: str,
+    status: BotStatus,
+) -> TradeReadinessResponse:
+    """Convert deterministic readiness to an API response with recovery-aware messaging."""
+
+    if readiness is None:
+        return _default_trade_readiness_response(symbol, status)
+
+    next_action = readiness.next_action
+    reason_if_not_trading = readiness.reason_if_not_trading
+    if (
+        status.recovered_from_prior_session
+        and status.symbol == symbol
+        and status.mode == "paused"
+    ):
+        next_action = "resume_runtime"
+        reason_if_not_trading = status.recovery_message
+
+    return TradeReadinessResponse(
+        selected_symbol=readiness.selected_symbol,
+        runtime_active=readiness.runtime_active,
+        mode=readiness.mode,
+        enough_candle_history=readiness.enough_candle_history,
+        deterministic_entry_signal=readiness.deterministic_entry_signal,
+        deterministic_exit_signal=readiness.deterministic_exit_signal,
+        risk_ready=readiness.risk_ready,
+        risk_blocked=readiness.risk_blocked,
+        broker_ready=readiness.broker_ready,
+        next_action=next_action,
+        reason_if_not_trading=reason_if_not_trading,
+        risk_reason_codes=readiness.risk_reason_codes,
+        expected_edge_pct=readiness.expected_edge_pct,
+        estimated_round_trip_cost_pct=readiness.estimated_round_trip_cost_pct,
     )
 
 
@@ -626,6 +729,11 @@ def _to_workstation_response(
             )
             if feature_snapshot is not None
             else None
+        ),
+        trade_readiness=_to_trade_readiness_response(
+            state.trade_readiness,
+            symbol=state.symbol,
+            status=status,
         ),
         ai_signal=(
             _to_ai_signal_response(

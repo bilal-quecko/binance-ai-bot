@@ -15,6 +15,7 @@
   PnlHistoryResponse,
   PerformanceAnalyticsResponse,
   PositionItem,
+  TradeQualityResponse,
   WorkstationResponse,
   RangeFilters,
   SpotSymbolItem,
@@ -93,6 +94,17 @@ export function getPerformanceAnalytics(
   const params = buildRangeParams(filters);
   params.set('symbol', symbol.trim().toUpperCase());
   return requestJson<PerformanceAnalyticsResponse>('/performance', params);
+}
+
+export function getTradeQualityAnalytics(
+  symbol: string,
+  filters?: RangeFilters,
+): Promise<TradeQualityResponse> {
+  const params = buildRangeParams(filters);
+  params.set('symbol', symbol.trim().toUpperCase());
+  params.set('limit', '5');
+  params.set('offset', '0');
+  return requestJson<TradeQualityResponse>('/performance/trade-quality', params);
 }
 
 export function getEquity(): Promise<EquityResponse> {

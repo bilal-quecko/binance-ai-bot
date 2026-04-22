@@ -15,7 +15,7 @@ from app.paper.broker import PaperBroker
 from app.paper.models import FillResult, OrderRequest, Position
 from app.risk.limits import RiskEngine
 from app.risk.models import RiskDecision, RiskInput
-from app.runner.models import RunnerConfig, RunnerCycleResult
+from app.runner.models import RunnerConfig, RunnerCycleResult, TradeReadiness
 from app.storage.repositories import StorageRepository
 from app.strategies.models import StrategySignal
 from app.strategies.trend_following import TrendFollowingStrategy
@@ -148,10 +148,154 @@ class StrategyRunner:
             )
         return self._strategy.evaluate(feature_snapshot, position=position)
 
+    def preview_risk_decision(self, symbol: str) -> RiskDecision | None:
+        """Return the current risk decision preview for the next actionable signal."""
+
+        normalized_symbol = symbol.upper()
+        feature_snapshot = self.get_feature_snapshot(normalized_symbol)
+        if feature_snapshot is None:
+            return None
+        position = self._broker.get_position(normalized_symbol)
+        actionable_signal = (
+            self._strategy.evaluate(feature_snapshot, position=position)
+            if position is not None and position.quantity > Decimal("0")
+            else self._strategy.evaluate(feature_snapshot, position=None)
+        )
+        if actionable_signal.side not in {"BUY", "SELL"}:
+            return None
+        return self._risk_engine.evaluate(
+            self._build_risk_input(feature_snapshot, actionable_signal, position)
+        )
+
+    def preview_trade_readiness(
+        self,
+        symbol: str,
+        *,
+        runtime_active: bool,
+        mode: str,
+    ) -> TradeReadiness:
+        """Return deterministic trade-readiness state for one symbol."""
+
+        normalized_symbol = symbol.upper()
+        broker_ready = self._config.mode == "paper"
+        if not runtime_active:
+            return TradeReadiness(
+                selected_symbol=normalized_symbol,
+                runtime_active=False,
+                mode=mode,
+                enough_candle_history=False,
+                deterministic_entry_signal=False,
+                deterministic_exit_signal=False,
+                risk_ready=False,
+                risk_blocked=False,
+                broker_ready=broker_ready,
+                next_action="start_runtime",
+                reason_if_not_trading=f"Start the live runtime for {normalized_symbol} before auto paper trading can act.",
+                risk_reason_codes=(),
+            )
+
+        feature_snapshot = self.get_feature_snapshot(normalized_symbol)
+        if feature_snapshot is None:
+            return TradeReadiness(
+                selected_symbol=normalized_symbol,
+                runtime_active=True,
+                mode=mode,
+                enough_candle_history=False,
+                deterministic_entry_signal=False,
+                deterministic_exit_signal=False,
+                risk_ready=False,
+                risk_blocked=False,
+                broker_ready=broker_ready,
+                next_action="wait_for_history",
+                reason_if_not_trading=f"Waiting for enough closed candle history to build deterministic signals for {normalized_symbol}.",
+                risk_reason_codes=(),
+            )
+
+        position = self._broker.get_position(normalized_symbol)
+        entry_signal = self._strategy.evaluate(feature_snapshot, position=None)
+        exit_signal = self.preview_exit_signal(normalized_symbol)
+        actionable_signal = (
+            exit_signal
+            if exit_signal is not None and exit_signal.side == "SELL"
+            else entry_signal
+        )
+        risk_decision = None
+        if actionable_signal.side in {"BUY", "SELL"}:
+            risk_decision = self._risk_engine.evaluate(
+                self._build_risk_input(feature_snapshot, actionable_signal, position)
+            )
+
+        deterministic_entry_signal = entry_signal.side == "BUY"
+        deterministic_exit_signal = exit_signal is not None and exit_signal.side == "SELL"
+        risk_ready = risk_decision is not None and risk_decision.decision in {"approve", "resize"}
+        risk_blocked = risk_decision is not None and risk_decision.decision == "reject"
+
+        next_action = "wait"
+        reason_if_not_trading: str | None = None
+        if deterministic_exit_signal:
+            if risk_ready and mode == "auto_paper":
+                next_action = "exit"
+            elif risk_blocked:
+                next_action = "blocked"
+                reason_if_not_trading = self._reason_if_not_trading(
+                    risk_decision.reason_codes,
+                    normalized_symbol,
+                )
+            else:
+                next_action = "resume_auto_trade"
+                reason_if_not_trading = "An exit signal exists, but auto paper trading is paused."
+        elif deterministic_entry_signal:
+            if risk_ready and mode == "auto_paper":
+                next_action = "enter"
+            elif risk_blocked:
+                next_action = "blocked"
+                reason_if_not_trading = self._reason_if_not_trading(
+                    risk_decision.reason_codes,
+                    normalized_symbol,
+                )
+            else:
+                next_action = "resume_auto_trade"
+                reason_if_not_trading = "An entry signal exists, but auto paper trading is paused."
+        elif position is not None and position.quantity > Decimal("0"):
+            next_action = "hold"
+            reason_if_not_trading = "A paper position is open, and deterministic exit conditions are not active yet."
+        else:
+            next_action = "wait"
+            reason_if_not_trading = "Deterministic entry conditions are not active yet."
+
+        return TradeReadiness(
+            selected_symbol=normalized_symbol,
+            runtime_active=True,
+            mode=mode,
+            enough_candle_history=True,
+            deterministic_entry_signal=deterministic_entry_signal,
+            deterministic_exit_signal=deterministic_exit_signal,
+            risk_ready=risk_ready,
+            risk_blocked=risk_blocked,
+            broker_ready=broker_ready,
+            next_action=next_action,
+            reason_if_not_trading=reason_if_not_trading,
+            risk_reason_codes=risk_decision.reason_codes if risk_decision is not None else (),
+            expected_edge_pct=risk_decision.expected_edge_pct if risk_decision is not None else None,
+            estimated_round_trip_cost_pct=(
+                risk_decision.estimated_round_trip_cost_pct if risk_decision is not None else None
+            ),
+        )
+
     def get_current_position(self, symbol: str) -> Position | None:
         """Return the current broker position for a symbol."""
 
         return self._broker.get_position(symbol.upper())
+
+    def get_open_positions(self) -> dict[str, Position]:
+        """Return all current broker positions for recovery snapshots."""
+
+        return self._broker.positions()
+
+    def get_balances(self) -> dict[str, Decimal]:
+        """Return current broker balances for recovery snapshots."""
+
+        return self._broker.balances()
 
     def get_last_cycle_result(self, symbol: str) -> RunnerCycleResult | None:
         """Return the latest processed cycle result for a symbol."""
@@ -196,6 +340,25 @@ class StrategyRunner:
             top_of_book=self._top_of_book_by_symbol.get(symbol),
         )
 
+    @staticmethod
+    def _reason_if_not_trading(reason_codes: tuple[str, ...], symbol: str) -> str:
+        """Return a human-readable deterministic block reason."""
+
+        primary = reason_codes[0] if reason_codes else ""
+        if primary == "EDGE_BELOW_COSTS":
+            return f"Expected edge for {symbol} is too small after estimated fees and slippage."
+        if primary == "DAILY_LOSS_LIMIT":
+            return "Daily loss protection is active, so new entries are blocked."
+        if primary == "OPEN_POSITION_LIMIT":
+            return "The maximum open-position limit has been reached."
+        if primary == "STOP_DISTANCE_TOO_TIGHT":
+            return "The protective stop is too tight relative to the current price."
+        if primary == "SIZE_BELOW_MINIMUM":
+            return "The risk-sized quantity falls below the configured minimum executable size."
+        if primary == "NO_POSITION_TO_EXIT":
+            return "There is no open paper position to exit for this symbol."
+        return ", ".join(reason_codes) if reason_codes else f"The deterministic path for {symbol} is still waiting."
+
     def _build_risk_input(
         self,
         feature_snapshot: FeatureSnapshot,
@@ -216,6 +379,21 @@ class StrategyRunner:
         if signal.side == "SELL":
             requested_quantity = position.quantity if position is not None else Decimal("0")
 
+        expected_edge_pct: Decimal | None = None
+        if (
+            signal.side == "BUY"
+            and feature_snapshot.atr is not None
+            and entry_price > Decimal("0")
+            and hasattr(self._strategy, "config")
+        ):
+            take_profit_multiple = self._strategy.config.take_profit_atr_multiple
+            expected_edge_pct = (
+                (feature_snapshot.atr * take_profit_multiple) / entry_price
+            )
+        estimated_round_trip_cost_pct = (
+            (self._broker.fee_rate * Decimal("2")) + (self._broker.slippage_pct * Decimal("2"))
+        )
+
         return RiskInput(
             signal=signal,
             entry_price=entry_price,
@@ -227,6 +405,9 @@ class StrategyRunner:
             current_position_quantity=position.quantity if position is not None else Decimal("0"),
             stop_price=stop_price,
             volatility=feature_snapshot.atr,
+            expected_edge_pct=expected_edge_pct,
+            estimated_round_trip_cost_pct=estimated_round_trip_cost_pct,
+            min_expected_edge_buffer_pct=self._config.min_expected_edge_buffer_pct,
             risk_per_trade=self._config.risk_per_trade,
             max_daily_loss=self._config.max_daily_loss,
             max_open_positions=self._config.max_open_positions,

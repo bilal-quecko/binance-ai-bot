@@ -9,6 +9,8 @@ import { MetricCard } from './components/MetricCard';
 import { PerformanceAnalyticsSection } from './components/PerformanceAnalyticsSection';
 import { SectionCard } from './components/SectionCard';
 import { StatePanel } from './components/StatePanel';
+import { TradeReadinessPanel } from './components/TradeReadinessPanel';
+import { TradeQualitySection } from './components/TradeQualitySection';
 import {
   getAISignalEvaluation,
   getAISignal,
@@ -16,6 +18,7 @@ import {
   getBotStatus,
   getHealth,
   getPerformanceAnalytics,
+  getTradeQualityAnalytics,
   getSymbols,
   getWorkstation,
   pauseBot,
@@ -34,6 +37,7 @@ import type {
   HealthResponse,
   PerformanceAnalyticsResponse,
   SpotSymbolItem,
+  TradeQualityResponse,
   WorkstationResponse,
 } from './lib/types';
 
@@ -48,12 +52,17 @@ type WorkstationTab = 'signal' | 'auto-trade';
 
 const INITIAL_BOT_STATUS: BotStatusResponse = {
   state: 'stopped',
+  mode: 'stopped',
   symbol: null,
   timeframe: '1m',
   paper_only: true,
+  session_id: null,
   started_at: null,
   last_event_time: null,
   last_error: null,
+  recovered_from_prior_session: false,
+  broker_state_restored: false,
+  recovery_message: null,
 };
 
 const INITIAL_WORKSTATION: WorkstationResponse | null = null;
@@ -68,6 +77,7 @@ const INITIAL_AI_HISTORY: AISignalHistoryResponse = {
 };
 const INITIAL_AI_EVALUATION: AIOutcomeEvaluationResponse | null = null;
 const INITIAL_PERFORMANCE: PerformanceAnalyticsResponse | null = null;
+const INITIAL_TRADE_QUALITY: TradeQualityResponse | null = null;
 
 function createRemoteState<T>(data: T): RemoteState<T> {
   return {
@@ -110,6 +120,7 @@ function App() {
   const [aiHistory, setAiHistory] = useState<RemoteState<AISignalHistoryResponse>>(createRemoteState(INITIAL_AI_HISTORY));
   const [aiEvaluation, setAiEvaluation] = useState<RemoteState<AIOutcomeEvaluationResponse | null>>(createRemoteState(INITIAL_AI_EVALUATION));
   const [performanceAnalytics, setPerformanceAnalytics] = useState<RemoteState<PerformanceAnalyticsResponse | null>>(createRemoteState(INITIAL_PERFORMANCE));
+  const [tradeQualityAnalytics, setTradeQualityAnalytics] = useState<RemoteState<TradeQualityResponse | null>>(createRemoteState(INITIAL_TRADE_QUALITY));
   const [symbolResults, setSymbolResults] = useState<RemoteState<SpotSymbolItem[]>>(createRemoteState<SpotSymbolItem[]>([]));
 
   const [selectedSymbol, setSelectedSymbol] = useState('');
@@ -129,34 +140,35 @@ function App() {
   }, []);
 
   const refreshWorkspace = useCallback(async (symbol: string) => {
+    const requestedSymbol = symbol.trim().toUpperCase();
     setHealth((current) => setPending(current));
     setBotStatus((current) => setPending(current));
-    if (symbol.trim().length > 0) {
-      setWorkstation((current) => setPending(current));
-      setAiSignal((current) => setPending(current));
-      setAiHistory((current) => setPending(current));
-      setAiEvaluation((current) => setPending(current));
-      setPerformanceAnalytics((current) => setPending(current));
-    } else {
-      setWorkstation({ data: null, loading: false, refreshing: false, error: null });
-      setAiSignal({ data: null, loading: false, refreshing: false, error: null });
-      setAiHistory({ data: INITIAL_AI_HISTORY, loading: false, refreshing: false, error: null });
-      setAiEvaluation({ data: null, loading: false, refreshing: false, error: null });
-      setPerformanceAnalytics({ data: null, loading: false, refreshing: false, error: null });
-    }
+    setWorkstation((current) => setPending(current));
+    setAiSignal((current) => setPending(current));
+    setAiHistory((current) => setPending(current));
+    setAiEvaluation((current) => setPending(current));
+    setPerformanceAnalytics((current) => setPending(current));
+    setTradeQualityAnalytics((current) => setPending(current));
 
     try {
-      const [healthData, botStatusData, workstationData, aiSignalData, aiHistoryData, aiEvaluationData, performanceData] = await Promise.all([
-        getHealth(),
-        getBotStatus(),
-        symbol.trim().length > 0 ? getWorkstation(symbol) : Promise.resolve<WorkstationResponse | null>(null),
-        symbol.trim().length > 0 ? getAISignal(symbol) : Promise.resolve<AISignalSummary | null>(null),
-        symbol.trim().length > 0
-          ? getAISignalHistory(symbol, { limit: INITIAL_AI_HISTORY.limit, offset: 0 })
+      const [healthData, botStatusData] = await Promise.all([getHealth(), getBotStatus()]);
+      const resolvedSymbol = requestedSymbol || botStatusData.symbol || '';
+      if (!requestedSymbol && botStatusData.symbol) {
+        setSelectedSymbol(botStatusData.symbol);
+        setSymbolSearch(botStatusData.symbol);
+      }
+
+      const [workstationData, aiSignalData, aiHistoryData, aiEvaluationData, performanceData, tradeQualityData] = await Promise.all([
+        resolvedSymbol ? getWorkstation(resolvedSymbol) : Promise.resolve<WorkstationResponse | null>(null),
+        resolvedSymbol ? getAISignal(resolvedSymbol) : Promise.resolve<AISignalSummary | null>(null),
+        resolvedSymbol
+          ? getAISignalHistory(resolvedSymbol, { limit: INITIAL_AI_HISTORY.limit, offset: 0 })
           : Promise.resolve<AISignalHistoryResponse>(INITIAL_AI_HISTORY),
-        symbol.trim().length > 0 ? getAISignalEvaluation(symbol) : Promise.resolve<AIOutcomeEvaluationResponse | null>(null),
-        symbol.trim().length > 0 ? getPerformanceAnalytics(symbol) : Promise.resolve<PerformanceAnalyticsResponse | null>(null),
+        resolvedSymbol ? getAISignalEvaluation(resolvedSymbol) : Promise.resolve<AIOutcomeEvaluationResponse | null>(null),
+        resolvedSymbol ? getPerformanceAnalytics(resolvedSymbol) : Promise.resolve<PerformanceAnalyticsResponse | null>(null),
+        resolvedSymbol ? getTradeQualityAnalytics(resolvedSymbol) : Promise.resolve<TradeQualityResponse | null>(null),
       ]);
+
       setHealth({ data: healthData, loading: false, refreshing: false, error: null });
       setBotStatus({ data: botStatusData, loading: false, refreshing: false, error: null });
       setWorkstation({ data: workstationData, loading: false, refreshing: false, error: null });
@@ -164,6 +176,7 @@ function App() {
       setAiHistory({ data: aiHistoryData, loading: false, refreshing: false, error: null });
       setAiEvaluation({ data: aiEvaluationData, loading: false, refreshing: false, error: null });
       setPerformanceAnalytics({ data: performanceData, loading: false, refreshing: false, error: null });
+      setTradeQualityAnalytics({ data: tradeQualityData, loading: false, refreshing: false, error: null });
       setLastUpdatedAt(new Date());
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to refresh workstation state.';
@@ -175,6 +188,7 @@ function App() {
         setAiHistory((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setAiEvaluation((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setPerformanceAnalytics((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setTradeQualityAnalytics((current) => ({ ...current, loading: false, refreshing: false, error: message }));
       }
     }
   }, []);
@@ -220,6 +234,7 @@ function App() {
     setAiHistory({ data: INITIAL_AI_HISTORY, loading: false, refreshing: false, error: null });
     setAiEvaluation({ data: null, loading: false, refreshing: false, error: null });
     setPerformanceAnalytics({ data: null, loading: false, refreshing: false, error: null });
+    setTradeQualityAnalytics({ data: null, loading: false, refreshing: false, error: null });
   }, []);
 
   const runBotAction = useCallback(async (action: () => Promise<BotStatusResponse>) => {
@@ -252,6 +267,7 @@ function App() {
       setAiHistory({ data: INITIAL_AI_HISTORY, loading: false, refreshing: false, error: null });
       setAiEvaluation({ data: null, loading: false, refreshing: false, error: null });
       setPerformanceAnalytics({ data: null, loading: false, refreshing: false, error: null });
+      setTradeQualityAnalytics({ data: null, loading: false, refreshing: false, error: null });
       setLastUpdatedAt(new Date());
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to reset the paper session.';
@@ -279,6 +295,7 @@ function App() {
   const workstationStatusMessage = effectiveWorkstation?.status_message ?? (selectedSymbol ? `Start or attach the live runtime for ${selectedSymbol} to populate symbol-scoped workstation data.` : 'Select one symbol to populate the workstation.');
   const signalExplanation = effectiveWorkstation?.explanation ?? 'Select a symbol, then start or pause the live paper runtime to populate live signal state.';
   const refreshLabel = autoRefreshSeconds === 0 ? 'Off' : `${autoRefreshSeconds}s`;
+  const readiness = effectiveWorkstation?.trade_readiness ?? null;
 
   return (
     <div className="min-h-screen bg-transparent text-slate-100">
@@ -394,6 +411,7 @@ function App() {
                           value={effectiveWorkstation.last_price ? formatCurrency(effectiveWorkstation.last_price) : '-'}
                           helper={formatDateTime(effectiveWorkstation.last_market_event)}
                         />
+                        <MetricCard label="Runtime Mode" value={effectiveWorkstation.runtime_status.mode} helper={effectiveWorkstation.runtime_status.session_id ? `Session ${effectiveWorkstation.runtime_status.session_id}` : 'No active runtime session'} />
                         <MetricCard label="Trend / Bias" value={trendLabel} helper={effectiveWorkstation.feature?.regime ?? 'No regime yet'} />
                         <MetricCard
                           label="Current Candle"
@@ -424,6 +442,10 @@ function App() {
                           </div>
                           <p className="mt-3 text-sm text-slate-300">{effectiveWorkstation.exit_signal?.reason_codes.join(', ') || 'No exit context yet'}</p>
                         </div>
+                      </div>
+
+                      <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                        <TradeReadinessPanel symbol={selectedSymbol} readiness={readiness} compact />
                       </div>
 
                       <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
@@ -468,11 +490,12 @@ function App() {
                   )}
 
                   <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
-                    <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">AI Signal</p>
+                    <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">AI Advisory</p>
                     {aiSignal.error ? (
                       <StatePanel title="AI signal unavailable" message={aiSignal.error} tone="error" />
                     ) : effectiveAiSignal ? (
                       <div className="mt-3 space-y-4">
+                        <p className="text-xs uppercase tracking-[0.16em] text-slate-500">Advisory only - execution still follows deterministic strategy plus risk gating.</p>
                         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
                           <MetricCard label="Bias" value={effectiveAiSignal.bias} helper="Probable market direction" />
                           <MetricCard label="Confidence" value={`${effectiveAiSignal.confidence}%`} helper={formatDateTime(effectiveAiSignal.timestamp)} />
@@ -522,6 +545,7 @@ function App() {
               ) : (
                 <div className="grid gap-4">
                   <MetricCard label="Runtime Status" value={botStatus.data.state} helper={`Timeframe ${botStatus.data.timeframe}`} />
+                  <MetricCard label="Runtime Mode" value={botStatus.data.mode} helper={botStatus.data.session_id ? `Session ${botStatus.data.session_id}` : 'No active session'} />
                   <MetricCard label="Selected Symbol" value={selectedSymbol} helper={effectiveWorkstation?.is_runtime_symbol ? 'Connected to live runtime' : 'Not running for this symbol'} />
                   <MetricCard label="Last Market Event" value={formatDateTime(effectiveWorkstation?.last_market_event ?? botStatus.data.last_event_time)} helper="Latest live market timestamp" />
                   <MetricCard label="Session Error" value={botStatus.data.last_error ?? '-'} helper="Most recent runtime error, if any" />
@@ -590,12 +614,26 @@ function App() {
                   </div>
 
                   <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <TradeReadinessPanel symbol={selectedSymbol} readiness={readiness} />
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
                     <PerformanceAnalyticsSection
                       symbol={selectedSymbol}
                       analytics={performanceAnalytics.data}
                       loading={performanceAnalytics.loading}
                       refreshing={performanceAnalytics.refreshing}
                       error={performanceAnalytics.error}
+                    />
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <TradeQualitySection
+                      symbol={selectedSymbol}
+                      analytics={tradeQualityAnalytics.data}
+                      loading={tradeQualityAnalytics.loading}
+                      refreshing={tradeQualityAnalytics.refreshing}
+                      error={tradeQualityAnalytics.error}
                     />
                   </div>
                 </div>
@@ -606,6 +644,7 @@ function App() {
               <div className="grid gap-4">
                 <MetricCard label="API Health" value={health.data?.status ?? 'loading'} helper={health.data?.mode ?? 'paper'} />
                 <MetricCard label="Runtime Symbol" value={botStatus.data.symbol ?? '-'} helper={`Selected ${selectedSymbol || '-'}`} />
+                <MetricCard label="Next Bot Action" value={readiness?.next_action ?? 'wait'} helper={readiness?.reason_if_not_trading ?? 'Deterministic readiness is shown in the Auto Trade panel.'} />
                 <MetricCard label="Selected Symbol Session" value={effectiveWorkstation?.is_runtime_symbol ? 'Live' : 'Idle'} helper={effectiveWorkstation?.is_runtime_symbol ? 'Receiving live updates' : 'No current runtime for selected symbol'} />
                 <MetricCard label="Realized PnL" value={formatCurrency(effectiveWorkstation?.realized_pnl ?? '0')} tone={Number(effectiveWorkstation?.realized_pnl ?? '0') >= 0 ? 'positive' : 'negative'} />
               </div>

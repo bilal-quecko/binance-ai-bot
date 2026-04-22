@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from app.api.dashboard_api import get_dashboard_data_access
 from app.api.dependencies import DashboardDataAccess
 from app.main import app
+from app.market_data.candles import Candle
 from app.paper.models import FillResult, Position
 from app.risk.models import RiskDecision
 from app.storage import StorageRepository
@@ -150,6 +151,32 @@ def _seed_repository(repository: StorageRepository) -> None:
         payload={"side": "BUY", "reason_codes": ("BULLISH_TREND",)},
         event_time=next_day,
     )
+    candle_inputs = (
+        ("BTCUSDT", base_time, Decimal("100"), Decimal("100")),
+        ("BTCUSDT", base_time + timedelta(minutes=1), Decimal("112"), Decimal("112")),
+        ("BTCUSDT", next_day, Decimal("120"), Decimal("120")),
+        ("BTCUSDT", next_day + timedelta(minutes=1), Decimal("125"), Decimal("125")),
+        ("ETHUSDT", base_time + timedelta(minutes=2), Decimal("105"), Decimal("105")),
+        ("ETHUSDT", base_time + timedelta(minutes=3), Decimal("100"), Decimal("100")),
+    )
+    for symbol, open_time, close_price, close_value in candle_inputs:
+        repository.insert_market_candle_snapshot(
+            Candle(
+                symbol=symbol,
+                timeframe="1m",
+                open=close_value,
+                high=close_value,
+                low=close_value,
+                close=close_price,
+                volume=Decimal("1"),
+                quote_volume=close_price,
+                open_time=open_time,
+                close_time=open_time + timedelta(minutes=1),
+                event_time=open_time + timedelta(minutes=1),
+                trade_count=1,
+                is_closed=True,
+            )
+        )
 
 
 def _make_client(db_path: Path) -> TestClient:
@@ -183,6 +210,7 @@ def test_dashboard_api_core_endpoints() -> None:
         drawdown_response = client.get("/drawdown")
         metrics_response = client.get("/metrics")
         performance_response = client.get("/performance", params={"symbol": "BTCUSDT"})
+        trade_quality_response = client.get("/performance/trade-quality", params={"symbol": "BTCUSDT"})
     finally:
         app.dependency_overrides.clear()
 
@@ -354,6 +382,51 @@ def test_dashboard_api_core_endpoints() -> None:
         "current_drawdown": "56",
     }
 
+    assert trade_quality_response.status_code == 200
+    assert trade_quality_response.json() == {
+        "symbol": "BTCUSDT",
+        "start_date": None,
+        "end_date": None,
+        "total_details": 1,
+        "limit": 5,
+        "offset": 0,
+        "summary": {
+            "total_closed_trades": 1,
+            "average_mfe_pct": "10.00",
+            "average_mae_pct": "0.00",
+            "average_captured_move_pct": "100.00",
+            "average_giveback_pct": "0.00",
+            "average_entry_quality_score": "100.00",
+            "average_exit_quality_score": "100.00",
+            "longest_no_trade_seconds": 64740,
+            "hold_time_distribution": {
+                "average_seconds": 60,
+                "median_seconds": 60,
+                "p75_seconds": 60,
+                "max_seconds": 60,
+            },
+        },
+        "details": [
+            {
+                "order_id": "PAPER-000002",
+                "symbol": "BTCUSDT",
+                "entry_time": "2024-03-09T16:00:00Z",
+                "exit_time": "2024-03-09T16:01:00Z",
+                "quantity": "1",
+                "entry_price": "100",
+                "exit_price": "110",
+                "realized_pnl": "10",
+                "hold_seconds": 60,
+                "mfe_pct": "10.00",
+                "mae_pct": "0.00",
+                "captured_move_pct": "100.00",
+                "giveback_pct": "0.00",
+                "entry_quality_score": "100.00",
+                "exit_quality_score": "100.00",
+            }
+        ],
+    }
+
 
 def test_dashboard_api_filtering_pagination_and_summary() -> None:
     db_path = _db_path()
@@ -375,6 +448,10 @@ def test_dashboard_api_filtering_pagination_and_summary() -> None:
         performance_response = client.get(
             "/performance",
             params={"symbol": "BTCUSDT", "start_date": "2024-03-09", "end_date": "2024-03-09"},
+        )
+        trade_quality_response = client.get(
+            "/performance/trade-quality",
+            params={"symbol": "BTCUSDT", "start_date": "2024-03-09", "end_date": "2024-03-09", "limit": 1, "offset": 0},
         )
     finally:
         app.dependency_overrides.clear()
@@ -469,6 +546,11 @@ def test_dashboard_api_filtering_pagination_and_summary() -> None:
         "max_drawdown": "0",
         "current_drawdown": "0",
     }
+
+    assert trade_quality_response.status_code == 200
+    assert trade_quality_response.json()["summary"]["total_closed_trades"] == 1
+    assert trade_quality_response.json()["total_details"] == 1
+    assert trade_quality_response.json()["details"][0]["order_id"] == "PAPER-000002"
 
 
 def test_dashboard_api_uses_dependency_backed_data_access() -> None:

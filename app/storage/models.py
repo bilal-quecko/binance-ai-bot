@@ -160,3 +160,26 @@ class MarketCandleSnapshotRecord:
     close_time: datetime
     close_price: Decimal
     event_time: datetime
+
+
+@dataclass(slots=True)
+class RuntimeSessionRecord:
+    """Persisted backend-owned runtime session state."""
+
+    state: str
+    mode: str
+    symbol: str | None
+    session_id: str | None
+    started_at: datetime | None
+    last_event_time: datetime | None
+    last_error: str | None
+
+
+@dataclass(slots=True)
+class PaperBrokerStateRecord:
+    """Persisted paper broker recovery state."""
+
+    balances: dict[str, Decimal]
+    positions: list[PositionSnapshotRecord]
+    realized_pnl: Decimal
+    snapshot_time: datetime

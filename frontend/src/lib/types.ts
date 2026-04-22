@@ -12,12 +12,17 @@ export interface SpotSymbolItem {
 
 export interface BotStatusResponse {
   state: 'stopped' | 'running' | 'paused' | 'error';
+  mode: 'auto_paper' | 'paused' | 'stopped' | 'error';
   symbol: string | null;
   timeframe: string;
   paper_only: boolean;
+  session_id: string | null;
   started_at: string | null;
   last_event_time: string | null;
   last_error: string | null;
+  recovered_from_prior_session: boolean;
+  broker_state_restored: boolean;
+  recovery_message: string | null;
 }
 
 export interface CandleSummary {
@@ -72,6 +77,23 @@ export interface AISignalSummary {
   suggested_action: 'wait' | 'enter' | 'hold' | 'exit';
   explanation: string;
   features: AISignalFeatureSummary;
+}
+
+export interface TradeReadinessResponse {
+  selected_symbol: string;
+  runtime_active: boolean;
+  mode: 'auto_paper' | 'paused' | 'stopped' | 'error';
+  enough_candle_history: boolean;
+  deterministic_entry_signal: boolean;
+  deterministic_exit_signal: boolean;
+  risk_ready: boolean;
+  risk_blocked: boolean;
+  broker_ready: boolean;
+  next_action: string;
+  reason_if_not_trading: string | null;
+  risk_reason_codes: string[];
+  expected_edge_pct: DecimalString | null;
+  estimated_round_trip_cost_pct: DecimalString | null;
 }
 
 export interface AISignalHistoryResponse {
@@ -153,6 +175,7 @@ export interface WorkstationResponse {
   current_candle: CandleSummary | null;
   top_of_book: TopOfBookSummary | null;
   feature: FeatureSummary | null;
+  trade_readiness: TradeReadinessResponse;
   ai_signal: AISignalSummary | null;
   trend_bias: string | null;
   entry_signal: SignalSummary | null;
@@ -197,6 +220,54 @@ export interface PerformanceAnalyticsResponse {
   symbol_realized_pnl: DecimalString;
   max_drawdown: DecimalString;
   current_drawdown: DecimalString;
+}
+
+export interface HoldTimeDistribution {
+  average_seconds: number | null;
+  median_seconds: number | null;
+  p75_seconds: number | null;
+  max_seconds: number | null;
+}
+
+export interface TradeQualitySummary {
+  total_closed_trades: number;
+  average_mfe_pct: DecimalString | null;
+  average_mae_pct: DecimalString | null;
+  average_captured_move_pct: DecimalString | null;
+  average_giveback_pct: DecimalString | null;
+  average_entry_quality_score: DecimalString | null;
+  average_exit_quality_score: DecimalString | null;
+  longest_no_trade_seconds: number | null;
+  hold_time_distribution: HoldTimeDistribution;
+}
+
+export interface TradeQualityDetail {
+  order_id: string;
+  symbol: string;
+  entry_time: string;
+  exit_time: string;
+  quantity: DecimalString;
+  entry_price: DecimalString;
+  exit_price: DecimalString;
+  realized_pnl: DecimalString;
+  hold_seconds: number;
+  mfe_pct: DecimalString;
+  mae_pct: DecimalString;
+  captured_move_pct: DecimalString;
+  giveback_pct: DecimalString;
+  entry_quality_score: DecimalString;
+  exit_quality_score: DecimalString;
+}
+
+export interface TradeQualityResponse {
+  symbol: string;
+  start_date: string | null;
+  end_date: string | null;
+  total_details: number;
+  limit: number;
+  offset: number;
+  summary: TradeQualitySummary;
+  details: TradeQualityDetail[];
 }
 
 export interface TradeItem {

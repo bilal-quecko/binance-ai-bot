@@ -5,6 +5,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.ai.models import AIFeatureVector, AISignalSnapshot
+from app.paper.models import Position
 from app.paper.models import FillResult
 from app.risk.models import RiskDecision
 from app.storage import StorageRepository
@@ -77,9 +78,12 @@ def test_storage_repository_creates_required_tables() -> None:
         "ai_signal_snapshots",
         "fills",
         "market_candle_snapshots",
+        "paper_broker_positions",
+        "paper_broker_state",
         "pnl_snapshots",
         "positions_snapshots",
         "runner_events",
+        "runtime_session_state",
         "trades",
     } <= table_names
 
@@ -315,3 +319,82 @@ def test_storage_repository_adds_missing_optional_ai_columns_for_old_sqlite_file
     assert len(history) == 1
     assert history[0].feature_summary.candle_count == 5
     assert candle_history == []
+
+
+def test_storage_repository_persists_runtime_session_and_broker_recovery_state() -> None:
+    db_path = _db_path("runtime_broker_recovery")
+    repository = StorageRepository(f"sqlite:///{db_path}")
+    started_at = datetime(2024, 3, 9, 16, 0, 0, tzinfo=UTC)
+    last_event_time = datetime(2024, 3, 9, 16, 5, 0, tzinfo=UTC)
+    snapshot_time = datetime(2024, 3, 9, 16, 6, 0, tzinfo=UTC)
+    repository.upsert_runtime_session_state(
+        state="running",
+        mode="auto_paper",
+        symbol="BTCUSDT",
+        session_id="session-001",
+        started_at=started_at,
+        last_event_time=last_event_time,
+        last_error=None,
+    )
+    repository.upsert_paper_broker_state(
+        balances={"USDT": Decimal("9900.5")},
+        positions={
+            "BTCUSDT": Position(
+                symbol="BTCUSDT",
+                quantity=Decimal("0.25"),
+                avg_entry_price=Decimal("40000"),
+                realized_pnl=Decimal("15"),
+                quote_asset="USDT",
+            )
+        },
+        realized_pnl=Decimal("15"),
+        snapshot_time=snapshot_time,
+    )
+    repository.close()
+
+    reopened = StorageRepository(f"sqlite:///{db_path}")
+    try:
+        session_state = reopened.get_runtime_session_state()
+        broker_state = reopened.get_paper_broker_state()
+    finally:
+        reopened.close()
+
+    assert session_state is not None
+    assert session_state.state == "running"
+    assert session_state.mode == "auto_paper"
+    assert session_state.symbol == "BTCUSDT"
+    assert session_state.session_id == "session-001"
+    assert session_state.started_at == started_at
+    assert session_state.last_event_time == last_event_time
+
+    assert broker_state is not None
+    assert broker_state.balances == {"USDT": Decimal("9900.5")}
+    assert broker_state.realized_pnl == Decimal("15")
+    assert broker_state.snapshot_time == snapshot_time
+    assert len(broker_state.positions) == 1
+    assert broker_state.positions[0].symbol == "BTCUSDT"
+    assert broker_state.positions[0].quantity == Decimal("0.25")
+
+
+def test_storage_repository_ignores_corrupt_broker_recovery_state() -> None:
+    db_path = _db_path("runtime_broker_corrupt")
+    repository = StorageRepository(f"sqlite:///{db_path}")
+    try:
+        repository._connection.execute(  # noqa: SLF001 - targeted corrupt-state regression coverage
+            """
+            INSERT INTO paper_broker_state (singleton_id, balances_json, realized_pnl, snapshot_time)
+            VALUES (1, ?, ?, ?)
+            """,
+            ("not-json", "10", "2024-03-09T16:00:00+00:00"),
+        )
+        repository._connection.commit()
+    finally:
+        repository.close()
+
+    reopened = StorageRepository(f"sqlite:///{db_path}")
+    try:
+        broker_state = reopened.get_paper_broker_state()
+    finally:
+        reopened.close()
+
+    assert broker_state is None

@@ -103,6 +103,36 @@ SCHEMA_STATEMENTS = (
         UNIQUE(symbol, timeframe, open_time)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS runtime_session_state (
+        singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+        state TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        symbol TEXT,
+        session_id TEXT,
+        started_at TEXT,
+        last_event_time TEXT,
+        last_error TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS paper_broker_state (
+        singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+        balances_json TEXT NOT NULL,
+        realized_pnl TEXT NOT NULL,
+        snapshot_time TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS paper_broker_positions (
+        symbol TEXT PRIMARY KEY,
+        quantity TEXT NOT NULL,
+        avg_entry_price TEXT NOT NULL,
+        realized_pnl TEXT NOT NULL,
+        quote_asset TEXT NOT NULL,
+        snapshot_time TEXT NOT NULL
+    )
+    """,
 )
 
 OPTIONAL_TABLE_COLUMNS: dict[str, dict[str, str]] = {

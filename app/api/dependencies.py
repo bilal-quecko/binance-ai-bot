@@ -16,6 +16,7 @@ from app.storage.models import (
     DrawdownSummary,
     EquityHistoryPoint,
     FillRecord,
+    MarketCandleSnapshotRecord,
     PnlHistoryPoint,
     PnlSnapshotRecord,
     PositionSnapshotRecord,
@@ -145,11 +146,26 @@ class DashboardDataAccess:
         self,
         *,
         symbol: str | None,
+        start_date: date | None = None,
         end_date: date | None,
     ) -> list[TradeRecord]:
         """Return trades needed for performance analytics calculations."""
 
         return self.repository.get_trade_history(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    def get_market_candles(
+        self,
+        *,
+        symbol: str,
+        end_date: date | None,
+    ) -> list[MarketCandleSnapshotRecord]:
+        """Return persisted closed candles for symbol-scoped attribution analytics."""
+
+        return self.repository.get_market_candle_history(
             symbol=symbol,
             end_date=end_date,
         )

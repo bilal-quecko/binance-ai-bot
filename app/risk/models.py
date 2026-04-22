@@ -21,6 +21,9 @@ class RiskInput:
     current_position_quantity: Decimal = Decimal("0")
     stop_price: Decimal | None = None
     volatility: Decimal | None = None
+    expected_edge_pct: Decimal | None = None
+    estimated_round_trip_cost_pct: Decimal = Decimal("0")
+    min_expected_edge_buffer_pct: Decimal = Decimal("0")
     risk_per_trade: Decimal = Decimal("0.005")
     max_daily_loss: Decimal = Decimal("0.02")
     max_open_positions: int = 3
@@ -36,6 +39,8 @@ class RiskDecision:
     decision: Literal["approve", "reject", "resize"]
     approved_quantity: Decimal
     reason_codes: tuple[str, ...] = field(default_factory=tuple)
+    expected_edge_pct: Decimal | None = None
+    estimated_round_trip_cost_pct: Decimal | None = None
 
     @property
     def approved(self) -> bool:

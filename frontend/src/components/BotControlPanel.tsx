@@ -204,19 +204,33 @@ export function BotControlPanel({
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Current bot status</p>
               <p className="mt-2 text-lg font-semibold text-white">{status.state}</p>
-              <p className="mt-1 text-xs text-slate-400">Timeframe {status.timeframe} | paper only</p>
+              <p className="mt-1 text-xs text-slate-400">Mode {status.mode} | timeframe {status.timeframe} | paper only</p>
             </div>
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Started</p>
               <p className="mt-2 text-sm text-slate-200">{formatDateTime(status.started_at)}</p>
             </div>
             <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Session</p>
+              <p className="mt-2 text-sm text-slate-200">{status.session_id ?? '-'}</p>
+            </div>
+            <div>
               <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Last market event</p>
               <p className="mt-2 text-sm text-slate-200">{formatDateTime(status.last_event_time)}</p>
+            </div>
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Recovery state</p>
+              <p className="mt-2 text-sm text-slate-200">
+                {status.recovered_from_prior_session ? 'Recovered session' : 'Fresh session'}
+              </p>
+              <p className="mt-1 text-xs text-slate-400">
+                {status.broker_state_restored ? 'Broker state restored' : 'No recovered broker state'}
+              </p>
             </div>
           </div>
 
           {status.last_error ? <p className="text-sm text-rose-300">{status.last_error}</p> : null}
+          {status.recovery_message ? <p className="text-sm text-amber-300">{status.recovery_message}</p> : null}
           {actionError ? <p className="text-sm text-rose-300">{actionError}</p> : null}
 
           <div className="flex flex-wrap gap-2">

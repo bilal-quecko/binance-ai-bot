@@ -1,6 +1,8 @@
 import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -11,6 +13,14 @@ from app.exchange.binance_rest import BinanceRestClient
 from app.exchange.symbol_service import SpotSymbolService
 from app.market_data.candles import Candle
 from app.market_data.models import MarketSnapshot
+from app.paper.models import Position
+from app.storage import StorageRepository
+
+
+def _db_path(name: str) -> Path:
+    base = Path("tests/.tmp_storage")
+    base.mkdir(parents=True, exist_ok=True)
+    return (base / f"{name}_{uuid4().hex}.sqlite").resolve()
 
 
 @pytest.mark.asyncio
@@ -221,6 +231,15 @@ class FakeRunner:
     def process_snapshot(self, snapshot: MarketSnapshot) -> None:
         self.processed.append(snapshot)
 
+    def get_balances(self) -> dict[str, Decimal]:
+        return {"USDT": Decimal("10000")}
+
+    def get_open_positions(self) -> dict[str, Position]:
+        return {}
+
+    def realized_pnl(self) -> Decimal:
+        return Decimal("0")
+
 
 class FakeStreamManager:
     def __init__(self, snapshots: list[MarketSnapshot]) -> None:
@@ -267,8 +286,9 @@ async def test_paper_bot_runtime_ingests_live_snapshots_and_processes_closed_can
 
     fake_runner = FakeRunner()
     stream_manager = FakeStreamManager([trade_snapshot, candle_snapshot])
+    db_path = _db_path("runtime_ingest")
     runtime = PaperBotRuntime(
-        settings=Settings(APP_MODE='paper', DATABASE_URL='sqlite:///./tests_runtime.sqlite'),
+        settings=Settings(APP_MODE='paper', DATABASE_URL=f"sqlite:///{db_path}"),
         websocket_client=object(),
         stream_manager=stream_manager,
     )
@@ -357,7 +377,7 @@ async def test_paper_bot_runtime_ignores_duplicate_and_out_of_order_closed_kline
 
     fake_runner = FakeRunner()
     stream_manager = FakeStreamManager(snapshots)
-    settings = Settings(APP_MODE='paper', DATABASE_URL='sqlite:///tests/.tmp_storage/runtime_ordering.sqlite')
+    settings = Settings(APP_MODE='paper', DATABASE_URL=f"sqlite:///{_db_path('runtime_ordering')}")
     runtime = PaperBotRuntime(settings=settings, websocket_client=None, stream_manager=stream_manager)  # type: ignore[arg-type]
     runtime._build_runner = lambda: fake_runner  # type: ignore[method-assign]
 
@@ -371,3 +391,92 @@ async def test_paper_bot_runtime_ignores_duplicate_and_out_of_order_closed_kline
         first_candle.open_time,
         second_candle.open_time,
     ]
+
+
+def test_paper_bot_runtime_recovers_session_and_broker_state_as_safe_pause() -> None:
+    db_path = _db_path("runtime_recovery")
+    settings = Settings(APP_MODE="paper", DATABASE_URL=f"sqlite:///{db_path}")
+    repository = StorageRepository(settings.database_url)
+    try:
+        repository.upsert_runtime_session_state(
+            state="running",
+            mode="auto_paper",
+            symbol="BTCUSDT",
+            session_id="recovered-session",
+            started_at=datetime(2024, 3, 9, 16, 0, tzinfo=UTC),
+            last_event_time=datetime(2024, 3, 9, 16, 5, tzinfo=UTC),
+            last_error=None,
+        )
+        repository.upsert_paper_broker_state(
+            balances={"USDT": Decimal("9950")},
+            positions={
+                "BTCUSDT": Position(
+                    symbol="BTCUSDT",
+                    quantity=Decimal("0.5"),
+                    avg_entry_price=Decimal("100"),
+                    realized_pnl=Decimal("12"),
+                    quote_asset="USDT",
+                )
+            },
+            realized_pnl=Decimal("12"),
+            snapshot_time=datetime(2024, 3, 9, 16, 6, tzinfo=UTC),
+        )
+    finally:
+        repository.close()
+
+    runtime = PaperBotRuntime(settings=settings, websocket_client=None, stream_manager=FakeStreamManager([]))  # type: ignore[arg-type]
+
+    status = runtime.status()
+    workstation = runtime.workstation_state("BTCUSDT")
+
+    assert status.state == "paused"
+    assert status.mode == "paused"
+    assert status.symbol == "BTCUSDT"
+    assert status.session_id == "recovered-session"
+    assert status.recovered_from_prior_session is True
+    assert status.broker_state_restored is True
+    assert status.recovery_message is not None
+
+    assert workstation.is_runtime_symbol is True
+    assert workstation.current_position is not None
+    assert workstation.current_position.quantity == Decimal("0.5")
+    assert workstation.current_position.avg_entry_price == Decimal("100")
+    assert workstation.realized_pnl == Decimal("12")
+    assert workstation.recovery_message == status.recovery_message
+
+
+def test_paper_bot_runtime_ignores_corrupt_recovery_state_and_stays_safe() -> None:
+    db_path = _db_path("runtime_recovery_corrupt")
+    settings = Settings(APP_MODE="paper", DATABASE_URL=f"sqlite:///{db_path}")
+    repository = StorageRepository(settings.database_url)
+    try:
+        repository.upsert_runtime_session_state(
+            state="running",
+            mode="auto_paper",
+            symbol="BTCUSDT",
+            session_id="recovered-session",
+            started_at=datetime(2024, 3, 9, 16, 0, tzinfo=UTC),
+            last_event_time=datetime(2024, 3, 9, 16, 5, tzinfo=UTC),
+            last_error=None,
+        )
+        repository._connection.execute(  # noqa: SLF001 - targeted corrupt recovery coverage
+            """
+            INSERT INTO paper_broker_state (singleton_id, balances_json, realized_pnl, snapshot_time)
+            VALUES (1, ?, ?, ?)
+            """,
+            ("not-json", "12", "2024-03-09T16:06:00+00:00"),
+        )
+        repository._connection.commit()
+    finally:
+        repository.close()
+
+    runtime = PaperBotRuntime(settings=settings, websocket_client=None, stream_manager=FakeStreamManager([]))  # type: ignore[arg-type]
+
+    status = runtime.status()
+    workstation = runtime.workstation_state("BTCUSDT")
+
+    assert status.state == "paused"
+    assert status.mode == "paused"
+    assert status.recovered_from_prior_session is True
+    assert status.broker_state_restored is False
+    assert workstation.current_position is None
