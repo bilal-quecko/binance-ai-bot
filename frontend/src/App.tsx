@@ -6,10 +6,12 @@ import { AIAdvisorySection } from './components/AIAdvisorySection';
 import { AutoRefreshSelector } from './components/AutoRefreshSelector';
 import { BotControlPanel } from './components/BotControlPanel';
 import { DataStateIndicator } from './components/DataStateIndicator';
+import { FusionSignalSection } from './components/FusionSignalSection';
 import { MarketSentimentSection } from './components/MarketSentimentSection';
 import { MetricCard } from './components/MetricCard';
 import { PerformanceAnalyticsSection } from './components/PerformanceAnalyticsSection';
 import { PatternAnalysisSection } from './components/PatternAnalysisSection';
+import { PersistenceHealthCard } from './components/PersistenceHealthCard';
 import { SectionCard } from './components/SectionCard';
 import { StatePanel } from './components/StatePanel';
 import { SymbolSentimentSection } from './components/SymbolSentimentSection';
@@ -21,6 +23,7 @@ import {
   getAISignal,
   getAISignalHistory,
   getBotStatus,
+  getFusionSignal,
   getHealth,
   getMarketSentiment,
   getPatternAnalysis,
@@ -44,6 +47,7 @@ import type {
   AutoRefreshIntervalSeconds,
   BotStatusResponse,
   HealthResponse,
+  FusionSignalResponse,
   MarketSentimentResponse,
   PatternAnalysisResponse,
   PatternHorizon,
@@ -77,6 +81,12 @@ const INITIAL_BOT_STATUS: BotStatusResponse = {
   recovered_from_prior_session: false,
   broker_state_restored: false,
   recovery_message: null,
+  persistence: {
+    persistence_state: 'unavailable',
+    persistence_message: 'Persistence state has not been read yet.',
+    persistence_last_ok_at: null,
+    recovery_source: null,
+  },
 };
 
 const INITIAL_WORKSTATION: WorkstationResponse | null = null;
@@ -94,6 +104,7 @@ const INITIAL_TECHNICAL_ANALYSIS: TechnicalAnalysisResponse | null = null;
 const INITIAL_MARKET_SENTIMENT: MarketSentimentResponse | null = null;
 const INITIAL_SYMBOL_SENTIMENT: SymbolSentimentResponse | null = null;
 const INITIAL_PATTERN_ANALYSIS: PatternAnalysisResponse | null = null;
+const INITIAL_FUSION_SIGNAL: FusionSignalResponse | null = null;
 const INITIAL_PERFORMANCE: PerformanceAnalyticsResponse | null = null;
 const INITIAL_TRADE_QUALITY: TradeQualityResponse | null = null;
 const AI_HISTORY_PAGE_SIZE = 3;
@@ -156,6 +167,7 @@ function App() {
   const [marketSentiment, setMarketSentiment] = useState<RemoteState<MarketSentimentResponse | null>>(createRemoteState(INITIAL_MARKET_SENTIMENT));
   const [symbolSentiment, setSymbolSentiment] = useState<RemoteState<SymbolSentimentResponse | null>>(createRemoteState(INITIAL_SYMBOL_SENTIMENT));
   const [patternAnalysis, setPatternAnalysis] = useState<RemoteState<PatternAnalysisResponse | null>>(createRemoteState(INITIAL_PATTERN_ANALYSIS));
+  const [fusionSignal, setFusionSignal] = useState<RemoteState<FusionSignalResponse | null>>(createRemoteState(INITIAL_FUSION_SIGNAL));
   const [performanceAnalytics, setPerformanceAnalytics] = useState<RemoteState<PerformanceAnalyticsResponse | null>>(createRemoteState(INITIAL_PERFORMANCE));
   const [tradeQualityAnalytics, setTradeQualityAnalytics] = useState<RemoteState<TradeQualityResponse | null>>(createRemoteState(INITIAL_TRADE_QUALITY));
   const [symbolResults, setSymbolResults] = useState<RemoteState<SpotSymbolItem[]>>(createRemoteState<SpotSymbolItem[]>([]));
@@ -190,6 +202,7 @@ function App() {
     setMarketSentiment((current) => setPending(current));
     setSymbolSentiment((current) => setPending(current));
     setPatternAnalysis((current) => setPending(current));
+    setFusionSignal((current) => setPending(current));
     setPerformanceAnalytics((current) => setPending(current));
     setTradeQualityAnalytics((current) => setPending(current));
 
@@ -201,7 +214,7 @@ function App() {
         setSymbolSearch(botStatusData.symbol);
       }
 
-      const [workstationData, aiSignalData, aiHistoryData, aiEvaluationData, technicalAnalysisData, marketSentimentData, symbolSentimentData, patternAnalysisData, performanceData, tradeQualityData] = await Promise.all([
+      const [workstationData, aiSignalData, aiHistoryData, aiEvaluationData, technicalAnalysisData, marketSentimentData, symbolSentimentData, patternAnalysisData, fusionSignalData, performanceData, tradeQualityData] = await Promise.all([
         resolvedSymbol ? getWorkstation(resolvedSymbol) : Promise.resolve<WorkstationResponse | null>(null),
         resolvedSymbol ? getAISignal(resolvedSymbol) : Promise.resolve<AISignalSummary | null>(null),
         resolvedSymbol
@@ -212,6 +225,7 @@ function App() {
         resolvedSymbol ? getMarketSentiment(resolvedSymbol) : Promise.resolve<MarketSentimentResponse | null>(null),
         resolvedSymbol ? getSymbolSentiment(resolvedSymbol) : Promise.resolve<SymbolSentimentResponse | null>(null),
         resolvedSymbol ? getPatternAnalysis(resolvedSymbol, selectedPatternHorizon) : Promise.resolve<PatternAnalysisResponse | null>(null),
+        resolvedSymbol ? getFusionSignal(resolvedSymbol) : Promise.resolve<FusionSignalResponse | null>(null),
         resolvedSymbol ? getPerformanceAnalytics(resolvedSymbol) : Promise.resolve<PerformanceAnalyticsResponse | null>(null),
         resolvedSymbol ? getTradeQualityAnalytics(resolvedSymbol) : Promise.resolve<TradeQualityResponse | null>(null),
       ]);
@@ -226,6 +240,7 @@ function App() {
       setMarketSentiment({ data: marketSentimentData, loading: false, refreshing: false, error: null });
       setSymbolSentiment({ data: symbolSentimentData, loading: false, refreshing: false, error: null });
       setPatternAnalysis({ data: patternAnalysisData, loading: false, refreshing: false, error: null });
+      setFusionSignal({ data: fusionSignalData, loading: false, refreshing: false, error: null });
       setPerformanceAnalytics({ data: performanceData, loading: false, refreshing: false, error: null });
       setTradeQualityAnalytics({ data: tradeQualityData, loading: false, refreshing: false, error: null });
       setLastUpdatedAt(new Date());
@@ -242,6 +257,7 @@ function App() {
         setMarketSentiment((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setSymbolSentiment((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setPatternAnalysis((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setFusionSignal((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setPerformanceAnalytics((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setTradeQualityAnalytics((current) => ({ ...current, loading: false, refreshing: false, error: message }));
       }
@@ -294,6 +310,7 @@ function App() {
     setMarketSentiment({ data: null, loading: false, refreshing: false, error: null });
     setSymbolSentiment({ data: null, loading: false, refreshing: false, error: null });
     setPatternAnalysis({ data: null, loading: false, refreshing: false, error: null });
+    setFusionSignal({ data: null, loading: false, refreshing: false, error: null });
     setPerformanceAnalytics({ data: null, loading: false, refreshing: false, error: null });
     setTradeQualityAnalytics({ data: null, loading: false, refreshing: false, error: null });
   }, []);
@@ -524,6 +541,10 @@ function App() {
                       </div>
 
                       <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                        <PersistenceHealthCard persistence={effectiveWorkstation.persistence} compact />
+                      </div>
+
+                      <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
                         <TradeReadinessPanel symbol={selectedSymbol} readiness={readiness} compact />
                       </div>
 
@@ -567,6 +588,16 @@ function App() {
                       </div>
                     </div>
                   )}
+
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <FusionSignalSection
+                      symbol={selectedSymbol}
+                      signal={fusionSignal.data}
+                      loading={fusionSignal.loading}
+                      refreshing={fusionSignal.refreshing}
+                      error={fusionSignal.error}
+                    />
+                  </div>
 
                   <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
                     <TechnicalAnalysisSection
@@ -678,6 +709,11 @@ function App() {
               ) : (
                 <div className="space-y-5">
                   <DataStateIndicator dataState={workstationDataState} message={workstationStatusMessage} />
+                  {effectiveWorkstation ? (
+                    <PersistenceHealthCard persistence={effectiveWorkstation.persistence} />
+                  ) : (
+                    <PersistenceHealthCard persistence={botStatus.data.persistence} />
+                  )}
                   <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
                     <MetricCard label="Runtime Status" value={botStatus.data.state} helper={`Paper only - ${selectedSymbol}`} />
                     <MetricCard label="Last Action" value={effectiveWorkstation?.last_action?.signal_side ?? 'Waiting'} helper={formatDateTime(effectiveWorkstation?.last_action?.event_time ?? null)} />

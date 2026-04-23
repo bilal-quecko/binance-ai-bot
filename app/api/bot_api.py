@@ -25,9 +25,11 @@ from app.analysis import (
 )
 from app.ai.evaluation import AIOutcomeEvaluator
 from app.bot import BotStatus, PaperBotRuntime, WorkstationState
+from app.bot.runtime import PersistenceState
 from app.config import Settings, get_settings
 from app.data import MarketContextService
 from app.exchange.symbol_service import SpotSymbolRecord, SpotSymbolService
+from app.fusion import FusionInputs, FusionSignalSnapshot, UnifiedSignalFusionEngine
 from app.runner.models import TradeReadiness
 from app.storage import StorageRepository
 from app.storage.models import MarketCandleSnapshotRecord
@@ -36,6 +38,15 @@ router = APIRouter()
 LOGGER = logging.getLogger(__name__)
 
 DataState = Literal["ready", "waiting_for_runtime", "waiting_for_history", "degraded_storage"]
+
+
+class PersistenceHealthResponse(BaseModel):
+    """Serialized persistence-health state for the workstation."""
+
+    persistence_state: PersistenceState
+    persistence_message: str
+    persistence_last_ok_at: datetime | None = None
+    recovery_source: str | None = None
 
 
 class SymbolResponse(BaseModel):
@@ -68,6 +79,7 @@ class BotStatusResponse(BaseModel):
     recovered_from_prior_session: bool = False
     broker_state_restored: bool = False
     recovery_message: str | None = None
+    persistence: PersistenceHealthResponse
 
 
 class CandleSummaryResponse(BaseModel):
@@ -284,20 +296,38 @@ class MarketSentimentResponse(BaseModel):
 
 
 class SymbolSentimentResponse(BaseModel):
-    """Symbol-scoped external sentiment payload."""
+    """Symbol-scoped sentiment intelligence payload."""
 
     symbol: str
     generated_at: datetime | None = None
     data_state: DataState
     status_message: str | None = None
-    sentiment_state: str = "insufficient_data"
-    sentiment_score: int | None = None
-    source_count: int = 0
-    freshness: str = "unknown"
-    freshness_minutes: int | None = None
+    score: int | None = None
+    label: str = "insufficient_data"
     confidence: int | None = None
-    evidence_summary: list[str] = []
+    momentum_state: str = "unknown"
+    risk_flag: str = "unknown"
+    source_mode: str = "proxy"
+    components: list[str] = Field(default_factory=list)
     explanation: str | None = None
+
+
+class FusionSignalResponse(BaseModel):
+    """Unified advisory fusion signal for one selected symbol."""
+
+    symbol: str
+    generated_at: datetime | None = None
+    data_state: DataState
+    status_message: str | None = None
+    final_signal: str = "wait"
+    confidence: int = 0
+    expected_edge_pct: Decimal | None = None
+    preferred_horizon: str = "15m"
+    risk_grade: str = "high"
+    alignment_score: int = 0
+    top_reasons: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    invalidation_hint: str | None = None
 
 
 class AISignalHistoryResponse(BaseModel):
@@ -367,6 +397,7 @@ class WorkstationResponse(BaseModel):
     status_message: str | None = None
     is_runtime_symbol: bool
     runtime_status: BotStatusResponse
+    persistence: PersistenceHealthResponse
     last_price: Decimal | None = None
     current_candle: CandleSummaryResponse | None = None
     top_of_book: TopOfBookResponse | None = None
@@ -503,13 +534,89 @@ def _safe_symbol_sentiment(
     service: SymbolSentimentService,
     *,
     symbol: str,
+    runtime: PaperBotRuntime,
+    repository: StorageRepository,
 ) -> tuple[SymbolSentimentSnapshot | None, bool]:
     """Return symbol sentiment without allowing source/service errors to escape the API."""
 
     try:
-        return service.analyze(symbol=symbol), False
+        benchmark_records = repository.get_market_candle_history(symbol="BTCUSDT", timeframe="1m")
+        return (
+            service.analyze(
+                symbol=symbol,
+                candles=runtime.candle_history(symbol),
+                benchmark_symbol="BTCUSDT" if benchmark_records else None,
+                benchmark_closes=[record.close_price for record in benchmark_records[-24:]],
+            ),
+            False,
+        )
     except Exception:
         LOGGER.exception("Failed to build symbol sentiment for symbol %s.", symbol)
+        return None, True
+
+
+def _safe_fusion_signal(
+    *,
+    symbol: str,
+    runtime: PaperBotRuntime,
+    repository: StorageRepository | None,
+    sentiment_service: SymbolSentimentService,
+) -> tuple[FusionSignalSnapshot | None, bool]:
+    """Return a fused advisory signal without allowing optional dependencies to escape the API."""
+
+    try:
+        workstation_state, _, _ = _safe_workstation_state(runtime, symbol)
+        technical_analysis, _ = _safe_technical_analysis(runtime, symbol)
+        if repository is not None:
+            pattern_analysis, _ = _safe_pattern_analysis(
+                runtime,
+                symbol=symbol,
+                horizon="7d",
+                repository=repository,
+            )
+            symbol_sentiment, _ = _safe_symbol_sentiment(
+                sentiment_service,
+                symbol=symbol,
+                runtime=runtime,
+                repository=repository,
+            )
+        else:
+            pattern_analysis = HorizonPatternAnalysisService().analyze(
+                symbol=symbol,
+                horizon="7d",
+                points=[
+                    PatternPricePoint(symbol=candle.symbol, timestamp=candle.close_time, close_price=candle.close)
+                    for candle in runtime.candle_history(symbol)
+                    if candle.is_closed
+                ],
+                runtime_active=_runtime_matches_symbol(runtime.status(), symbol),
+            )
+            symbol_sentiment = sentiment_service.analyze(
+                symbol=symbol,
+                candles=runtime.candle_history(symbol),
+                benchmark_symbol=None,
+                benchmark_closes=(),
+            )
+        return (
+            UnifiedSignalFusionEngine().build_signal(
+                FusionInputs(
+                    symbol=symbol,
+                    technical_analysis=technical_analysis,
+                    pattern_analysis=pattern_analysis,
+                    ai_signal=workstation_state.ai_signal,
+                    symbol_sentiment=symbol_sentiment,
+                    trade_readiness=workstation_state.trade_readiness,
+                    current_position_quantity=(
+                        workstation_state.current_position.quantity
+                        if workstation_state.current_position is not None
+                        else Decimal("0")
+                    ),
+                )
+            ),
+            False,
+        )
+    except Exception:
+        LOGGER.exception("Failed to build fusion signal for symbol %s.", symbol)
         return None, True
 
 
@@ -758,10 +865,11 @@ def _derive_market_sentiment_data_state(
 def _derive_symbol_sentiment_data_state(
     *,
     symbol: str,
+    status: BotStatus,
     analysis: SymbolSentimentSnapshot | None,
     analysis_failed: bool,
 ) -> tuple[DataState, str]:
-    """Derive a symbol-scoped external sentiment state without fabricating evidence."""
+    """Derive a symbol-scoped sentiment state without fabricating evidence."""
 
     if analysis_failed:
         return (
@@ -773,10 +881,46 @@ def _derive_symbol_sentiment_data_state(
             "degraded_storage",
             f"Symbol sentiment for {symbol} could not be built.",
         )
+    if analysis.data_state == "incomplete":
+        if not _runtime_matches_symbol(status, symbol):
+            return (
+                "waiting_for_runtime",
+                f"Start the runtime for {symbol} to accumulate symbol-scoped sentiment inputs.",
+            )
+        return (
+            "waiting_for_history",
+            analysis.status_message or f"Symbol sentiment for {symbol} still needs more live history.",
+        )
     return (
         "ready",
         analysis.status_message or f"Symbol sentiment is ready for {symbol}.",
     )
+
+
+def _derive_fusion_data_state(
+    *,
+    symbol: str,
+    status: BotStatus,
+    analysis: FusionSignalSnapshot | None,
+    analysis_failed: bool,
+) -> tuple[DataState, str]:
+    """Derive a fusion data state without raising on optional input gaps."""
+
+    if analysis_failed:
+        return ("degraded_storage", f"Final fusion signal for {symbol} is temporarily unavailable.")
+    if analysis is None:
+        return ("degraded_storage", f"Final fusion signal for {symbol} could not be built.")
+    if analysis.data_state == "incomplete":
+        if not _runtime_matches_symbol(status, symbol):
+            return (
+                "waiting_for_runtime",
+                f"Start the runtime for {symbol} to build the final fused signal.",
+            )
+        return (
+            "waiting_for_history",
+            analysis.status_message or f"Fusion signal for {symbol} still needs more analysis history.",
+        )
+    return ("ready", analysis.status_message or f"Fusion signal is ready for {symbol}.")
 
 
 def get_symbol_service(request: Request) -> SpotSymbolService:
@@ -814,7 +958,22 @@ def _to_symbol_response(record: SpotSymbolRecord) -> SymbolResponse:
     )
 
 
-def _to_status_response(status: BotStatus) -> BotStatusResponse:
+def _to_persistence_response(runtime: PaperBotRuntime) -> PersistenceHealthResponse:
+    """Convert runtime persistence state to an API response."""
+
+    return PersistenceHealthResponse(
+        persistence_state=runtime.persistence_state(),
+        persistence_message=runtime.persistence_status_message(),
+        persistence_last_ok_at=runtime.persistence_last_ok_at(),
+        recovery_source=runtime.persistence_recovery_source(),
+    )
+
+
+def _to_status_response(
+    status: BotStatus,
+    *,
+    persistence: PersistenceHealthResponse,
+) -> BotStatusResponse:
     """Convert runtime status to an API response."""
 
     return BotStatusResponse(
@@ -830,6 +989,7 @@ def _to_status_response(status: BotStatus) -> BotStatusResponse:
         recovered_from_prior_session=status.recovered_from_prior_session,
         broker_state_restored=status.broker_state_restored,
         recovery_message=status.recovery_message,
+        persistence=persistence,
     )
 
 
@@ -1122,14 +1282,40 @@ def _to_symbol_sentiment_response(
         generated_at=analysis.generated_at if analysis is not None else None,
         data_state=data_state,
         status_message=status_message,
-        sentiment_state=analysis.sentiment_state if analysis is not None else "insufficient_data",
-        sentiment_score=analysis.sentiment_score if analysis is not None else None,
-        source_count=analysis.source_count if analysis is not None else 0,
-        freshness=analysis.freshness if analysis is not None else "unknown",
-        freshness_minutes=analysis.freshness_minutes if analysis is not None else None,
+        score=analysis.score if analysis is not None else None,
+        label=analysis.label if analysis is not None else "insufficient_data",
         confidence=analysis.confidence if analysis is not None else None,
-        evidence_summary=list(analysis.evidence_summary) if analysis is not None else [],
+        momentum_state=analysis.momentum_state if analysis is not None else "unknown",
+        risk_flag=analysis.risk_flag if analysis is not None else "unknown",
+        source_mode=analysis.source_mode if analysis is not None else "proxy",
+        components=[component.explanation for component in analysis.components] if analysis is not None else [],
         explanation=analysis.explanation if analysis is not None else None,
+    )
+
+
+def _to_fusion_signal_response(
+    *,
+    symbol: str,
+    analysis: FusionSignalSnapshot | None,
+    data_state: DataState,
+    status_message: str | None,
+) -> FusionSignalResponse:
+    """Build a stable unified fusion API response."""
+
+    return FusionSignalResponse(
+        symbol=symbol,
+        generated_at=analysis.generated_at if analysis is not None else None,
+        data_state=data_state,
+        status_message=status_message,
+        final_signal=analysis.final_signal if analysis is not None else "wait",
+        confidence=analysis.confidence if analysis is not None else 0,
+        expected_edge_pct=analysis.expected_edge_pct if analysis is not None else None,
+        preferred_horizon=analysis.preferred_horizon if analysis is not None else "15m",
+        risk_grade=analysis.risk_grade if analysis is not None else "high",
+        alignment_score=analysis.alignment_score if analysis is not None else 0,
+        top_reasons=list(analysis.top_reasons) if analysis is not None else [],
+        warnings=list(analysis.warnings) if analysis is not None else [],
+        invalidation_hint=analysis.invalidation_hint if analysis is not None else None,
     )
 
 
@@ -1192,6 +1378,7 @@ def _to_ai_outcome_evaluation_response(
 def _to_workstation_response(
     *,
     state: WorkstationState,
+    runtime: PaperBotRuntime,
     status: BotStatus,
     data_state: DataState,
     status_message: str | None,
@@ -1238,7 +1425,8 @@ def _to_workstation_response(
         data_state=data_state,
         status_message=status_message,
         is_runtime_symbol=state.is_runtime_symbol,
-        runtime_status=_to_status_response(status),
+        runtime_status=_to_status_response(status, persistence=_to_persistence_response(runtime)),
+        persistence=_to_persistence_response(runtime),
         last_price=market_snapshot.last_price if market_snapshot is not None else None,
         current_candle=(
             CandleSummaryResponse(
@@ -1386,7 +1574,7 @@ def get_bot_status(
 ) -> BotStatusResponse:
     """Return the current paper-bot runtime status."""
 
-    return _to_status_response(runtime.status())
+    return _to_status_response(runtime.status(), persistence=_to_persistence_response(runtime))
 
 
 @router.post("/bot/start", response_model=BotStatusResponse)
@@ -1400,7 +1588,7 @@ async def start_bot(
         status = await runtime.start(payload.symbol)
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _to_status_response(status)
+    return _to_status_response(status, persistence=_to_persistence_response(runtime))
 
 
 @router.post("/bot/stop", response_model=BotStatusResponse)
@@ -1409,7 +1597,7 @@ async def stop_bot(
 ) -> BotStatusResponse:
     """Stop the live paper bot."""
 
-    return _to_status_response(await runtime.stop())
+    return _to_status_response(await runtime.stop(), persistence=_to_persistence_response(runtime))
 
 
 @router.post("/bot/pause", response_model=BotStatusResponse)
@@ -1422,7 +1610,7 @@ async def pause_bot(
         status = await runtime.pause()
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _to_status_response(status)
+    return _to_status_response(status, persistence=_to_persistence_response(runtime))
 
 
 @router.post("/bot/resume", response_model=BotStatusResponse)
@@ -1435,7 +1623,7 @@ async def resume_bot(
         status = await runtime.resume()
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _to_status_response(status)
+    return _to_status_response(status, persistence=_to_persistence_response(runtime))
 
 
 @router.post("/bot/reset", response_model=BotStatusResponse)
@@ -1451,7 +1639,7 @@ async def reset_bot_session(
         repository.clear_all()
     finally:
         repository.close()
-    return _to_status_response(status)
+    return _to_status_response(status, persistence=_to_persistence_response(runtime))
 
 
 @router.get("/bot/workstation", response_model=WorkstationResponse)
@@ -1474,6 +1662,7 @@ def get_workstation(
     )
     return _to_workstation_response(
         state=state,
+        runtime=runtime,
         status=status,
         data_state=data_state,
         status_message=status_message,
@@ -1608,18 +1797,81 @@ def get_market_sentiment(
 @router.get("/bot/symbol-sentiment", response_model=SymbolSentimentResponse)
 def get_symbol_sentiment(
     symbol: Annotated[str, Query(min_length=1)],
+    runtime: Annotated[PaperBotRuntime, Depends(get_bot_runtime)],
+    settings: Annotated[Settings, Depends(get_settings_dependency)],
     service: Annotated[SymbolSentimentService, Depends(get_symbol_sentiment_service)],
 ) -> SymbolSentimentResponse:
-    """Return symbol-scoped external sentiment for the workstation."""
+    """Return symbol-scoped sentiment intelligence for the workstation."""
 
     normalized_symbol = symbol.strip().upper()
-    analysis, analysis_failed = _safe_symbol_sentiment(service, symbol=normalized_symbol)
-    data_state, status_message = _derive_symbol_sentiment_data_state(
+    runtime_status = runtime.status()
+    try:
+        repository = StorageRepository(settings.database_url)
+    except Exception:
+        LOGGER.exception("Failed to open storage while reading symbol sentiment for %s.", normalized_symbol)
+        return _to_symbol_sentiment_response(
+            symbol=normalized_symbol,
+            analysis=None,
+            data_state="degraded_storage",
+            status_message="Symbol sentiment storage is unavailable.",
+        )
+    try:
+        analysis, analysis_failed = _safe_symbol_sentiment(
+            service,
+            symbol=normalized_symbol,
+            runtime=runtime,
+            repository=repository,
+        )
+        data_state, status_message = _derive_symbol_sentiment_data_state(
+            symbol=normalized_symbol,
+            status=runtime_status,
+            analysis=analysis,
+            analysis_failed=analysis_failed,
+        )
+    finally:
+        repository.close()
+    return _to_symbol_sentiment_response(
         symbol=normalized_symbol,
         analysis=analysis,
-        analysis_failed=analysis_failed,
+        data_state=data_state,
+        status_message=status_message,
     )
-    return _to_symbol_sentiment_response(
+
+
+@router.get("/bot/fusion-signal", response_model=FusionSignalResponse)
+def get_fusion_signal(
+    symbol: Annotated[str, Query(min_length=1)],
+    runtime: Annotated[PaperBotRuntime, Depends(get_bot_runtime)],
+    settings: Annotated[Settings, Depends(get_settings_dependency)],
+    sentiment_service: Annotated[SymbolSentimentService, Depends(get_symbol_sentiment_service)],
+) -> FusionSignalResponse:
+    """Return the unified advisory fusion signal for one symbol."""
+
+    normalized_symbol = symbol.strip().upper()
+    runtime_status = runtime.status()
+    repository: StorageRepository | None = None
+    try:
+        repository = StorageRepository(settings.database_url)
+    except Exception:
+        LOGGER.exception("Failed to open storage while reading fusion signal for %s.", normalized_symbol)
+
+    try:
+        analysis, analysis_failed = _safe_fusion_signal(
+            symbol=normalized_symbol,
+            runtime=runtime,
+            repository=repository,
+            sentiment_service=sentiment_service,
+        )
+        data_state, status_message = _derive_fusion_data_state(
+            symbol=normalized_symbol,
+            status=runtime_status,
+            analysis=analysis,
+            analysis_failed=analysis_failed,
+        )
+    finally:
+        if repository is not None:
+            repository.close()
+    return _to_fusion_signal_response(
         symbol=normalized_symbol,
         analysis=analysis,
         data_state=data_state,
@@ -1704,6 +1956,7 @@ def get_ai_signal(
     )
     workstation = _to_workstation_response(
         state=state,
+        runtime=runtime,
         status=workstation_status,
         data_state=workstation_data_state,
         status_message=workstation_status_message,

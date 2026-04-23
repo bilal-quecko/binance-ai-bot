@@ -274,3 +274,80 @@ Chronological implementation checkpoints for Binance AI Bot.
   - full backend test suite: passed
   - frontend helper tests: passed
   - frontend production build: passed
+
+## No. 15 - SQLite Persistence Transaction Hardening
+
+- Status: Completed
+- Scope:
+  - removed fragile shared write-transaction behavior from SQLite persistence paths
+  - moved repository writes to scoped per-operation transactions with isolated connections
+  - added friendly runtime persistence degradation messaging instead of leaking raw SQLite commit errors
+- Backend:
+  - enabled SQLite WAL mode on usable local storage paths and added a safe temp-storage fallback for environments where the requested path cannot support SQLite journaling
+  - refactored runtime-session, broker-state, AI snapshot, candle snapshot, trade, fill, position, PnL, and event writes to use isolated `with connection:` transactions
+  - moved repository reads off the shared runtime connection so async tasks no longer share one SQLite handle for normal operations
+  - caught runtime persistence failures and converted them into user-facing persistence warnings while keeping in-memory paper runtime state alive
+- Validation:
+  - added concurrency regression coverage for runtime persistence writes
+  - added friendly-warning regression coverage for the `cannot commit - no transaction is active` failure path
+  - full backend test suite: passed
+
+## No. 16 - Persistence Health Visibility
+
+- Status: Completed
+- Scope:
+  - exposed explicit persistence-health state in bot status and workstation payloads
+  - distinguished healthy persistence, degraded in-memory-only execution, recovered persisted sessions, and unavailable persistence
+  - surfaced persistence-health messaging in the workstation UI without exposing raw database errors
+- Backend:
+  - added `healthy`, `degraded_in_memory_only`, `recovered_from_persistence`, and `unavailable` persistence states
+  - derived persistence state from runtime recovery flags, storage degradation state, and live runtime activity
+  - exposed persistence message, last successful persistence timestamp, and recovery source through `/bot/status` and `/bot/workstation`
+- Frontend:
+  - added a compact persistence-health card in the Signal and Auto Trade workstation views
+  - added operator-readable persistence state messaging to the live control panel
+  - kept persistence state visually distinct from runtime status, deterministic readiness, and AI advisory
+- Validation:
+  - added API tests for healthy, degraded in-memory-only, recovered-from-persistence, and unavailable persistence states
+  - full backend test suite: passed
+  - frontend production build: passed
+
+## No. 17 - Symbol Sentiment Layer
+
+- Status: Completed
+- Scope:
+  - replaced the earlier source-backed placeholder symbol-sentiment path with a profit-oriented symbol sentiment engine
+  - added deterministic symbol-scoped sentiment proxies so signals can use sentiment-style context even before external news/social APIs are integrated
+  - exposed the new sentiment view through `/bot/symbol-sentiment` and a dedicated Signal-tab Symbol Sentiment card
+- Backend:
+  - added `app/sentiment/models.py`, `app/sentiment/sources.py`, `app/sentiment/scoring.py`, and `app/sentiment/symbol_sentiment.py`
+  - scored symbol sentiment from deterministic proxy inputs such as price acceleration, volatility shock, search/social proxy, BTC-relative strength, and exchange activity
+  - returned typed sentiment outputs with `score`, `label`, `confidence`, `momentum_state`, `risk_flag`, `source_mode`, component explanations, and a human-readable summary
+  - kept sentiment advisory-only and reusable for a later combined signal engine
+- Frontend:
+  - replaced the old external-source sentiment card with a Symbol Sentiment card showing the score meter, label, confidence, momentum state, risk flag, explanation, and active sentiment drivers
+  - kept the section visually separate from technical analysis, pattern analysis, market sentiment, and AI advisory
+- Validation:
+  - added backend service and API coverage for bullish, bearish, mixed, and insufficient-data scenarios
+  - full backend test suite: passed
+  - frontend production build: passed
+
+## No. 18 - Unified Signal Fusion Engine
+
+- Status: Completed
+- Scope:
+  - combined current intelligence layers into one final advisory signal for the selected symbol
+  - added a symbol-scoped `/bot/fusion-signal` endpoint and a dedicated Signal-tab `FINAL SIGNAL` card
+  - kept the result advisory-only so it does not bypass deterministic strategy, risk, or execution
+- Backend:
+  - added `app/fusion/models.py`, `app/fusion/weights.py`, `app/fusion/scoring.py`, and `app/fusion/engine.py`
+  - fused technical analysis, pattern analysis, AI advisory, symbol sentiment, deterministic trade readiness, and fee-aware edge/cost gating into one final action
+  - returned typed outputs for final signal, confidence, expected edge, preferred horizon, risk grade, alignment score, top reasons, warnings, and invalidation hint
+- Frontend:
+  - added a major `FINAL SIGNAL` card in the Signal tab
+  - showed one unified action with confidence, expected edge, risk grade, timeframe, reasons, warnings, and invalidation guidance
+  - kept the fused signal visually separate from technical analysis, pattern analysis, symbol sentiment, and AI advisory
+- Validation:
+  - added fusion-engine and API tests for bullish, bearish, mixed, and reduce-risk scenarios
+  - full backend test suite: passed
+  - frontend production build: passed

@@ -3,6 +3,18 @@ export type RangePreset = '1D' | '7D' | '30D' | 'ALL';
 export type AutoRefreshIntervalSeconds = 0 | 5 | 10 | 30;
 export type WorkstationDataState = 'ready' | 'waiting_for_runtime' | 'waiting_for_history' | 'degraded_storage';
 export type PatternHorizon = '1d' | '3d' | '7d' | '14d' | '30d';
+export type PersistenceState =
+  | 'healthy'
+  | 'degraded_in_memory_only'
+  | 'recovered_from_persistence'
+  | 'unavailable';
+
+export interface PersistenceHealthSummary {
+  persistence_state: PersistenceState;
+  persistence_message: string;
+  persistence_last_ok_at: string | null;
+  recovery_source: string | null;
+}
 
 export interface SpotSymbolItem {
   symbol: string;
@@ -24,6 +36,7 @@ export interface BotStatusResponse {
   recovered_from_prior_session: boolean;
   broker_state_restored: boolean;
   recovery_message: string | null;
+  persistence: PersistenceHealthSummary;
 }
 
 export interface CandleSummary {
@@ -177,14 +190,30 @@ export interface SymbolSentimentResponse {
   generated_at: string | null;
   data_state: WorkstationDataState;
   status_message: string | null;
-  sentiment_state: 'bullish' | 'bearish' | 'neutral' | 'mixed' | 'insufficient_data';
-  sentiment_score: number | null;
-  source_count: number;
-  freshness: 'fresh' | 'recent' | 'stale' | 'unknown';
-  freshness_minutes: number | null;
+  score: number | null;
+  label: 'bullish' | 'bearish' | 'neutral' | 'mixed' | 'insufficient_data';
   confidence: number | null;
-  evidence_summary: string[];
+  momentum_state: 'rising' | 'fading' | 'stable' | 'unknown';
+  risk_flag: 'hype' | 'panic' | 'normal' | 'unknown';
+  source_mode: 'proxy' | 'external' | 'mixed';
+  components: string[];
   explanation: string | null;
+}
+
+export interface FusionSignalResponse {
+  symbol: string;
+  generated_at: string | null;
+  data_state: WorkstationDataState;
+  status_message: string | null;
+  final_signal: 'long' | 'short' | 'wait' | 'reduce_risk' | 'exit_long' | 'exit_short';
+  confidence: number;
+  expected_edge_pct: DecimalString | null;
+  preferred_horizon: '5m' | '15m' | '1h';
+  risk_grade: 'low' | 'medium' | 'high';
+  alignment_score: number;
+  top_reasons: string[];
+  warnings: string[];
+  invalidation_hint: string | null;
 }
 
 export interface TradeReadinessResponse {
@@ -283,6 +312,7 @@ export interface WorkstationResponse {
   status_message: string | null;
   is_runtime_symbol: boolean;
   runtime_status: BotStatusResponse;
+  persistence: PersistenceHealthSummary;
   last_price: DecimalString | null;
   current_candle: CandleSummary | null;
   top_of_book: TopOfBookSummary | null;

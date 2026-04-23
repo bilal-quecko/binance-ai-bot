@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 import sqlite3
+import threading
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -9,6 +11,7 @@ from app.paper.models import Position
 from app.paper.models import FillResult
 from app.risk.models import RiskDecision
 from app.storage import StorageRepository
+from app.storage.db import resolve_sqlite_path
 
 
 def _db_path(name: str) -> Path:
@@ -62,10 +65,11 @@ def _ai_snapshot(
 
 def test_storage_repository_creates_required_tables() -> None:
     db_path = _db_path("create_tables")
-    repository = StorageRepository(f"sqlite:///{db_path}")
+    database_url = f"sqlite:///{db_path}"
+    repository = StorageRepository(database_url)
     repository.close()
 
-    connection = sqlite3.connect(str(db_path))
+    connection = sqlite3.connect(str(resolve_sqlite_path(database_url)))
     try:
         rows = connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
@@ -398,3 +402,54 @@ def test_storage_repository_ignores_corrupt_broker_recovery_state() -> None:
         reopened.close()
 
     assert broker_state is None
+
+
+def test_storage_repository_uses_wal_and_handles_concurrent_runtime_writes() -> None:
+    db_path = _db_path("concurrent_runtime_writes")
+    repository = StorageRepository(f"sqlite:///{db_path}")
+    barrier = threading.Barrier(5)
+    errors: list[Exception] = []
+
+    def write_cycle(index: int) -> None:
+        try:
+            barrier.wait()
+            event_time = datetime(2024, 3, 9, 16, index, tzinfo=UTC)
+            repository.upsert_runtime_session_state(
+                state="running",
+                mode="auto_paper",
+                symbol="BTCUSDT",
+                session_id=f"session-{index}",
+                started_at=event_time,
+                last_event_time=event_time,
+                last_error=None,
+            )
+            repository.upsert_paper_broker_state(
+                balances={"USDT": Decimal("10000") - Decimal(index)},
+                positions={},
+                realized_pnl=Decimal(index),
+                snapshot_time=event_time,
+            )
+            repository.insert_event(
+                event_type="runtime_write",
+                symbol="BTCUSDT",
+                message=f"write-{index}",
+                payload={"index": index},
+                event_time=event_time,
+            )
+        except Exception as exc:  # pragma: no cover - failure path asserted below
+            errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(write_cycle, index) for index in range(5)]
+        for future in futures:
+            future.result()
+
+    assert errors == []
+
+    runtime_state = repository.get_runtime_session_state()
+    event_count = repository.count_runner_events(symbol="BTCUSDT")
+    repository.close()
+
+    assert runtime_state is not None
+    assert runtime_state.symbol == "BTCUSDT"
+    assert event_count == 5

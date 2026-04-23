@@ -2,12 +2,13 @@ import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+import sqlite3
 from uuid import uuid4
 
 import httpx
 import pytest
 
-from app.bot.runtime import PaperBotRuntime
+from app.bot.runtime import BotStatus, PaperBotRuntime
 from app.config import Settings
 from app.exchange.binance_rest import BinanceRestClient
 from app.exchange.symbol_service import SpotSymbolService
@@ -480,3 +481,29 @@ def test_paper_bot_runtime_ignores_corrupt_recovery_state_and_stays_safe() -> No
     assert status.recovered_from_prior_session is True
     assert status.broker_state_restored is False
     assert workstation.current_position is None
+
+
+def test_paper_bot_runtime_marks_friendly_persistence_warning_when_runtime_state_write_fails() -> None:
+    db_path = _db_path("runtime_persistence_warning")
+    settings = Settings(APP_MODE="paper", DATABASE_URL=f"sqlite:///{db_path}")
+    runtime = PaperBotRuntime(settings=settings, websocket_client=None, stream_manager=FakeStreamManager([]))  # type: ignore[arg-type]
+
+    def raise_commit_bug(**kwargs) -> None:
+        raise sqlite3.OperationalError("cannot commit - no transaction is active")
+
+    runtime._storage_repository.upsert_runtime_session_state = raise_commit_bug  # type: ignore[method-assign]  # noqa: SLF001
+
+    runtime._status = BotStatus(
+        state="running",
+        mode="auto_paper",
+        symbol="BTCUSDT",
+        timeframe="1m",
+        session_id="session-warning",
+        started_at=datetime(2024, 3, 9, 16, 0, tzinfo=UTC),
+    )
+    runtime._persist_runtime_state()  # noqa: SLF001 - targeted persistence failure coverage
+
+    assert runtime.storage_degraded() is True
+    assert runtime.storage_status_message() == (
+        "Persistence is temporarily unavailable. Live paper state is still running in memory."
+    )

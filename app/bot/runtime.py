@@ -39,6 +39,12 @@ from app.strategies.trend_following import TrendFollowingStrategy
 
 BotState = Literal["stopped", "running", "paused", "error"]
 BotMode = Literal["auto_paper", "paused", "stopped", "error"]
+PersistenceState = Literal[
+    "healthy",
+    "degraded_in_memory_only",
+    "recovered_from_persistence",
+    "unavailable",
+]
 
 
 @dataclass(slots=True)
@@ -102,6 +108,7 @@ class PaperBotRuntime:
         self._status = BotStatus(timeframe=self._default_timeframe())
         self._lock = asyncio.Lock()
         self._last_processed_candle_open_time: dict[str, datetime] = {}
+        self._persistence_last_ok_at: datetime | None = None
         self._restore_from_storage()
 
     def _default_timeframe(self) -> str:
@@ -142,6 +149,58 @@ class PaperBotRuntime:
             return None
         return self._storage_repository.optional_storage_message
 
+    def persistence_last_ok_at(self) -> datetime | None:
+        """Return the latest successful persistence timestamp, if known."""
+
+        return self._persistence_last_ok_at
+
+    def persistence_recovery_source(self) -> str | None:
+        """Return the recovery source label for the current session, if any."""
+
+        if self._status.recovered_from_prior_session and self._status.broker_state_restored:
+            return "sqlite_runtime_session+paper_broker_state"
+        if self._status.recovered_from_prior_session:
+            return "sqlite_runtime_session"
+        if self._status.broker_state_restored:
+            return "sqlite_paper_broker_state"
+        return None
+
+    def persistence_state(self) -> PersistenceState:
+        """Return the current persistence-health state for the workstation."""
+
+        has_recovered_state = self._status.recovered_from_prior_session or self._status.broker_state_restored
+        runtime_active = self._status.state in {"running", "paused"}
+        if self.storage_degraded():
+            if runtime_active or has_recovered_state:
+                return "degraded_in_memory_only"
+            return "unavailable"
+        if has_recovered_state:
+            return "recovered_from_persistence"
+        return "healthy"
+
+    def persistence_status_message(self) -> str:
+        """Return a user-readable persistence-health explanation."""
+
+        state = self.persistence_state()
+        if state == "degraded_in_memory_only":
+            return self.storage_status_message() or (
+                "Persistence is degraded. The paper runtime is still active, but current state is only safe in memory."
+            )
+        if state == "recovered_from_persistence":
+            return self._status.recovery_message or (
+                "Recovered prior runtime and broker state from persisted storage. Review the restored session before resuming."
+            )
+        if state == "unavailable":
+            return self.storage_status_message() or (
+                "Persistence is unavailable. No recoverable session state is currently available."
+            )
+        return "Runtime state and paper broker state are persisting normally."
+
+    def _mark_persistence_ok(self) -> None:
+        """Record the latest successful persistence timestamp."""
+
+        self._persistence_last_ok_at = datetime.now(tz=UTC)
+
     def _reset_runtime_state(self) -> None:
         """Reset in-memory runtime state after stop/reset."""
 
@@ -151,27 +210,41 @@ class PaperBotRuntime:
     def _persist_runtime_state(self) -> None:
         """Persist backend-owned runtime session state for restart recovery."""
 
-        self._storage_repository.upsert_runtime_session_state(
-            state=self._status.state,
-            mode=self._status.mode,
-            symbol=self._status.symbol,
-            session_id=self._status.session_id,
-            started_at=self._status.started_at,
-            last_event_time=self._status.last_event_time,
-            last_error=self._status.last_error,
-        )
+        try:
+            self._storage_repository.upsert_runtime_session_state(
+                state=self._status.state,
+                mode=self._status.mode,
+                symbol=self._status.symbol,
+                session_id=self._status.session_id,
+                started_at=self._status.started_at,
+                last_event_time=self._status.last_event_time,
+                last_error=self._status.last_error,
+            )
+            self._mark_persistence_ok()
+        except Exception:
+            self._storage_repository.record_persistence_warning(
+                "Persistence is temporarily unavailable. Live paper state is still running in memory."
+            )
+            self._logger.exception("Failed to persist runtime session state.")
 
     def _persist_broker_state(self) -> None:
         """Persist paper broker balances and positions for restart recovery."""
 
         if self._runner is None:
             return
-        self._storage_repository.upsert_paper_broker_state(
-            balances=self._runner.get_balances(),
-            positions=self._runner.get_open_positions(),
-            realized_pnl=self._runner.realized_pnl(),
-            snapshot_time=datetime.now(tz=UTC),
-        )
+        try:
+            self._storage_repository.upsert_paper_broker_state(
+                balances=self._runner.get_balances(),
+                positions=self._runner.get_open_positions(),
+                realized_pnl=self._runner.realized_pnl(),
+                snapshot_time=datetime.now(tz=UTC),
+            )
+            self._mark_persistence_ok()
+        except Exception:
+            self._storage_repository.record_persistence_warning(
+                "Paper broker persistence is temporarily unavailable. Open paper positions remain active in memory."
+            )
+            self._logger.exception("Failed to persist paper broker state.")
 
     def _build_broker_from_state(self, state: PaperBrokerStateRecord) -> PaperBroker:
         """Build an in-memory paper broker from persisted recovery state."""
@@ -373,6 +446,7 @@ class PaperBotRuntime:
         try:
             was_inserted = self._storage_repository.insert_ai_signal_snapshot(ai_signal)
             if was_inserted:
+                self._mark_persistence_ok()
                 self._storage_repository.insert_event(
                     event_type="ai_signal_snapshot",
                     symbol=symbol,
@@ -387,6 +461,9 @@ class PaperBotRuntime:
                     event_time=ai_signal.feature_vector.timestamp,
                 )
         except Exception:
+            self._storage_repository.record_persistence_warning(
+                "AI advisory persistence is temporarily unavailable. Live analysis remains available in memory."
+            )
             self._logger.exception("Failed to persist AI signal snapshot for %s.", symbol)
         return ai_signal
 
@@ -451,7 +528,17 @@ class PaperBotRuntime:
                 if snapshot.candle is None or not snapshot.candle.is_closed:
                     continue
                 if self._storage_repository is not None:
-                    self._storage_repository.insert_market_candle_snapshot(snapshot.candle)
+                    try:
+                        self._storage_repository.insert_market_candle_snapshot(snapshot.candle)
+                        self._mark_persistence_ok()
+                    except Exception:
+                        self._storage_repository.record_persistence_warning(
+                            "Candle history persistence is temporarily unavailable. Live paper logic continues in memory."
+                        )
+                        self._logger.exception(
+                            "Failed to persist market candle snapshot for %s.",
+                            snapshot.candle.symbol,
+                        )
                 last_processed_open_time = self._last_processed_candle_open_time.get(symbol)
                 if (
                     last_processed_open_time is not None

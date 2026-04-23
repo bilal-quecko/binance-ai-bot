@@ -23,6 +23,19 @@ interface BotControlPanelProps {
   onReset: () => void;
 }
 
+function persistenceLabel(state: BotStatusResponse['persistence']['persistence_state']): string {
+  if (state === 'healthy') {
+    return 'Healthy';
+  }
+  if (state === 'recovered_from_persistence') {
+    return 'Recovered';
+  }
+  if (state === 'degraded_in_memory_only') {
+    return 'In memory only';
+  }
+  return 'Unavailable';
+}
+
 export function BotControlPanel({
   searchQuery,
   selectedSymbol,
@@ -226,6 +239,11 @@ export function BotControlPanel({
               <p className="mt-1 text-xs text-slate-400">
                 {status.broker_state_restored ? 'Broker state restored' : 'No recovered broker state'}
               </p>
+            </div>
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Persistence</p>
+              <p className="mt-2 text-sm text-slate-200">{persistenceLabel(status.persistence.persistence_state)}</p>
+              <p className="mt-1 text-xs text-slate-400">{status.persistence.persistence_message}</p>
             </div>
           </div>
 

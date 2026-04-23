@@ -25,6 +25,7 @@ from app.market_data.models import MarketSnapshot
 from app.market_data.orderbook import TopOfBook
 from app.paper.models import Position
 from app.runner.models import TradeReadiness
+from app.sentiment.models import SentimentComponent
 from app.storage import StorageRepository
 from app.strategies.models import StrategySignal
 
@@ -46,22 +47,29 @@ class FakeSymbolSentimentService:
     def __init__(self, snapshot: SymbolSentimentSnapshot | None = None) -> None:
         self._snapshot = snapshot
 
-    def analyze(self, *, symbol: str) -> SymbolSentimentSnapshot:
+    def analyze(
+        self,
+        *,
+        symbol: str,
+        candles=(),
+        benchmark_symbol=None,
+        benchmark_closes=(),
+    ) -> SymbolSentimentSnapshot:
         if self._snapshot is not None:
             return self._snapshot
         return SymbolSentimentSnapshot(
             symbol=symbol,
             generated_at=datetime(2024, 3, 9, 16, 2, tzinfo=UTC),
             data_state='incomplete',
-            status_message=f'Symbol sentiment for {symbol} is insufficient until source-backed evidence becomes available.',
-            sentiment_state='insufficient_data',
-            sentiment_score=None,
-            source_count=0,
-            freshness='unknown',
-            freshness_minutes=None,
+            status_message=f'Proxy sentiment for {symbol} still needs more live history.',
+            score=None,
+            label='insufficient_data',
             confidence=None,
-            evidence_summary=(),
-            explanation=f'No configured symbol-sentiment sources returned usable external evidence for {symbol}, so sentiment stays insufficient.',
+            momentum_state='unknown',
+            risk_flag='unknown',
+            explanation=f'Symbol sentiment for {symbol} is unavailable because proxy sentiment inputs are still incomplete.',
+            source_mode='proxy',
+            components=(),
         )
 
 
@@ -69,6 +77,10 @@ class FakeRuntime:
     def __init__(self) -> None:
         self.state = BotStatus(state='stopped', mode='stopped', timeframe='1m')
         self.reset_called = False
+        self._storage_degraded = False
+        self._storage_message: str | None = None
+        self._persistence_last_ok_at: datetime | None = datetime(2024, 3, 9, 16, 2, tzinfo=UTC)
+        self._persistence_recovery_source: str | None = None
 
     def status(self) -> BotStatus:
         return self.state
@@ -77,7 +89,29 @@ class FakeRuntime:
         return False
 
     def storage_status_message(self) -> str | None:
-        return None
+        return self._storage_message
+
+    def persistence_state(self) -> str:
+        if self._storage_degraded:
+            if self.state.state in {'running', 'paused'} or self.state.recovered_from_prior_session or self.state.broker_state_restored:
+                return 'degraded_in_memory_only'
+            return 'unavailable'
+        if self.state.recovered_from_prior_session or self.state.broker_state_restored:
+            return 'recovered_from_persistence'
+        return 'healthy'
+
+    def persistence_status_message(self) -> str:
+        if self._storage_degraded:
+            return self._storage_message or 'Persistence is degraded. Current paper state is only safe in memory.'
+        if self.state.recovered_from_prior_session or self.state.broker_state_restored:
+            return self.state.recovery_message or 'Recovered session state from persisted storage.'
+        return 'Runtime state and paper broker state are persisting normally.'
+
+    def persistence_last_ok_at(self) -> datetime | None:
+        return self._persistence_last_ok_at
+
+    def persistence_recovery_source(self) -> str | None:
+        return self._persistence_recovery_source
 
     async def start(self, symbol: str) -> BotStatus:
         self.state = BotStatus(
@@ -309,6 +343,46 @@ class BrokenRuntime(NeutralRuntime):
         raise RuntimeError("simulated workstation failure")
 
 
+class DegradedPersistenceRuntime(FakeRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.state = BotStatus(
+            state='running',
+            mode='auto_paper',
+            symbol='BTCUSDT',
+            timeframe='1m',
+            session_id='session-btcusdt',
+            started_at=datetime(2024, 3, 9, 16, 0, tzinfo=UTC),
+        )
+        self._storage_degraded = True
+        self._storage_message = 'Persistence is temporarily unavailable. Live paper state is still running in memory.'
+
+
+class UnavailablePersistenceRuntime(NeutralRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self._storage_degraded = True
+        self._storage_message = 'Persistence is unavailable. No recoverable session state is currently available.'
+
+
+class RecoveredPersistenceRuntime(FakeRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.state = BotStatus(
+            state='paused',
+            mode='paused',
+            symbol='BTCUSDT',
+            timeframe='1m',
+            session_id='recovered-session',
+            started_at=datetime(2024, 3, 9, 15, 50, tzinfo=UTC),
+            last_event_time=datetime(2024, 3, 9, 15, 59, tzinfo=UTC),
+            recovered_from_prior_session=True,
+            broker_state_restored=True,
+            recovery_message='Recovered a prior paper session after backend restart. Manual resume is required before auto trading continues.',
+        )
+        self._persistence_recovery_source = 'sqlite_runtime_session+paper_broker_state'
+
+
 class HistoryWaitingRuntime(FakeRuntime):
     def __init__(self) -> None:
         super().__init__()
@@ -383,6 +457,21 @@ def _db_path() -> Path:
     base = Path("tests/.tmp_storage")
     base.mkdir(parents=True, exist_ok=True)
     return (base / f"bot_api_{uuid4().hex}.sqlite").resolve()
+
+
+def _persistence_json(
+    *,
+    state: str,
+    message: str,
+    last_ok_at: str | None = '2024-03-09T16:02:00Z',
+    recovery_source: str | None = None,
+) -> dict[str, str | None]:
+    return {
+        'persistence_state': state,
+        'persistence_message': message,
+        'persistence_last_ok_at': last_ok_at,
+        'recovery_source': recovery_source,
+    }
 
 
 class IdleStreamManager:
@@ -808,11 +897,19 @@ def test_recovered_runtime_state_is_visible_after_restart_style_reconstruction()
     assert status_response.json()['recovered_from_prior_session'] is True
     assert status_response.json()['broker_state_restored'] is True
     assert 'Manual resume is required' in status_response.json()['recovery_message']
+    assert status_response.json()['persistence']['persistence_state'] == 'recovered_from_persistence'
+    assert 'Manual resume is required' in status_response.json()['persistence']['persistence_message']
+    assert status_response.json()['persistence']['recovery_source'] == 'sqlite_runtime_session+paper_broker_state'
+    assert status_response.json()['persistence']['persistence_last_ok_at'] is not None
 
     assert workstation_response.status_code == 200
     assert workstation_response.json()['data_state'] == 'waiting_for_history'
     assert workstation_response.json()['runtime_status']['recovered_from_prior_session'] is True
     assert workstation_response.json()['runtime_status']['broker_state_restored'] is True
+    assert workstation_response.json()['persistence']['persistence_state'] == 'recovered_from_persistence'
+    assert 'Manual resume is required' in workstation_response.json()['persistence']['persistence_message']
+    assert workstation_response.json()['persistence']['recovery_source'] == 'sqlite_runtime_session+paper_broker_state'
+    assert workstation_response.json()['persistence']['persistence_last_ok_at'] is not None
     assert workstation_response.json()['current_position']['quantity'] == '0.5'
     assert workstation_response.json()['trade_readiness']['next_action'] == 'resume_runtime'
     assert 'Manual resume is required' in workstation_response.json()['trade_readiness']['reason_if_not_trading']
@@ -835,6 +932,7 @@ def test_workstation_endpoints_return_empty_states_without_runtime_data() -> Non
         pattern_analysis_response = client.get('/bot/pattern-analysis', params={'symbol': 'ETHUSDT', 'horizon': '7d'})
         market_sentiment_response = client.get('/bot/market-sentiment', params={'symbol': 'ETHUSDT'})
         symbol_sentiment_response = client.get('/bot/symbol-sentiment', params={'symbol': 'ETHUSDT'})
+        fusion_signal_response = client.get('/bot/fusion-signal', params={'symbol': 'ETHUSDT'})
         ai_signal_response = client.get('/bot/ai-signal', params={'symbol': 'ETHUSDT'})
         ai_history_response = client.get('/bot/ai-signal/history', params={'symbol': 'ETHUSDT', 'limit': 10, 'offset': 0})
         ai_evaluation_response = client.get('/bot/ai-signal/evaluation', params={'symbol': 'ETHUSDT'})
@@ -860,7 +958,17 @@ def test_workstation_endpoints_return_empty_states_without_runtime_data() -> Non
             'recovered_from_prior_session': False,
             'broker_state_restored': False,
             'recovery_message': None,
+            'persistence': _persistence_json(
+                state='healthy',
+                message='Runtime state and paper broker state are persisting normally.',
+                recovery_source=None,
+            ),
         },
+        'persistence': _persistence_json(
+            state='healthy',
+            message='Runtime state and paper broker state are persisting normally.',
+            recovery_source=None,
+        ),
         'last_price': None,
         'current_candle': None,
         'top_of_book': None,
@@ -902,9 +1010,12 @@ def test_workstation_endpoints_return_empty_states_without_runtime_data() -> Non
     assert market_sentiment_response.json()['data_state'] == 'waiting_for_runtime'
     assert market_sentiment_response.json()['market_state'] == 'insufficient_data'
     assert symbol_sentiment_response.status_code == 200
-    assert symbol_sentiment_response.json()['data_state'] == 'ready'
-    assert symbol_sentiment_response.json()['sentiment_state'] == 'insufficient_data'
-    assert symbol_sentiment_response.json()['source_count'] == 0
+    assert symbol_sentiment_response.json()['data_state'] == 'waiting_for_runtime'
+    assert symbol_sentiment_response.json()['label'] == 'insufficient_data'
+    assert symbol_sentiment_response.json()['components'] == []
+    assert fusion_signal_response.status_code == 200
+    assert fusion_signal_response.json()['data_state'] == 'waiting_for_runtime'
+    assert fusion_signal_response.json()['final_signal'] == 'wait'
     assert ai_signal_response.status_code == 200
     assert ai_signal_response.json() is None
     assert ai_history_response.status_code == 200
@@ -929,15 +1040,28 @@ def test_symbol_sentiment_endpoint_returns_ready_shape_with_source_backing() -> 
         symbol='XRPUSDT',
         generated_at=datetime(2024, 3, 9, 16, 2, tzinfo=UTC),
         data_state='ready',
-        status_message='Symbol sentiment is ready for XRPUSDT.',
-        sentiment_state='bullish',
-        sentiment_score=74,
-        source_count=2,
-        freshness='fresh',
-        freshness_minutes=18,
+        status_message='Proxy sentiment is ready for XRPUSDT.',
+        score=74,
+        label='bullish',
         confidence=67,
-        evidence_summary=('DeskA: Listing momentum stays positive', 'DeskB: Network activity improves'),
-        explanation='Symbol sentiment for XRPUSDT reads bullish from two fresh source-backed items.',
+        momentum_state='rising',
+        risk_flag='normal',
+        explanation='Proxy symbol sentiment for XRPUSDT reads bullish. Price acceleration and exchange activity both support the move.',
+        source_mode='proxy',
+        components=(
+            SentimentComponent(
+                name='price_acceleration',
+                score=Decimal('0.74'),
+                weight=Decimal('0.30'),
+                explanation='Price acceleration proxy is bullish with strengthening returns.',
+            ),
+            SentimentComponent(
+                name='exchange_activity_proxy',
+                score=Decimal('0.43'),
+                weight=Decimal('0.20'),
+                explanation='Exchange-activity proxy is bullish with stronger trade participation.',
+            ),
+        ),
     )
     app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
     app.dependency_overrides[get_symbol_sentiment_service] = lambda: FakeSymbolSentimentService(snapshot)
@@ -955,16 +1079,67 @@ def test_symbol_sentiment_endpoint_returns_ready_shape_with_source_backing() -> 
         'symbol': 'XRPUSDT',
         'generated_at': '2024-03-09T16:02:00Z',
         'data_state': 'ready',
-        'status_message': 'Symbol sentiment is ready for XRPUSDT.',
-        'sentiment_state': 'bullish',
-        'sentiment_score': 74,
-        'source_count': 2,
-        'freshness': 'fresh',
-        'freshness_minutes': 18,
+        'status_message': 'Proxy sentiment is ready for XRPUSDT.',
+        'score': 74,
+        'label': 'bullish',
         'confidence': 67,
-        'evidence_summary': ['DeskA: Listing momentum stays positive', 'DeskB: Network activity improves'],
-        'explanation': 'Symbol sentiment for XRPUSDT reads bullish from two fresh source-backed items.',
+        'momentum_state': 'rising',
+        'risk_flag': 'normal',
+        'source_mode': 'proxy',
+        'components': [
+            'Price acceleration proxy is bullish with strengthening returns.',
+            'Exchange-activity proxy is bullish with stronger trade participation.',
+        ],
+        'explanation': 'Proxy symbol sentiment for XRPUSDT reads bullish. Price acceleration and exchange activity both support the move.',
     }
+
+
+def test_fusion_signal_endpoint_returns_ready_shape() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    snapshot = SymbolSentimentSnapshot(
+        symbol='BTCUSDT',
+        generated_at=datetime(2024, 3, 9, 16, 2, tzinfo=UTC),
+        data_state='ready',
+        status_message='Proxy sentiment is ready for BTCUSDT.',
+        score=58,
+        label='bullish',
+        confidence=71,
+        momentum_state='rising',
+        risk_flag='normal',
+        explanation='Proxy symbol sentiment for BTCUSDT reads bullish from aligned proxy drivers.',
+        source_mode='proxy',
+        components=(
+            SentimentComponent(
+                name='price_acceleration',
+                score=Decimal('0.58'),
+                weight=Decimal('0.30'),
+                explanation='Price acceleration proxy is bullish with strengthening returns.',
+            ),
+        ),
+    )
+    runtime = FakeRuntime()
+    runtime.state = BotStatus(state='running', mode='auto_paper', symbol='BTCUSDT', timeframe='1m')
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_symbol_sentiment_service] = lambda: FakeSymbolSentimentService(snapshot)
+    app.dependency_overrides[get_bot_runtime] = lambda: runtime
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    client = TestClient(app)
+
+    try:
+        response = client.get('/bot/fusion-signal', params={'symbol': 'BTCUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['symbol'] == 'BTCUSDT'
+    assert payload['data_state'] in {'ready', 'waiting_for_history'}
+    assert payload['final_signal'] in {'long', 'wait'}
+    assert isinstance(payload['confidence'], int)
+    assert payload['preferred_horizon'] in {'5m', '15m', '1h'}
+    assert isinstance(payload['top_reasons'], list)
+    assert isinstance(payload['warnings'], list)
 
 
 def test_workstation_endpoint_does_not_crash_when_runtime_state_errors() -> None:
@@ -984,6 +1159,7 @@ def test_workstation_endpoint_does_not_crash_when_runtime_state_errors() -> None
     assert workstation_response.status_code == 200
     assert workstation_response.json()['data_state'] == 'degraded_storage'
     assert workstation_response.json()['is_runtime_symbol'] is False
+    assert workstation_response.json()['persistence']['persistence_state'] == 'healthy'
     assert ai_signal_response.status_code == 200
     assert ai_signal_response.json() is None
 
@@ -1019,6 +1195,51 @@ def test_workstation_reports_waiting_for_history_when_runtime_is_live_but_featur
     assert ai_history_response.json()['data_state'] == 'waiting_for_history'
     assert ai_evaluation_response.status_code == 200
     assert ai_evaluation_response.json()['data_state'] == 'waiting_for_history'
+
+
+def test_status_and_workstation_report_degraded_in_memory_only_persistence() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    runtime = DegradedPersistenceRuntime()
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_bot_runtime] = lambda: runtime
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    client = TestClient(app)
+
+    try:
+        status_response = client.get('/bot/status')
+        workstation_response = client.get('/bot/workstation', params={'symbol': 'BTCUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert status_response.status_code == 200
+    assert status_response.json()['persistence']['persistence_state'] == 'degraded_in_memory_only'
+    assert 'still running in memory' in status_response.json()['persistence']['persistence_message']
+    assert workstation_response.status_code == 200
+    assert workstation_response.json()['persistence']['persistence_state'] == 'degraded_in_memory_only'
+    assert 'still running in memory' in workstation_response.json()['persistence']['persistence_message']
+
+
+def test_status_reports_unavailable_persistence_when_storage_is_not_usable() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    runtime = UnavailablePersistenceRuntime()
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_bot_runtime] = lambda: runtime
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    client = TestClient(app)
+
+    try:
+        status_response = client.get('/bot/status')
+        workstation_response = client.get('/bot/workstation', params={'symbol': 'BTCUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert status_response.status_code == 200
+    assert status_response.json()['persistence']['persistence_state'] == 'unavailable'
+    assert 'No recoverable session state' in status_response.json()['persistence']['persistence_message']
+    assert workstation_response.status_code == 200
+    assert workstation_response.json()['persistence']['persistence_state'] == 'unavailable'
 
 
 def test_reset_session_followed_by_workstation_read_stays_safe() -> None:

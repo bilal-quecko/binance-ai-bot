@@ -10,14 +10,13 @@ from fastapi import FastAPI
 
 from app.api.bot_api import router as bot_router
 from app.api.dashboard_api import router as dashboard_router
-from app.analysis import SymbolSentimentService
 from app.bot import PaperBotRuntime
 from app.config import get_settings
-from app.data import NewsService
 from app.exchange.binance_rest import BinanceRestClient
 from app.exchange.binance_ws import BinanceWebSocketClient
 from app.exchange.symbol_service import SpotSymbolService
 from app.monitoring.logging import configure_logging
+from app.sentiment import SymbolSentimentService
 
 
 @asynccontextmanager
@@ -28,7 +27,7 @@ async def lifespan(app: FastAPI):
     rest_client = BinanceRestClient(settings)
     websocket_client = BinanceWebSocketClient(base_url=settings.binance_ws_url)
     symbol_service = SpotSymbolService(rest_client)
-    symbol_sentiment_service = SymbolSentimentService(news_service=NewsService())
+    symbol_sentiment_service = SymbolSentimentService()
     bot_runtime = PaperBotRuntime(
         settings=settings,
         websocket_client=websocket_client,

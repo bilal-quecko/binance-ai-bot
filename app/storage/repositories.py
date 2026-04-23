@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, Iterator
 
 from app.ai.models import AISignalSnapshot
 from app.market_data.candles import Candle
@@ -239,6 +240,7 @@ class StorageRepository:
     """Paper-mode SQLite repository."""
 
     def __init__(self, database_url: str) -> None:
+        self._database_url = database_url
         self._connection = create_db_connection(database_url)
         self._optional_storage_degraded = False
         self._optional_storage_message: str | None = None
@@ -247,6 +249,21 @@ class StorageRepository:
         """Close the underlying SQLite connection."""
 
         self._connection.close()
+
+    def _open_connection(self) -> sqlite3.Connection:
+        """Open a fresh SQLite connection for an isolated operation."""
+
+        return create_db_connection(self._database_url)
+
+    @contextmanager
+    def _connection_scope(self) -> Iterator[sqlite3.Connection]:
+        """Yield a fresh SQLite connection for one repository operation."""
+
+        connection = self._open_connection()
+        try:
+            yield connection
+        finally:
+            connection.close()
 
     @property
     def optional_storage_degraded(self) -> bool:
@@ -266,29 +283,38 @@ class StorageRepository:
         self._optional_storage_degraded = True
         self._optional_storage_message = message
 
+    def record_persistence_warning(self, message: str) -> None:
+        """Expose a friendly persistence warning to runtime and API callers."""
+
+        self._mark_optional_storage_degraded(message)
+
     def clear_all(self) -> None:
         """Delete all persisted paper-session rows."""
 
-        with self._connection:
-            for table_name in (
-                "trades",
-                "fills",
-                "positions_snapshots",
-                "pnl_snapshots",
-                "runner_events",
-                "ai_signal_snapshots",
-                "market_candle_snapshots",
-                "runtime_session_state",
-                "paper_broker_state",
-                "paper_broker_positions",
-            ):
-                try:
-                    self._connection.execute(f"DELETE FROM {table_name}")
-                except sqlite3.OperationalError as exc:
-                    if not _is_optional_schema_error(exc):
-                        raise
-                    self._mark_optional_storage_degraded(f"Optional storage table {table_name} is unavailable.")
-                    LOGGER.warning("Skipping clear for missing table %s: %s", table_name, exc)
+        connection = self._open_connection()
+        try:
+            with connection:
+                for table_name in (
+                    "trades",
+                    "fills",
+                    "positions_snapshots",
+                    "pnl_snapshots",
+                    "runner_events",
+                    "ai_signal_snapshots",
+                    "market_candle_snapshots",
+                    "runtime_session_state",
+                    "paper_broker_state",
+                    "paper_broker_positions",
+                ):
+                    try:
+                        connection.execute(f"DELETE FROM {table_name}")
+                    except sqlite3.OperationalError as exc:
+                        if not _is_optional_schema_error(exc):
+                            raise
+                        self._mark_optional_storage_degraded(f"Optional storage table {table_name} is unavailable.")
+                        LOGGER.warning("Skipping clear for missing table %s: %s", table_name, exc)
+        finally:
+            connection.close()
 
     def upsert_runtime_session_state(
         self,
@@ -303,8 +329,10 @@ class StorageRepository:
     ) -> None:
         """Persist the backend-owned runtime session state."""
 
-        with self._connection:
-            self._connection.execute(
+        connection = self._open_connection()
+        try:
+            with connection:
+                connection.execute(
                 """
                 INSERT INTO runtime_session_state (
                     singleton_id, state, mode, symbol, session_id, started_at, last_event_time, last_error
@@ -328,17 +356,20 @@ class StorageRepository:
                     last_error,
                 ),
             )
+        finally:
+            connection.close()
 
     def get_runtime_session_state(self) -> RuntimeSessionRecord | None:
         """Return the persisted backend-owned runtime session state."""
 
-        row = self._connection.execute(
-            """
-            SELECT state, mode, symbol, session_id, started_at, last_event_time, last_error
-            FROM runtime_session_state
-            WHERE singleton_id = 1
-            """
-        ).fetchone()
+        with self._connection_scope() as connection:
+            row = connection.execute(
+                """
+                SELECT state, mode, symbol, session_id, started_at, last_event_time, last_error
+                FROM runtime_session_state
+                WHERE singleton_id = 1
+                """
+            ).fetchone()
         if row is None:
             return None
         return RuntimeSessionRecord(
@@ -354,8 +385,12 @@ class StorageRepository:
     def clear_runtime_session_state(self) -> None:
         """Clear any persisted runtime recovery state."""
 
-        with self._connection:
-            self._connection.execute("DELETE FROM runtime_session_state")
+        connection = self._open_connection()
+        try:
+            with connection:
+                connection.execute("DELETE FROM runtime_session_state")
+        finally:
+            connection.close()
 
     def upsert_paper_broker_state(
         self,
@@ -371,8 +406,10 @@ class StorageRepository:
             {asset.upper(): str(balance) for asset, balance in balances.items()},
             sort_keys=True,
         )
-        with self._connection:
-            self._connection.execute(
+        connection = self._open_connection()
+        try:
+            with connection:
+                connection.execute(
                 """
                 INSERT INTO paper_broker_state (
                     singleton_id, balances_json, realized_pnl, snapshot_time
@@ -388,9 +425,9 @@ class StorageRepository:
                     snapshot_time.isoformat(),
                 ),
             )
-            self._connection.execute("DELETE FROM paper_broker_positions")
-            for symbol, position in positions.items():
-                self._connection.execute(
+                connection.execute("DELETE FROM paper_broker_positions")
+                for symbol, position in positions.items():
+                    connection.execute(
                     """
                     INSERT INTO paper_broker_positions (
                         symbol, quantity, avg_entry_price, realized_pnl, quote_asset, snapshot_time
@@ -405,41 +442,44 @@ class StorageRepository:
                         snapshot_time.isoformat(),
                     ),
                 )
+        finally:
+            connection.close()
 
     def get_paper_broker_state(self) -> PaperBrokerStateRecord | None:
         """Return persisted paper broker recovery state."""
 
-        row = self._connection.execute(
-            """
-            SELECT balances_json, realized_pnl, snapshot_time
-            FROM paper_broker_state
-            WHERE singleton_id = 1
-            """
-        ).fetchone()
-        if row is None:
-            return None
-        try:
-            raw_balances = json.loads(row["balances_json"])
-            balances = {
-                str(asset).upper(): _decimal(value)
-                for asset, value in dict(raw_balances).items()
-            }
-        except (TypeError, ValueError, json.JSONDecodeError):
-            LOGGER.warning("Ignoring corrupt persisted paper broker balances during recovery.")
-            return None
+        with self._connection_scope() as connection:
+            row = connection.execute(
+                """
+                SELECT balances_json, realized_pnl, snapshot_time
+                FROM paper_broker_state
+                WHERE singleton_id = 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                raw_balances = json.loads(row["balances_json"])
+                balances = {
+                    str(asset).upper(): _decimal(value)
+                    for asset, value in dict(raw_balances).items()
+                }
+            except (TypeError, ValueError, json.JSONDecodeError):
+                LOGGER.warning("Ignoring corrupt persisted paper broker balances during recovery.")
+                return None
 
-        snapshot_time = _safe_datetime(row["snapshot_time"])
-        if snapshot_time is None:
-            LOGGER.warning("Ignoring corrupt persisted paper broker snapshot time during recovery.")
-            return None
+            snapshot_time = _safe_datetime(row["snapshot_time"])
+            if snapshot_time is None:
+                LOGGER.warning("Ignoring corrupt persisted paper broker snapshot time during recovery.")
+                return None
 
-        position_rows = self._connection.execute(
-            """
-            SELECT symbol, quantity, avg_entry_price, realized_pnl, quote_asset, snapshot_time
-            FROM paper_broker_positions
-            ORDER BY symbol ASC
-            """
-        ).fetchall()
+            position_rows = connection.execute(
+                """
+                SELECT symbol, quantity, avg_entry_price, realized_pnl, quote_asset, snapshot_time
+                FROM paper_broker_positions
+                ORDER BY symbol ASC
+                """
+            ).fetchall()
         positions: list[PositionSnapshotRecord] = []
         for position_row in position_rows:
             position_snapshot_time = _safe_datetime(position_row["snapshot_time"])
@@ -469,9 +509,13 @@ class StorageRepository:
     def clear_paper_broker_state(self) -> None:
         """Clear persisted paper broker recovery state."""
 
-        with self._connection:
-            self._connection.execute("DELETE FROM paper_broker_state")
-            self._connection.execute("DELETE FROM paper_broker_positions")
+        connection = self._open_connection()
+        try:
+            with connection:
+                connection.execute("DELETE FROM paper_broker_state")
+                connection.execute("DELETE FROM paper_broker_positions")
+        finally:
+            connection.close()
 
     def insert_market_candle_snapshot(self, candle: Candle) -> None:
         """Persist a closed candle for later AI outcome validation."""
@@ -479,8 +523,9 @@ class StorageRepository:
         if not candle.is_closed:
             return
         try:
-            with self._connection:
-                self._connection.execute(
+            connection = self._open_connection()
+            with connection:
+                connection.execute(
                     """
                     INSERT OR REPLACE INTO market_candle_snapshots (
                         symbol, timeframe, open_time, close_time, close_price, event_time
@@ -500,70 +545,103 @@ class StorageRepository:
                 raise
             self._mark_optional_storage_degraded("Closed-candle outcome storage is unavailable.")
             LOGGER.warning("Skipping market candle snapshot persistence due to schema issue: %s", exc)
+        finally:
+            if "connection" in locals():
+                connection.close()
 
     def insert_ai_signal_snapshot(self, snapshot: AISignalSnapshot) -> bool:
         """Persist an AI advisory snapshot when it materially changed."""
 
-        with self._connection:
-            try:
-                latest_snapshot = self.get_latest_ai_signal(snapshot.symbol)
-                next_feature_summary = _parse_ai_feature_summary(_serialize_ai_feature_summary(snapshot))
-                next_snapshot = AISignalSnapshotRecord(
-                    symbol=snapshot.symbol.upper(),
-                    timestamp=snapshot.feature_vector.timestamp,
-                    bias=snapshot.bias,
-                    confidence=snapshot.confidence,
-                    entry_signal=snapshot.entry_signal,
-                    exit_signal=snapshot.exit_signal,
-                    suggested_action=snapshot.suggested_action,
-                    explanation=snapshot.explanation,
-                    feature_summary=next_feature_summary,
-                )
-                if latest_snapshot is not None and not _ai_signal_materially_changed(latest_snapshot, next_snapshot):
-                    return False
+        connection = self._open_connection()
+        try:
+            with connection:
+                try:
+                    row = connection.execute(
+                        """
+                        SELECT symbol, snapshot_time, bias, confidence, entry_signal, exit_signal,
+                               suggested_action, explanation, feature_summary_json
+                        FROM ai_signal_snapshots
+                        WHERE symbol = ?
+                        ORDER BY snapshot_time DESC
+                        LIMIT 1
+                        """,
+                        (snapshot.symbol.upper(),),
+                    ).fetchone()
+                    latest_snapshot = (
+                        AISignalSnapshotRecord(
+                            symbol=row["symbol"],
+                            timestamp=datetime.fromisoformat(row["snapshot_time"]),
+                            bias=row["bias"],
+                            confidence=int(row["confidence"]),
+                            entry_signal=bool(row["entry_signal"]),
+                            exit_signal=bool(row["exit_signal"]),
+                            suggested_action=row["suggested_action"],
+                            explanation=row["explanation"],
+                            feature_summary=_parse_ai_feature_summary(row["feature_summary_json"]),
+                        )
+                        if row is not None
+                        else None
+                    )
+                    next_feature_summary = _parse_ai_feature_summary(_serialize_ai_feature_summary(snapshot))
+                    next_snapshot = AISignalSnapshotRecord(
+                        symbol=snapshot.symbol.upper(),
+                        timestamp=snapshot.feature_vector.timestamp,
+                        bias=snapshot.bias,
+                        confidence=snapshot.confidence,
+                        entry_signal=snapshot.entry_signal,
+                        exit_signal=snapshot.exit_signal,
+                        suggested_action=snapshot.suggested_action,
+                        explanation=snapshot.explanation,
+                        feature_summary=next_feature_summary,
+                    )
+                    if latest_snapshot is not None and not _ai_signal_materially_changed(latest_snapshot, next_snapshot):
+                        return False
 
-                self._connection.execute(
-                    """
-                    INSERT INTO ai_signal_snapshots (
-                        symbol, snapshot_time, bias, confidence, entry_signal, exit_signal,
-                        suggested_action, explanation, feature_summary_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        next_snapshot.symbol,
-                        next_snapshot.timestamp.isoformat(),
-                        next_snapshot.bias,
-                        next_snapshot.confidence,
-                        int(next_snapshot.entry_signal),
-                        int(next_snapshot.exit_signal),
-                        next_snapshot.suggested_action,
-                        next_snapshot.explanation,
-                        _serialize_ai_feature_summary(snapshot),
-                    ),
-                )
-            except sqlite3.OperationalError as exc:
-                if not _is_optional_schema_error(exc):
-                    raise
-                self._mark_optional_storage_degraded("AI advisory snapshot storage is unavailable.")
-                LOGGER.warning("Skipping AI signal snapshot persistence due to schema issue: %s", exc)
-                return False
+                    connection.execute(
+                        """
+                        INSERT INTO ai_signal_snapshots (
+                            symbol, snapshot_time, bias, confidence, entry_signal, exit_signal,
+                            suggested_action, explanation, feature_summary_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            next_snapshot.symbol,
+                            next_snapshot.timestamp.isoformat(),
+                            next_snapshot.bias,
+                            next_snapshot.confidence,
+                            int(next_snapshot.entry_signal),
+                            int(next_snapshot.exit_signal),
+                            next_snapshot.suggested_action,
+                            next_snapshot.explanation,
+                            _serialize_ai_feature_summary(snapshot),
+                        ),
+                    )
+                except sqlite3.OperationalError as exc:
+                    if not _is_optional_schema_error(exc):
+                        raise
+                    self._mark_optional_storage_degraded("AI advisory snapshot storage is unavailable.")
+                    LOGGER.warning("Skipping AI signal snapshot persistence due to schema issue: %s", exc)
+                    return False
+        finally:
+            connection.close()
         return True
 
     def get_latest_ai_signal(self, symbol: str) -> AISignalSnapshotRecord | None:
         """Return the latest persisted AI advisory snapshot for a symbol."""
 
         try:
-            row = self._connection.execute(
-                """
-                SELECT symbol, snapshot_time, bias, confidence, entry_signal, exit_signal,
-                       suggested_action, explanation, feature_summary_json
-                FROM ai_signal_snapshots
-                WHERE symbol = ?
-                ORDER BY snapshot_time DESC
-                LIMIT 1
-                """,
-                (symbol.upper(),),
-            ).fetchone()
+            with self._connection_scope() as connection:
+                row = connection.execute(
+                    """
+                    SELECT symbol, snapshot_time, bias, confidence, entry_signal, exit_signal,
+                           suggested_action, explanation, feature_summary_json
+                    FROM ai_signal_snapshots
+                    WHERE symbol = ?
+                    ORDER BY snapshot_time DESC
+                    LIMIT 1
+                    """,
+                    (symbol.upper(),),
+                ).fetchone()
         except sqlite3.OperationalError as exc:
             if not _is_optional_schema_error(exc):
                 raise
@@ -614,7 +692,8 @@ class StorageRepository:
             query += " LIMIT ? OFFSET ?"
             params.extend((limit, offset))
         try:
-            rows = self._connection.execute(query, tuple(params)).fetchall()
+            with self._connection_scope() as connection:
+                rows = connection.execute(query, tuple(params)).fetchall()
         except sqlite3.OperationalError as exc:
             if not _is_optional_schema_error(exc):
                 raise
@@ -659,7 +738,8 @@ class StorageRepository:
             timestamp_column="snapshot_time",
         )
         try:
-            row = self._connection.execute(query, tuple(params)).fetchone()
+            with self._connection_scope() as connection:
+                row = connection.execute(query, tuple(params)).fetchone()
         except sqlite3.OperationalError as exc:
             if not _is_optional_schema_error(exc):
                 raise
@@ -696,7 +776,8 @@ class StorageRepository:
         )
         query += " ORDER BY close_time ASC"
         try:
-            rows = self._connection.execute(query, tuple(params)).fetchall()
+            with self._connection_scope() as connection:
+                rows = connection.execute(query, tuple(params)).fetchall()
         except sqlite3.OperationalError as exc:
             if not _is_optional_schema_error(exc):
                 raise
@@ -725,8 +806,10 @@ class StorageRepository:
     ) -> None:
         """Persist a trade record."""
 
-        with self._connection:
-            self._connection.execute(
+        connection = self._open_connection()
+        try:
+            with connection:
+                connection.execute(
                 """
                 INSERT INTO trades (
                     order_id, symbol, side, requested_quantity, approved_quantity, filled_quantity,
@@ -749,12 +832,16 @@ class StorageRepository:
                     event_time.isoformat(),
                 ),
             )
+        finally:
+            connection.close()
 
     def insert_fill(self, fill_result: FillResult, event_time: datetime) -> None:
         """Persist a fill row for executed orders."""
 
-        with self._connection:
-            self._connection.execute(
+        connection = self._open_connection()
+        try:
+            with connection:
+                connection.execute(
                 """
                 INSERT INTO fills (
                     order_id, symbol, side, filled_quantity, fill_price, fee_paid,
@@ -773,6 +860,8 @@ class StorageRepository:
                     event_time.isoformat(),
                 ),
             )
+        finally:
+            connection.close()
 
     def insert_position_snapshot(self, position: Position | None, event_time: datetime, symbol: str) -> None:
         """Persist a position snapshot for the current cycle."""
@@ -787,8 +876,10 @@ class StorageRepository:
             realized_pnl = position.realized_pnl
             quote_asset = position.quote_asset
 
-        with self._connection:
-            self._connection.execute(
+        connection = self._open_connection()
+        try:
+            with connection:
+                connection.execute(
                 """
                 INSERT INTO positions_snapshots (
                     symbol, quantity, avg_entry_price, realized_pnl, quote_asset, snapshot_time
@@ -803,6 +894,8 @@ class StorageRepository:
                     event_time.isoformat(),
                 ),
             )
+        finally:
+            connection.close()
 
     def insert_pnl_snapshot(
         self,
@@ -815,8 +908,10 @@ class StorageRepository:
     ) -> None:
         """Persist a PnL snapshot."""
 
-        with self._connection:
-            self._connection.execute(
+        connection = self._open_connection()
+        try:
+            with connection:
+                connection.execute(
                 """
                 INSERT INTO pnl_snapshots (
                     snapshot_time, equity, total_pnl, realized_pnl, cash_balance
@@ -830,6 +925,8 @@ class StorageRepository:
                     str(cash_balance),
                 ),
             )
+        finally:
+            connection.close()
 
     def insert_event(
         self,
@@ -842,8 +939,10 @@ class StorageRepository:
     ) -> None:
         """Persist a runner event."""
 
-        with self._connection:
-            self._connection.execute(
+        connection = self._open_connection()
+        try:
+            with connection:
+                connection.execute(
                 """
                 INSERT INTO runner_events (
                     event_type, symbol, message, payload_json, event_time
@@ -857,6 +956,8 @@ class StorageRepository:
                     event_time.isoformat(),
                 ),
             )
+        finally:
+            connection.close()
 
     def _apply_history_filters(
         self,
@@ -930,7 +1031,8 @@ class StorageRepository:
         if limit is not None:
             query += " LIMIT ? OFFSET ?"
             params.extend((limit, offset))
-        rows = self._connection.execute(query, tuple(params)).fetchall()
+        with self._connection_scope() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
         return [
             TradeRecord(
                 order_id=row["order_id"],
@@ -973,23 +1075,25 @@ class StorageRepository:
             end_date=end_date,
             timestamp_column="event_time",
         )
-        row = self._connection.execute(query, tuple(params)).fetchone()
+        with self._connection_scope() as connection:
+            row = connection.execute(query, tuple(params)).fetchone()
         return int(row["row_count"]) if row is not None else 0
 
     def get_daily_pnl(self, day: date | None = None) -> Decimal:
         """Return the latest persisted total PnL for a UTC day."""
 
         target_day = day or datetime.now(tz=UTC).date()
-        rows = self._connection.execute(
-            """
-            SELECT total_pnl
-            FROM pnl_snapshots
-            WHERE date(snapshot_time) = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (target_day.isoformat(),),
-        ).fetchall()
+        with self._connection_scope() as connection:
+            rows = connection.execute(
+                """
+                SELECT total_pnl
+                FROM pnl_snapshots
+                WHERE date(snapshot_time) = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (target_day.isoformat(),),
+            ).fetchall()
         if not rows:
             return Decimal("0")
         return _decimal(rows[0]["total_pnl"])
@@ -1021,7 +1125,8 @@ class StorageRepository:
             timestamp_column="snapshot_time",
         )
         query += " ORDER BY id ASC"
-        rows = self._connection.execute(query, tuple(params)).fetchall()
+        with self._connection_scope() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
         return [
             PnlSnapshotRecord(
                 snapshot_time=datetime.fromisoformat(row["snapshot_time"]),
@@ -1168,7 +1273,8 @@ class StorageRepository:
             timestamp_column="snapshot_time",
         )
         query += " ORDER BY id DESC LIMIT 1"
-        rows = self._connection.execute(query, tuple(params)).fetchall()
+        with self._connection_scope() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
         if not rows:
             return None
 
@@ -1184,20 +1290,21 @@ class StorageRepository:
     def get_current_positions(self) -> list[PositionSnapshotRecord]:
         """Return the latest non-zero position snapshot for each symbol."""
 
-        rows = self._connection.execute(
-            """
-            SELECT p.symbol, p.quantity, p.avg_entry_price, p.realized_pnl, p.quote_asset, p.snapshot_time
-            FROM positions_snapshots AS p
-            INNER JOIN (
-                SELECT symbol, MAX(id) AS max_id
-                FROM positions_snapshots
-                GROUP BY symbol
-            ) AS latest
-                ON latest.max_id = p.id
-            WHERE CAST(p.quantity AS REAL) != 0
-            ORDER BY p.symbol ASC
-            """
-        ).fetchall()
+        with self._connection_scope() as connection:
+            rows = connection.execute(
+                """
+                SELECT p.symbol, p.quantity, p.avg_entry_price, p.realized_pnl, p.quote_asset, p.snapshot_time
+                FROM positions_snapshots AS p
+                INNER JOIN (
+                    SELECT symbol, MAX(id) AS max_id
+                    FROM positions_snapshots
+                    GROUP BY symbol
+                ) AS latest
+                    ON latest.max_id = p.id
+                WHERE CAST(p.quantity AS REAL) != 0
+                ORDER BY p.symbol ASC
+                """
+            ).fetchall()
         return [
             PositionSnapshotRecord(
                 symbol=row["symbol"],
@@ -1221,15 +1328,16 @@ class StorageRepository:
     ) -> list[FillRecord]:
         """Return persisted fills."""
 
-        rows = self._connection.execute(
-            *self._build_fill_query(
-                symbol=symbol,
-                start_date=start_date,
-                end_date=end_date,
-                limit=limit,
-                offset=offset,
-            )
-        ).fetchall()
+        with self._connection_scope() as connection:
+            rows = connection.execute(
+                *self._build_fill_query(
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                    limit=limit,
+                    offset=offset,
+                )
+            ).fetchall()
         return [
             FillRecord(
                 order_id=row["order_id"],
@@ -1300,7 +1408,8 @@ class StorageRepository:
             end_date=end_date,
             timestamp_column="event_time",
         )
-        row = self._connection.execute(query, tuple(params)).fetchone()
+        with self._connection_scope() as connection:
+            row = connection.execute(query, tuple(params)).fetchone()
         return int(row["row_count"]) if row is not None else 0
 
     def get_runner_events(
@@ -1332,7 +1441,8 @@ class StorageRepository:
         if limit is not None:
             query += " LIMIT ? OFFSET ?"
             params.extend((limit, offset))
-        rows = self._connection.execute(query, tuple(params)).fetchall()
+        with self._connection_scope() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
         return [
             RunnerEventRecord(
                 event_type=row["event_type"],
@@ -1367,5 +1477,6 @@ class StorageRepository:
             end_date=end_date,
             timestamp_column="event_time",
         )
-        row = self._connection.execute(query, tuple(params)).fetchone()
+        with self._connection_scope() as connection:
+            row = connection.execute(query, tuple(params)).fetchone()
         return int(row["row_count"]) if row is not None else 0

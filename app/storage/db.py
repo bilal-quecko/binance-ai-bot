@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 import sqlite3
+import tempfile
+from hashlib import sha1
 
+LOGGER = logging.getLogger(__name__)
+_SQLITE_PATH_FALLBACK_CACHE: dict[Path, Path] = {}
 
 AI_SIGNAL_FEATURE_SUMMARY_DEFAULT = (
     '{"candle_count": 0, "close_price": "0", "microstructure_healthy": false, '
@@ -165,20 +170,100 @@ def resolve_sqlite_path(database_url: str) -> Path:
 
     if not database_url.startswith("sqlite:///"):
         raise ValueError("Only sqlite:/// database URLs are supported for paper-mode storage.")
-    return Path(database_url.removeprefix("sqlite:///")).resolve()
+    requested_path = Path(database_url.removeprefix("sqlite:///")).resolve()
+    requested_path.parent.mkdir(parents=True, exist_ok=True)
+    return _resolve_usable_sqlite_path(requested_path)
 
 
 def create_db_connection(database_url: str) -> sqlite3.Connection:
     """Create a SQLite connection and initialize the paper-mode schema."""
 
     db_path = resolve_sqlite_path(database_url)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(db_path, check_same_thread=False)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=MEMORY")
-    connection.execute("PRAGMA synchronous=OFF")
+    _configure_sqlite_connection(connection)
+    connection.execute("PRAGMA busy_timeout=5000")
     initialize_schema(connection)
     return connection
+
+
+def _resolve_usable_sqlite_path(requested_path: Path) -> Path:
+    """Return a SQLite path that supports local paper-mode journaling."""
+
+    cached_path = _SQLITE_PATH_FALLBACK_CACHE.get(requested_path)
+    if cached_path is not None:
+        cached_path.parent.mkdir(parents=True, exist_ok=True)
+        return cached_path
+
+    if _sqlite_path_supports_wal(requested_path):
+        _SQLITE_PATH_FALLBACK_CACHE[requested_path] = requested_path
+        return requested_path
+
+    fallback_root = Path(tempfile.gettempdir()) / "binance-ai-bot" / "sqlite"
+    fallback_root.mkdir(parents=True, exist_ok=True)
+    fallback_name = f"{requested_path.stem}_{sha1(str(requested_path).encode('utf-8')).hexdigest()[:12]}{requested_path.suffix}"
+    fallback_path = fallback_root / fallback_name
+    LOGGER.warning(
+        "SQLite path %s does not support WAL in this environment; using temp storage %s instead.",
+        requested_path,
+        fallback_path,
+    )
+    _SQLITE_PATH_FALLBACK_CACHE[requested_path] = fallback_path
+    return fallback_path
+
+
+def _sqlite_path_supports_wal(requested_path: Path) -> bool:
+    """Return whether a SQLite database path can enable WAL and create schema files."""
+
+    probe_path = requested_path.parent / f".{requested_path.stem}_probe{requested_path.suffix}"
+    _cleanup_sqlite_probe_artifacts(probe_path)
+
+    connection = sqlite3.connect(probe_path, check_same_thread=False)
+    try:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute("PRAGMA journal_mode=WAL").fetchone()
+        journal_mode = str(row[0]).lower() if row is not None else ""
+        if journal_mode != "wal":
+            return False
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("CREATE TABLE sqlite_probe (id INTEGER PRIMARY KEY)")
+        connection.commit()
+        return True
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        connection.close()
+        _cleanup_sqlite_probe_artifacts(probe_path)
+
+
+def _cleanup_sqlite_probe_artifacts(probe_path: Path) -> None:
+    """Best-effort cleanup for SQLite probe files."""
+
+    for candidate in (
+        probe_path,
+        probe_path.with_name(f"{probe_path.name}-wal"),
+        probe_path.with_name(f"{probe_path.name}-shm"),
+        probe_path.with_suffix(f"{probe_path.suffix}-journal"),
+    ):
+        if not candidate.exists():
+            continue
+        try:
+            candidate.unlink()
+        except PermissionError:
+            LOGGER.debug("Skipping locked SQLite probe cleanup for %s.", candidate)
+
+
+def _configure_sqlite_connection(connection: sqlite3.Connection) -> None:
+    """Configure SQLite pragmas with WAL preference and safe fallback."""
+
+    try:
+        row = connection.execute("PRAGMA journal_mode=WAL").fetchone()
+        journal_mode = str(row[0]).lower() if row is not None else ""
+        if journal_mode != "wal":
+            raise sqlite3.OperationalError(f"journal_mode={journal_mode or 'unknown'}")
+    except sqlite3.OperationalError as exc:
+        LOGGER.warning("WAL journal mode is unavailable in this environment; continuing with SQLite default journal mode: %s", exc)
+    connection.execute("PRAGMA synchronous=NORMAL")
 
 
 def initialize_schema(connection: sqlite3.Connection) -> None:

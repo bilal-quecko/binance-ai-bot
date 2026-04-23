@@ -16,6 +16,7 @@
   PnlHistoryResponse,
   PerformanceAnalyticsResponse,
   PatternAnalysisResponse,
+  FusionSignalResponse,
   PositionItem,
   TechnicalAnalysisResponse,
   TradeQualityResponse,
@@ -164,6 +165,11 @@ export function getMarketSentiment(symbol: string): Promise<MarketSentimentRespo
 export function getSymbolSentiment(symbol: string): Promise<SymbolSentimentResponse> {
   const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
   return requestJson<SymbolSentimentResponse>('/bot/symbol-sentiment', params);
+}
+
+export function getFusionSignal(symbol: string): Promise<FusionSignalResponse> {
+  const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
+  return requestJson<FusionSignalResponse>('/bot/fusion-signal', params);
 }
 
 export function getAISignal(symbol: string): Promise<AISignalSummary | null> {
