@@ -157,6 +157,36 @@ class DashboardDataAccess:
             end_date=end_date,
         )
 
+    def get_fills(
+        self,
+        *,
+        symbol: str | None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> list[FillRecord]:
+        """Return fills needed for review analytics calculations."""
+
+        return self.repository.get_fill_history(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    def get_events(
+        self,
+        *,
+        symbol: str | None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> list[RunnerEventRecord]:
+        """Return runner events needed for review analytics calculations."""
+
+        return self.repository.get_runner_events(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
     def get_market_candles(
         self,
         *,

@@ -86,7 +86,7 @@ export function FusionSignalSection({
       <DataStateIndicator dataState={signal.data_state} message={signal.status_message} />
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-6">
-        <MetricCard label="Action" value={humanize(signal.final_signal)} helper="Unified advisory decision" />
+        <MetricCard label="Direction" value={humanize(signal.final_signal).toUpperCase()} helper="Unified advisory decision" />
         <MetricCard label="Confidence" value={`${signal.confidence}%`} helper="Shaped by cross-layer agreement" />
         <MetricCard
           label="Expected Edge"
@@ -100,14 +100,15 @@ export function FusionSignalSection({
 
       <div className="grid gap-4 lg:grid-cols-[0.9fr,1.1fr]">
         <div className="rounded-2xl border border-slate-800 bg-slate-950/40 p-4">
-          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Final Action</p>
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Why Now</p>
           <div className="mt-3 flex items-center gap-3">
             <span className={classNames('rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em]', actionTone(signal.final_signal))}>
-              {humanize(signal.final_signal)}
+              {humanize(signal.final_signal).toUpperCase()}
             </span>
+            <span className="text-sm text-slate-400">Best timeframe {signal.preferred_horizon}</span>
           </div>
           <p className="mt-3 text-sm leading-6 text-slate-300">
-            {signal.invalidation_hint ?? 'No invalidation hint is available yet for this fused setup.'}
+            {signal.top_reasons[0] ?? 'The fusion engine is still building its primary reason.'}
           </p>
         </div>
 
@@ -125,6 +126,13 @@ export function FusionSignalSection({
             <p className="mt-3 text-sm text-slate-400">No fused reasons are available yet.</p>
           )}
         </div>
+      </div>
+
+      <div className="rounded-2xl border border-slate-800 bg-slate-950/40 p-4">
+        <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Invalidation</p>
+        <p className="mt-3 text-sm leading-6 text-slate-300">
+          {signal.invalidation_hint ?? 'No clear invalidation level is available yet for this fused setup.'}
+        </p>
       </div>
 
       <div className="rounded-2xl border border-slate-800 bg-slate-950/40 p-4">

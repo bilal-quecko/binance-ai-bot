@@ -23,6 +23,7 @@ from app.analysis import (
     merge_pattern_points,
     normalize_horizon,
 )
+from app.analysis.multi_timeframe import aggregate_candles
 from app.ai.evaluation import AIOutcomeEvaluator
 from app.bot import BotStatus, PaperBotRuntime, WorkstationState
 from app.bot.runtime import PersistenceState
@@ -30,7 +31,8 @@ from app.config import Settings, get_settings
 from app.data import MarketContextService
 from app.exchange.symbol_service import SpotSymbolRecord, SpotSymbolService
 from app.fusion import FusionInputs, FusionSignalSnapshot, UnifiedSignalFusionEngine
-from app.runner.models import TradeReadiness
+from app.market_data.candles import Candle
+from app.runner.models import ManualTradeResult, TradeReadiness, TradingProfile
 from app.storage import StorageRepository
 from app.storage.models import MarketCandleSnapshotRecord
 
@@ -38,6 +40,7 @@ router = APIRouter()
 LOGGER = logging.getLogger(__name__)
 
 DataState = Literal["ready", "waiting_for_runtime", "waiting_for_history", "degraded_storage"]
+ChartTimeframe = Literal["1m", "5m", "15m", "1h"]
 
 
 class PersistenceHealthResponse(BaseModel):
@@ -62,6 +65,7 @@ class BotStartRequest(BaseModel):
     """Payload for starting the paper bot."""
 
     symbol: str = Field(min_length=1)
+    trading_profile: TradingProfile = "balanced"
 
 
 class BotStatusResponse(BaseModel):
@@ -79,6 +83,9 @@ class BotStatusResponse(BaseModel):
     recovered_from_prior_session: bool = False
     broker_state_restored: bool = False
     recovery_message: str | None = None
+    trading_profile: TradingProfile = "balanced"
+    tuning_version_id: str | None = None
+    baseline_tuning_version_id: str | None = None
     persistence: PersistenceHealthResponse
 
 
@@ -94,6 +101,19 @@ class CandleSummaryResponse(BaseModel):
     close: Decimal
     volume: Decimal
     is_closed: bool
+
+
+class CandleHistoryResponse(BaseModel):
+    """Symbol-scoped candle-history payload for the workstation chart."""
+
+    symbol: str
+    timeframe: ChartTimeframe
+    source_timeframe: str
+    derived_from_lower_timeframe: bool
+    data_state: DataState
+    status_message: str | None = None
+    candles: list[CandleSummaryResponse] = Field(default_factory=list)
+    current_price: Decimal | None = None
 
 
 class TopOfBookResponse(BaseModel):
@@ -204,6 +224,7 @@ class TradeReadinessResponse(BaseModel):
     selected_symbol: str
     runtime_active: bool
     mode: str
+    trading_profile: TradingProfile = "balanced"
     enough_candle_history: bool
     deterministic_entry_signal: bool
     deterministic_exit_signal: bool
@@ -212,9 +233,33 @@ class TradeReadinessResponse(BaseModel):
     broker_ready: bool
     next_action: str
     reason_if_not_trading: str | None = None
+    blocking_reasons: tuple[str, ...] = ()
+    signal_reason_codes: tuple[str, ...] = ()
     risk_reason_codes: tuple[str, ...] = ()
     expected_edge_pct: Decimal | None = None
     estimated_round_trip_cost_pct: Decimal | None = None
+
+
+class ManualTradeRequest(BaseModel):
+    """Manual paper-trade request payload."""
+
+    symbol: str = Field(min_length=1)
+
+
+class ManualTradeResponse(BaseModel):
+    """Serialized manual paper-trade result."""
+
+    symbol: str
+    action: str
+    requested_side: str
+    status: str
+    message: str
+    reason_codes: tuple[str, ...] = ()
+    approved_quantity: Decimal | None = None
+    filled_quantity: Decimal | None = None
+    fill_price: Decimal | None = None
+    current_position_quantity: Decimal | None = None
+    current_pnl: Decimal = Decimal("0")
 
 
 class TechnicalTimeframeSummaryResponse(BaseModel):
@@ -989,7 +1034,137 @@ def _to_status_response(
         recovered_from_prior_session=status.recovered_from_prior_session,
         broker_state_restored=status.broker_state_restored,
         recovery_message=status.recovery_message,
+        trading_profile=status.trading_profile,
+        tuning_version_id=status.tuning_version_id,
+        baseline_tuning_version_id=status.baseline_tuning_version_id,
         persistence=persistence,
+    )
+
+
+def _requested_timeframe_minutes(timeframe: ChartTimeframe) -> int:
+    """Return the minute span for a chart timeframe label."""
+
+    mapping: dict[ChartTimeframe, int] = {
+        "1m": 1,
+        "5m": 5,
+        "15m": 15,
+        "1h": 60,
+    }
+    return mapping[timeframe]
+
+
+def _merge_candle_history(
+    *,
+    live_candles: list[Candle],
+    timeframe: ChartTimeframe,
+) -> tuple[list[Candle], bool]:
+    """Return recent chart candles for the requested timeframe."""
+
+    closed_candles = [candle for candle in live_candles if candle.is_closed]
+    if timeframe == "1m":
+        return closed_candles, False
+
+    aggregated = aggregate_candles(
+        closed_candles,
+        timeframe_minutes=_requested_timeframe_minutes(timeframe),
+    )
+    relabeled = [
+        Candle(
+            symbol=candle.symbol,
+            timeframe=timeframe,
+            open=candle.open,
+            high=candle.high,
+            low=candle.low,
+            close=candle.close,
+            volume=candle.volume,
+            quote_volume=candle.quote_volume,
+            open_time=candle.open_time,
+            close_time=candle.close_time,
+            event_time=candle.event_time,
+            trade_count=candle.trade_count,
+            is_closed=candle.is_closed,
+        )
+        for candle in aggregated
+    ]
+    return relabeled, True
+
+
+def _to_candle_history_response(
+    *,
+    symbol: str,
+    timeframe: ChartTimeframe,
+    live_candles: list[Candle],
+    runtime_active: bool,
+    limit: int,
+) -> CandleHistoryResponse:
+    """Convert live candle history into a workstation chart response."""
+
+    normalized_symbol = symbol.upper()
+    if not runtime_active:
+        return CandleHistoryResponse(
+            symbol=normalized_symbol,
+            timeframe=timeframe,
+            source_timeframe="1m",
+            derived_from_lower_timeframe=timeframe != "1m",
+            data_state="waiting_for_runtime",
+            status_message=(
+                f"Start the live runtime for {normalized_symbol} to load recent closed candles for the chart."
+            ),
+            candles=[],
+            current_price=None,
+        )
+
+    chart_candles, derived = _merge_candle_history(
+        live_candles=live_candles,
+        timeframe=timeframe,
+    )
+    limited_candles = chart_candles[-limit:]
+    source_timeframe = "1m"
+
+    if limited_candles:
+        return CandleHistoryResponse(
+            symbol=normalized_symbol,
+            timeframe=timeframe,
+            source_timeframe=source_timeframe,
+            derived_from_lower_timeframe=derived,
+            data_state="ready" if len(limited_candles) >= min(limit, 20) else "waiting_for_history",
+            status_message=(
+                None
+                if len(limited_candles) >= min(limit, 20)
+                else (
+                    f"Chart is using {len(limited_candles)} closed candles for {normalized_symbol}. "
+                    "More history will improve structure and annotation quality."
+                )
+            ),
+            candles=[
+                CandleSummaryResponse(
+                    timeframe=timeframe,
+                    open_time=candle.open_time,
+                    close_time=candle.close_time,
+                    open=candle.open,
+                    high=candle.high,
+                    low=candle.low,
+                    close=candle.close,
+                    volume=candle.volume,
+                    is_closed=candle.is_closed,
+                )
+                for candle in limited_candles
+            ],
+            current_price=limited_candles[-1].close,
+        )
+
+    return CandleHistoryResponse(
+        symbol=normalized_symbol,
+        timeframe=timeframe,
+        source_timeframe=source_timeframe,
+        derived_from_lower_timeframe=derived,
+        data_state="waiting_for_history",
+        status_message=(
+            f"Live runtime is connected for {normalized_symbol}, but more closed candles are needed before the "
+            f"{timeframe} chart can render."
+        ),
+        candles=[],
+        current_price=None,
     )
 
 
@@ -1001,6 +1176,7 @@ def _default_trade_readiness_response(symbol: str, status: BotStatus) -> TradeRe
         selected_symbol=symbol,
         runtime_active=runtime_active,
         mode=status.mode,
+        trading_profile=status.trading_profile,
         enough_candle_history=False,
         deterministic_entry_signal=False,
         deterministic_exit_signal=False,
@@ -1021,6 +1197,16 @@ def _default_trade_readiness_response(symbol: str, status: BotStatus) -> TradeRe
                 else f"Waiting for enough closed candle history to build deterministic signals for {symbol}."
             )
         ),
+        blocking_reasons=(
+            (status.recovery_message,)
+            if status.recovered_from_prior_session and status.symbol == symbol and status.mode == "paused"
+            else (
+                ("Start the live runtime to receive live candles and order-book data.",)
+                if not runtime_active
+                else ("Need more closed candles before deterministic entries and exits can activate.",)
+            )
+        ),
+        signal_reason_codes=(),
         risk_reason_codes=(),
     )
 
@@ -1050,6 +1236,7 @@ def _to_trade_readiness_response(
         selected_symbol=readiness.selected_symbol,
         runtime_active=readiness.runtime_active,
         mode=readiness.mode,
+        trading_profile=readiness.trading_profile,
         enough_candle_history=readiness.enough_candle_history,
         deterministic_entry_signal=readiness.deterministic_entry_signal,
         deterministic_exit_signal=readiness.deterministic_exit_signal,
@@ -1058,9 +1245,35 @@ def _to_trade_readiness_response(
         broker_ready=readiness.broker_ready,
         next_action=next_action,
         reason_if_not_trading=reason_if_not_trading,
+        blocking_reasons=readiness.blocking_reasons,
+        signal_reason_codes=readiness.signal_reason_codes,
         risk_reason_codes=readiness.risk_reason_codes,
         expected_edge_pct=readiness.expected_edge_pct,
         estimated_round_trip_cost_pct=readiness.estimated_round_trip_cost_pct,
+    )
+
+
+def _to_manual_trade_response(result: ManualTradeResult) -> ManualTradeResponse:
+    """Convert a manual paper-trade result into an API response."""
+
+    return ManualTradeResponse(
+        symbol=result.symbol,
+        action=result.action,
+        requested_side=result.requested_side,
+        status=result.status,
+        message=result.message,
+        reason_codes=result.reason_codes,
+        approved_quantity=(
+            result.risk_decision.approved_quantity if result.risk_decision is not None else None
+        ),
+        filled_quantity=(
+            result.fill_result.filled_quantity if result.fill_result is not None else None
+        ),
+        fill_price=result.fill_result.fill_price if result.fill_result is not None else None,
+        current_position_quantity=(
+            result.current_position.quantity if result.current_position is not None else None
+        ),
+        current_pnl=result.current_pnl,
     )
 
 
@@ -1585,7 +1798,7 @@ async def start_bot(
     """Start live Binance Spot market-data driven paper trading."""
 
     try:
-        status = await runtime.start(payload.symbol)
+        status = await runtime.start(payload.symbol, payload.trading_profile)
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _to_status_response(status, persistence=_to_persistence_response(runtime))
@@ -1642,6 +1855,26 @@ async def reset_bot_session(
     return _to_status_response(status, persistence=_to_persistence_response(runtime))
 
 
+@router.post("/bot/manual-buy", response_model=ManualTradeResponse)
+async def manual_buy_market(
+    payload: ManualTradeRequest,
+    runtime: Annotated[PaperBotRuntime, Depends(get_bot_runtime)],
+) -> ManualTradeResponse:
+    """Execute a manual paper-market buy for the selected symbol."""
+
+    return _to_manual_trade_response(await runtime.manual_buy_market(payload.symbol))
+
+
+@router.post("/bot/manual-close", response_model=ManualTradeResponse)
+async def manual_close_position(
+    payload: ManualTradeRequest,
+    runtime: Annotated[PaperBotRuntime, Depends(get_bot_runtime)],
+) -> ManualTradeResponse:
+    """Execute a manual paper close for the selected symbol."""
+
+    return _to_manual_trade_response(await runtime.manual_close_position(payload.symbol))
+
+
 @router.get("/bot/workstation", response_model=WorkstationResponse)
 def get_workstation(
     symbol: Annotated[str, Query(min_length=1)],
@@ -1667,6 +1900,44 @@ def get_workstation(
         data_state=data_state,
         status_message=status_message,
     )
+
+
+@router.get("/bot/candles", response_model=CandleHistoryResponse)
+def get_candles(
+    symbol: Annotated[str, Query(min_length=1)],
+    timeframe: Annotated[ChartTimeframe, Query()] = "1m",
+    limit: Annotated[int, Query(ge=20, le=240)] = 120,
+    runtime: Annotated[PaperBotRuntime, Depends(get_bot_runtime)] = None,
+) -> CandleHistoryResponse:
+    """Return recent closed candles for the selected symbol chart."""
+
+    normalized_symbol = symbol.strip().upper()
+    status = runtime.status()
+    runtime_active = _runtime_matches_symbol(status, normalized_symbol)
+    try:
+        return _to_candle_history_response(
+            symbol=normalized_symbol,
+            timeframe=timeframe,
+            live_candles=runtime.candle_history(normalized_symbol),
+            runtime_active=runtime_active,
+            limit=limit,
+        )
+    except Exception:
+        LOGGER.exception(
+            "Failed to build candle history for symbol %s timeframe %s.",
+            normalized_symbol,
+            timeframe,
+        )
+        return CandleHistoryResponse(
+            symbol=normalized_symbol,
+            timeframe=timeframe,
+            source_timeframe="1m",
+            derived_from_lower_timeframe=timeframe != "1m",
+            data_state="degraded_storage",
+            status_message="Candle history is temporarily unavailable.",
+            candles=[],
+            current_price=None,
+        )
 
 
 @router.get("/bot/technical-analysis", response_model=TechnicalAnalysisResponse)

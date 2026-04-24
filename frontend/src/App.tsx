@@ -9,9 +9,11 @@ import { DataStateIndicator } from './components/DataStateIndicator';
 import { FusionSignalSection } from './components/FusionSignalSection';
 import { MarketSentimentSection } from './components/MarketSentimentSection';
 import { MetricCard } from './components/MetricCard';
+import { PaperTradeReviewSection } from './components/PaperTradeReviewSection';
 import { PerformanceAnalyticsSection } from './components/PerformanceAnalyticsSection';
 import { PatternAnalysisSection } from './components/PatternAnalysisSection';
 import { PersistenceHealthCard } from './components/PersistenceHealthCard';
+import { ProfileCalibrationSection } from './components/ProfileCalibrationSection';
 import { SectionCard } from './components/SectionCard';
 import { StatePanel } from './components/StatePanel';
 import { SymbolSentimentSection } from './components/SymbolSentimentSection';
@@ -23,38 +25,52 @@ import {
   getAISignal,
   getAISignalHistory,
   getBotStatus,
+  getCandles,
   getFusionSignal,
   getHealth,
   getMarketSentiment,
   getPatternAnalysis,
+  getPaperTradeReview,
   getPerformanceAnalytics,
+  getProfileCalibrationComparison,
+  getProfileCalibration,
   getSymbolSentiment,
   getTechnicalAnalysis,
   getTradeQualityAnalytics,
   getSymbols,
   getWorkstation,
+  manualBuyMarket,
+  manualClosePosition,
+  applyProfileCalibration,
   pauseBot,
   resetBotSession,
   resumeBot,
   startBot,
   stopBot,
 } from './lib/api';
-import { badgeTone, classNames, formatCurrency, formatDateTime, formatDecimal, pnlTone } from './lib/format';
+import { badgeTone, classNames, formatCurrency, formatDateTime, formatDecimal, formatReasonCodes, pnlTone } from './lib/format';
 import type {
   AIOutcomeEvaluationResponse,
   AISignalHistoryResponse,
   AISignalSummary,
   AutoRefreshIntervalSeconds,
   BotStatusResponse,
+  CandleHistoryResponse,
+  ChartTimeframe,
   HealthResponse,
   FusionSignalResponse,
   MarketSentimentResponse,
   PatternAnalysisResponse,
   PatternHorizon,
+  PaperTradeReviewResponse,
+  ProfileCalibrationApplyResponse,
+  ProfileCalibrationComparisonResponse,
   PerformanceAnalyticsResponse,
+  ProfileCalibrationResponse,
   SpotSymbolItem,
   SymbolSentimentResponse,
   TechnicalAnalysisResponse,
+  TradingProfile,
   TradeQualityResponse,
   WorkstationResponse,
 } from './lib/types';
@@ -81,6 +97,9 @@ const INITIAL_BOT_STATUS: BotStatusResponse = {
   recovered_from_prior_session: false,
   broker_state_restored: false,
   recovery_message: null,
+  trading_profile: 'balanced',
+  tuning_version_id: null,
+  baseline_tuning_version_id: null,
   persistence: {
     persistence_state: 'unavailable',
     persistence_message: 'Persistence state has not been read yet.',
@@ -100,6 +119,7 @@ const INITIAL_AI_HISTORY: AISignalHistoryResponse = {
   status_message: 'Start the live runtime for the selected symbol to generate advisory history.',
 };
 const INITIAL_AI_EVALUATION: AIOutcomeEvaluationResponse | null = null;
+const INITIAL_CANDLES: CandleHistoryResponse | null = null;
 const INITIAL_TECHNICAL_ANALYSIS: TechnicalAnalysisResponse | null = null;
 const INITIAL_MARKET_SENTIMENT: MarketSentimentResponse | null = null;
 const INITIAL_SYMBOL_SENTIMENT: SymbolSentimentResponse | null = null;
@@ -107,6 +127,9 @@ const INITIAL_PATTERN_ANALYSIS: PatternAnalysisResponse | null = null;
 const INITIAL_FUSION_SIGNAL: FusionSignalResponse | null = null;
 const INITIAL_PERFORMANCE: PerformanceAnalyticsResponse | null = null;
 const INITIAL_TRADE_QUALITY: TradeQualityResponse | null = null;
+const INITIAL_PAPER_REVIEW: PaperTradeReviewResponse | null = null;
+const INITIAL_PROFILE_CALIBRATION: ProfileCalibrationResponse | null = null;
+const INITIAL_PROFILE_CALIBRATION_COMPARISON: ProfileCalibrationComparisonResponse | null = null;
 const AI_HISTORY_PAGE_SIZE = 3;
 
 function createRemoteState<T>(data: T): RemoteState<T> {
@@ -152,6 +175,49 @@ function formatOptionalDecimal(value: string | number | null | undefined, fallba
   return formatDecimal(value);
 }
 
+function computeMidPrice(workstation: WorkstationResponse | null): number | null {
+  const top = workstation?.top_of_book;
+  if (!top) {
+    return null;
+  }
+  return (Number(top.bid_price) + Number(top.ask_price)) / 2;
+}
+
+function computeSpread(workstation: WorkstationResponse | null): number | null {
+  const top = workstation?.top_of_book;
+  if (!top) {
+    return null;
+  }
+  return Number(top.ask_price) - Number(top.bid_price);
+}
+
+function computeBookImbalance(workstation: WorkstationResponse | null): number | null {
+  const top = workstation?.top_of_book;
+  if (!top) {
+    return null;
+  }
+  const bid = Number(top.bid_quantity);
+  const ask = Number(top.ask_quantity);
+  const total = bid + ask;
+  if (total === 0) {
+    return null;
+  }
+  return (bid - ask) / total;
+}
+
+function describeLiveFieldGap(workstation: WorkstationResponse | null): string {
+  if (!workstation?.is_runtime_symbol) {
+    return 'Symbol unsupported until the live runtime is started for this symbol';
+  }
+  if (!workstation.top_of_book) {
+    if (workstation.current_candle) {
+      return 'Exchange depth unavailable';
+    }
+    return 'Awaiting websocket';
+  }
+  return 'Not yet populated';
+}
+
 function App() {
   const [tab, setTab] = useState<WorkstationTab>('signal');
   const [autoRefreshSeconds, setAutoRefreshSeconds] = useState<AutoRefreshIntervalSeconds>(0);
@@ -163,6 +229,7 @@ function App() {
   const [aiSignal, setAiSignal] = useState<RemoteState<AISignalSummary | null>>(createRemoteState(INITIAL_AI_SIGNAL));
   const [aiHistory, setAiHistory] = useState<RemoteState<AISignalHistoryResponse>>(createRemoteState(INITIAL_AI_HISTORY));
   const [aiEvaluation, setAiEvaluation] = useState<RemoteState<AIOutcomeEvaluationResponse | null>>(createRemoteState(INITIAL_AI_EVALUATION));
+  const [candles, setCandles] = useState<RemoteState<CandleHistoryResponse | null>>(createRemoteState(INITIAL_CANDLES));
   const [technicalAnalysis, setTechnicalAnalysis] = useState<RemoteState<TechnicalAnalysisResponse | null>>(createRemoteState(INITIAL_TECHNICAL_ANALYSIS));
   const [marketSentiment, setMarketSentiment] = useState<RemoteState<MarketSentimentResponse | null>>(createRemoteState(INITIAL_MARKET_SENTIMENT));
   const [symbolSentiment, setSymbolSentiment] = useState<RemoteState<SymbolSentimentResponse | null>>(createRemoteState(INITIAL_SYMBOL_SENTIMENT));
@@ -170,14 +237,21 @@ function App() {
   const [fusionSignal, setFusionSignal] = useState<RemoteState<FusionSignalResponse | null>>(createRemoteState(INITIAL_FUSION_SIGNAL));
   const [performanceAnalytics, setPerformanceAnalytics] = useState<RemoteState<PerformanceAnalyticsResponse | null>>(createRemoteState(INITIAL_PERFORMANCE));
   const [tradeQualityAnalytics, setTradeQualityAnalytics] = useState<RemoteState<TradeQualityResponse | null>>(createRemoteState(INITIAL_TRADE_QUALITY));
+  const [paperTradeReview, setPaperTradeReview] = useState<RemoteState<PaperTradeReviewResponse | null>>(createRemoteState(INITIAL_PAPER_REVIEW));
+  const [profileCalibration, setProfileCalibration] = useState<RemoteState<ProfileCalibrationResponse | null>>(createRemoteState(INITIAL_PROFILE_CALIBRATION));
+  const [profileCalibrationComparison, setProfileCalibrationComparison] = useState<RemoteState<ProfileCalibrationComparisonResponse | null>>(createRemoteState(INITIAL_PROFILE_CALIBRATION_COMPARISON));
   const [symbolResults, setSymbolResults] = useState<RemoteState<SpotSymbolItem[]>>(createRemoteState<SpotSymbolItem[]>([]));
 
   const [selectedSymbol, setSelectedSymbol] = useState('');
   const [symbolSearch, setSymbolSearch] = useState('');
   const [selectedPatternHorizon, setSelectedPatternHorizon] = useState<PatternHorizon>('7d');
+  const [selectedChartTimeframe, setSelectedChartTimeframe] = useState<ChartTimeframe>('1m');
+  const [selectedTradingProfile, setSelectedTradingProfile] = useState<TradingProfile>('balanced');
   const [aiHistoryOffset, setAiHistoryOffset] = useState(0);
   const [botActionLoading, setBotActionLoading] = useState(false);
   const [botActionError, setBotActionError] = useState<string | null>(null);
+  const [botActionMessage, setBotActionMessage] = useState<string | null>(null);
+  const [profileApplyLoading, setProfileApplyLoading] = useState(false);
 
   const loadSymbols = useCallback(async (query: string) => {
     setSymbolResults((current) => ({ ...current, loading: current.data.length === 0, refreshing: current.data.length > 0, error: null }));
@@ -198,6 +272,7 @@ function App() {
     setAiSignal((current) => setPending(current));
     setAiHistory((current) => setPending(current));
     setAiEvaluation((current) => setPending(current));
+    setCandles((current) => setPending(current));
     setTechnicalAnalysis((current) => setPending(current));
     setMarketSentiment((current) => setPending(current));
     setSymbolSentiment((current) => setPending(current));
@@ -205,6 +280,9 @@ function App() {
     setFusionSignal((current) => setPending(current));
     setPerformanceAnalytics((current) => setPending(current));
     setTradeQualityAnalytics((current) => setPending(current));
+    setPaperTradeReview((current) => setPending(current));
+    setProfileCalibration((current) => setPending(current));
+    setProfileCalibrationComparison((current) => setPending(current));
 
     try {
       const [healthData, botStatusData] = await Promise.all([getHealth(), getBotStatus()]);
@@ -214,13 +292,30 @@ function App() {
         setSymbolSearch(botStatusData.symbol);
       }
 
-      const [workstationData, aiSignalData, aiHistoryData, aiEvaluationData, technicalAnalysisData, marketSentimentData, symbolSentimentData, patternAnalysisData, fusionSignalData, performanceData, tradeQualityData] = await Promise.all([
+      const [
+        workstationData,
+        aiSignalData,
+        aiHistoryData,
+        aiEvaluationData,
+        candleData,
+        technicalAnalysisData,
+        marketSentimentData,
+        symbolSentimentData,
+        patternAnalysisData,
+        fusionSignalData,
+        performanceData,
+        tradeQualityData,
+        paperReviewData,
+        profileCalibrationData,
+        profileCalibrationComparisonData,
+      ] = await Promise.all([
         resolvedSymbol ? getWorkstation(resolvedSymbol) : Promise.resolve<WorkstationResponse | null>(null),
         resolvedSymbol ? getAISignal(resolvedSymbol) : Promise.resolve<AISignalSummary | null>(null),
         resolvedSymbol
           ? getAISignalHistory(resolvedSymbol, { limit: AI_HISTORY_PAGE_SIZE, offset: aiHistoryOffset })
           : Promise.resolve<AISignalHistoryResponse>(INITIAL_AI_HISTORY),
         resolvedSymbol ? getAISignalEvaluation(resolvedSymbol) : Promise.resolve<AIOutcomeEvaluationResponse | null>(null),
+        resolvedSymbol ? getCandles(resolvedSymbol, selectedChartTimeframe, 120) : Promise.resolve<CandleHistoryResponse | null>(null),
         resolvedSymbol ? getTechnicalAnalysis(resolvedSymbol) : Promise.resolve<TechnicalAnalysisResponse | null>(null),
         resolvedSymbol ? getMarketSentiment(resolvedSymbol) : Promise.resolve<MarketSentimentResponse | null>(null),
         resolvedSymbol ? getSymbolSentiment(resolvedSymbol) : Promise.resolve<SymbolSentimentResponse | null>(null),
@@ -228,14 +323,25 @@ function App() {
         resolvedSymbol ? getFusionSignal(resolvedSymbol) : Promise.resolve<FusionSignalResponse | null>(null),
         resolvedSymbol ? getPerformanceAnalytics(resolvedSymbol) : Promise.resolve<PerformanceAnalyticsResponse | null>(null),
         resolvedSymbol ? getTradeQualityAnalytics(resolvedSymbol) : Promise.resolve<TradeQualityResponse | null>(null),
+        resolvedSymbol ? getPaperTradeReview(resolvedSymbol) : Promise.resolve<PaperTradeReviewResponse | null>(null),
+        resolvedSymbol
+          ? getProfileCalibration(resolvedSymbol, { profile: selectedTradingProfile })
+          : Promise.resolve<ProfileCalibrationResponse | null>(null),
+        resolvedSymbol
+          ? getProfileCalibrationComparison(resolvedSymbol, selectedTradingProfile)
+          : Promise.resolve<ProfileCalibrationComparisonResponse | null>(null),
       ]);
 
       setHealth({ data: healthData, loading: false, refreshing: false, error: null });
       setBotStatus({ data: botStatusData, loading: false, refreshing: false, error: null });
+      if (botStatusData.state !== 'stopped') {
+        setSelectedTradingProfile(botStatusData.trading_profile);
+      }
       setWorkstation({ data: workstationData, loading: false, refreshing: false, error: null });
       setAiSignal({ data: aiSignalData, loading: false, refreshing: false, error: null });
       setAiHistory({ data: aiHistoryData, loading: false, refreshing: false, error: null });
       setAiEvaluation({ data: aiEvaluationData, loading: false, refreshing: false, error: null });
+      setCandles({ data: candleData, loading: false, refreshing: false, error: null });
       setTechnicalAnalysis({ data: technicalAnalysisData, loading: false, refreshing: false, error: null });
       setMarketSentiment({ data: marketSentimentData, loading: false, refreshing: false, error: null });
       setSymbolSentiment({ data: symbolSentimentData, loading: false, refreshing: false, error: null });
@@ -243,6 +349,9 @@ function App() {
       setFusionSignal({ data: fusionSignalData, loading: false, refreshing: false, error: null });
       setPerformanceAnalytics({ data: performanceData, loading: false, refreshing: false, error: null });
       setTradeQualityAnalytics({ data: tradeQualityData, loading: false, refreshing: false, error: null });
+      setPaperTradeReview({ data: paperReviewData, loading: false, refreshing: false, error: null });
+      setProfileCalibration({ data: profileCalibrationData, loading: false, refreshing: false, error: null });
+      setProfileCalibrationComparison({ data: profileCalibrationComparisonData, loading: false, refreshing: false, error: null });
       setLastUpdatedAt(new Date());
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to refresh workstation state.';
@@ -253,6 +362,7 @@ function App() {
         setAiSignal((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setAiHistory((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setAiEvaluation((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setCandles((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setTechnicalAnalysis((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setMarketSentiment((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setSymbolSentiment((current) => ({ ...current, loading: false, refreshing: false, error: message }));
@@ -260,9 +370,12 @@ function App() {
         setFusionSignal((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setPerformanceAnalytics((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setTradeQualityAnalytics((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setPaperTradeReview((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setProfileCalibration((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setProfileCalibrationComparison((current) => ({ ...current, loading: false, refreshing: false, error: message }));
       }
     }
-  }, [aiHistoryOffset, selectedPatternHorizon]);
+  }, [aiHistoryOffset, selectedChartTimeframe, selectedPatternHorizon, selectedTradingProfile]);
 
   useEffect(() => {
     void loadSymbols(symbolSearch);
@@ -288,6 +401,7 @@ function App() {
       setSelectedSymbol('');
     }
     setBotActionError(null);
+    setBotActionMessage(null);
   }, [selectedSymbol]);
 
   const handleSelectSymbol = useCallback((symbol: string) => {
@@ -295,6 +409,7 @@ function App() {
     setSelectedSymbol(symbol);
     setSymbolSearch(symbol);
     setBotActionError(null);
+    setBotActionMessage(null);
   }, []);
 
   const handleClearSelection = useCallback(() => {
@@ -302,10 +417,12 @@ function App() {
     setSelectedSymbol('');
     setSymbolSearch('');
     setBotActionError(null);
+    setBotActionMessage(null);
     setWorkstation({ data: null, loading: false, refreshing: false, error: null });
     setAiSignal({ data: null, loading: false, refreshing: false, error: null });
     setAiHistory({ data: INITIAL_AI_HISTORY, loading: false, refreshing: false, error: null });
     setAiEvaluation({ data: null, loading: false, refreshing: false, error: null });
+    setCandles({ data: null, loading: false, refreshing: false, error: null });
     setTechnicalAnalysis({ data: null, loading: false, refreshing: false, error: null });
     setMarketSentiment({ data: null, loading: false, refreshing: false, error: null });
     setSymbolSentiment({ data: null, loading: false, refreshing: false, error: null });
@@ -313,14 +430,19 @@ function App() {
     setFusionSignal({ data: null, loading: false, refreshing: false, error: null });
     setPerformanceAnalytics({ data: null, loading: false, refreshing: false, error: null });
     setTradeQualityAnalytics({ data: null, loading: false, refreshing: false, error: null });
+    setPaperTradeReview({ data: null, loading: false, refreshing: false, error: null });
+    setProfileCalibration({ data: null, loading: false, refreshing: false, error: null });
+    setProfileCalibrationComparison({ data: null, loading: false, refreshing: false, error: null });
   }, []);
 
   const runBotAction = useCallback(async (action: () => Promise<BotStatusResponse>) => {
     setBotActionLoading(true);
     setBotActionError(null);
+    setBotActionMessage(null);
     try {
       const nextStatus = await action();
       setBotStatus({ data: nextStatus, loading: false, refreshing: false, error: null });
+      setSelectedTradingProfile(nextStatus.trading_profile);
       if (nextStatus.symbol) {
         setAiHistoryOffset(0);
         setSelectedSymbol(nextStatus.symbol);
@@ -335,23 +457,45 @@ function App() {
     }
   }, [refreshWorkspace, selectedSymbol]);
 
+  const runManualTradeAction = useCallback(async (action: () => Promise<{ message: string }>) => {
+    setBotActionLoading(true);
+    setBotActionError(null);
+    setBotActionMessage(null);
+    try {
+      const result = await action();
+      setBotActionMessage(result.message);
+      await refreshWorkspace(selectedSymbol);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to submit the manual paper trade.';
+      setBotActionError(message);
+    } finally {
+      setBotActionLoading(false);
+    }
+  }, [refreshWorkspace, selectedSymbol]);
+
   const handleResetSession = useCallback(async () => {
     setBotActionLoading(true);
     setBotActionError(null);
+    setBotActionMessage(null);
     try {
       const nextStatus = await resetBotSession();
       setAiHistoryOffset(0);
       setBotStatus({ data: nextStatus, loading: false, refreshing: false, error: null });
+      setSelectedTradingProfile(nextStatus.trading_profile);
       setWorkstation({ data: null, loading: false, refreshing: false, error: null });
       setAiSignal({ data: null, loading: false, refreshing: false, error: null });
       setAiHistory({ data: INITIAL_AI_HISTORY, loading: false, refreshing: false, error: null });
       setAiEvaluation({ data: null, loading: false, refreshing: false, error: null });
+      setCandles({ data: null, loading: false, refreshing: false, error: null });
       setTechnicalAnalysis({ data: null, loading: false, refreshing: false, error: null });
       setMarketSentiment({ data: null, loading: false, refreshing: false, error: null });
       setSymbolSentiment({ data: null, loading: false, refreshing: false, error: null });
       setPatternAnalysis({ data: null, loading: false, refreshing: false, error: null });
       setPerformanceAnalytics({ data: null, loading: false, refreshing: false, error: null });
       setTradeQualityAnalytics({ data: null, loading: false, refreshing: false, error: null });
+      setPaperTradeReview({ data: null, loading: false, refreshing: false, error: null });
+      setProfileCalibration({ data: null, loading: false, refreshing: false, error: null });
+      setProfileCalibrationComparison({ data: null, loading: false, refreshing: false, error: null });
       setLastUpdatedAt(new Date());
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to reset the paper session.';
@@ -380,9 +524,32 @@ function App() {
   const signalExplanation = effectiveWorkstation?.explanation ?? 'Select a symbol, then start or pause the live paper runtime to populate live signal state.';
   const refreshLabel = autoRefreshSeconds === 0 ? 'Off' : `${autoRefreshSeconds}s`;
   const readiness = effectiveWorkstation?.trade_readiness ?? null;
+  const derivedMidPrice = effectiveWorkstation?.feature?.mid_price ?? computeMidPrice(effectiveWorkstation);
+  const derivedSpread = effectiveWorkstation?.feature?.bid_ask_spread ?? computeSpread(effectiveWorkstation);
+  const derivedBookImbalance = effectiveWorkstation?.feature?.order_book_imbalance ?? computeBookImbalance(effectiveWorkstation);
+  const liveFieldGap = describeLiveFieldGap(effectiveWorkstation);
   const handleAiHistoryPrevious = useCallback(() => {
     setAiHistoryOffset((current) => Math.max(current - AI_HISTORY_PAGE_SIZE, 0));
   }, []);
+
+  const handleApplyProfileCalibration = useCallback(async (profile: TradingProfile, thresholds?: string[]) => {
+    if (!selectedSymbol) {
+      return;
+    }
+    setProfileApplyLoading(true);
+    setBotActionError(null);
+    setBotActionMessage(null);
+    try {
+      const result: ProfileCalibrationApplyResponse = await applyProfileCalibration(selectedSymbol, profile, thresholds);
+      setBotActionMessage(result.status_message);
+      await refreshWorkspace(selectedSymbol);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to apply the tuning recommendation.';
+      setBotActionError(message);
+    } finally {
+      setProfileApplyLoading(false);
+    }
+  }, [refreshWorkspace, selectedSymbol]);
   const handleAiHistoryNext = useCallback(() => {
     setAiHistoryOffset((current) => {
       const total = aiHistory.data.total;
@@ -435,18 +602,30 @@ function App() {
           searchQuery={symbolSearch}
           selectedSymbol={selectedSymbol}
           hasValidSelection={selectedSymbol.length > 0}
+          tradingProfile={selectedTradingProfile}
+          onTradingProfileChange={setSelectedTradingProfile}
           symbolResults={symbolResults.data}
           symbolsLoading={symbolResults.loading || symbolResults.refreshing}
           symbolsError={symbolResults.error}
+          chart={candles.data}
+          chartLoading={candles.loading || candles.refreshing}
+          chartError={candles.error}
+          chartTimeframe={selectedChartTimeframe}
+          onChartTimeframeChange={setSelectedChartTimeframe}
+          technicalAnalysis={technicalAnalysis.data}
           status={botStatus.data}
           actionLoading={botActionLoading}
           actionError={botActionError ?? botStatus.error}
+          actionMessage={botActionMessage}
+          hasOpenPosition={Boolean(effectiveWorkstation?.current_position)}
           onSearchChange={handleSymbolSearchChange}
           onSelectSymbol={handleSelectSymbol}
           onClearSelection={handleClearSelection}
-          onStart={() => void runBotAction(() => startBot(selectedSymbol))}
+          onStart={() => void runBotAction(() => startBot(selectedSymbol, selectedTradingProfile))}
           onStop={() => void runBotAction(stopBot)}
           onPauseResume={() => void runBotAction(() => (botStatus.data.state === 'paused' ? resumeBot() : pauseBot()))}
+          onManualBuy={() => void runManualTradeAction(() => manualBuyMarket(selectedSymbol))}
+          onManualClose={() => void runManualTradeAction(() => manualClosePosition(selectedSymbol))}
           onReset={() => void handleResetSession()}
         />
 
@@ -507,7 +686,7 @@ function App() {
                           value={effectiveWorkstation.last_price ? formatCurrency(effectiveWorkstation.last_price) : '-'}
                           helper={formatDateTime(effectiveWorkstation.last_market_event)}
                         />
-                        <MetricCard label="Runtime Mode" value={effectiveWorkstation.runtime_status.mode} helper={effectiveWorkstation.runtime_status.session_id ? `Session ${effectiveWorkstation.runtime_status.session_id}` : 'No active runtime session'} />
+                        <MetricCard label="Runtime Mode" value={effectiveWorkstation.runtime_status.mode} helper={`Profile ${effectiveWorkstation.runtime_status.trading_profile}${effectiveWorkstation.runtime_status.session_id ? ` · Session ${effectiveWorkstation.runtime_status.session_id}` : ''}`} />
                         <MetricCard label="Trend / Bias" value={trendLabel} helper={effectiveWorkstation.feature?.regime ?? 'No regime yet'} />
                         <MetricCard
                           label="Current Candle"
@@ -525,7 +704,7 @@ function App() {
                             </span>
                             <span className="text-sm text-slate-400">{describeSignal(effectiveWorkstation.entry_signal?.side)}</span>
                           </div>
-                          <p className="mt-3 text-sm text-slate-300">{effectiveWorkstation.entry_signal?.reason_codes.join(', ') || 'No entry context yet'}</p>
+                          <p className="mt-3 text-sm text-slate-300">{effectiveWorkstation.entry_signal ? formatReasonCodes(effectiveWorkstation.entry_signal.reason_codes) : 'No entry context yet'}</p>
                         </div>
 
                         <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
@@ -536,7 +715,7 @@ function App() {
                             </span>
                             <span className="text-sm text-slate-400">{describeSignal(effectiveWorkstation.exit_signal?.side)}</span>
                           </div>
-                          <p className="mt-3 text-sm text-slate-300">{effectiveWorkstation.exit_signal?.reason_codes.join(', ') || 'No exit context yet'}</p>
+                          <p className="mt-3 text-sm text-slate-300">{effectiveWorkstation.exit_signal ? formatReasonCodes(effectiveWorkstation.exit_signal.reason_codes) : 'No exit context yet'}</p>
                         </div>
                       </div>
 
@@ -572,18 +751,14 @@ function App() {
 
                         <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
                           <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Feature Snapshot</p>
-                          {effectiveWorkstation.feature ? (
-                            <div className="mt-3 grid grid-cols-2 gap-3 text-sm text-slate-200">
-                              <div><span className="text-slate-500">EMA Fast</span><p>{formatOptionalCurrency(effectiveWorkstation.feature.ema_fast, 'Not yet populated')}</p></div>
-                              <div><span className="text-slate-500">EMA Slow</span><p>{formatOptionalCurrency(effectiveWorkstation.feature.ema_slow, 'Not yet populated')}</p></div>
-                              <div><span className="text-slate-500">ATR</span><p>{formatOptionalDecimal(effectiveWorkstation.feature.atr, 'Not yet populated')}</p></div>
-                              <div><span className="text-slate-500">Spread</span><p>{formatOptionalDecimal(effectiveWorkstation.feature.bid_ask_spread, effectiveWorkstation.top_of_book ? 'Not yet populated' : 'Waiting for live snapshot')}</p></div>
-                              <div><span className="text-slate-500">Mid Price</span><p>{formatOptionalCurrency(effectiveWorkstation.feature.mid_price, effectiveWorkstation.top_of_book ? 'Not yet populated' : 'Waiting for live snapshot')}</p></div>
-                              <div><span className="text-slate-500">Book Imbalance</span><p>{formatOptionalDecimal(effectiveWorkstation.feature.order_book_imbalance, effectiveWorkstation.top_of_book ? 'Not yet populated' : 'Unavailable')}</p></div>
-                            </div>
-                          ) : (
-                            <StatePanel title="Waiting for features" message="More candle history is needed before the feature engine can derive trend and volatility state." tone="empty" />
-                          )}
+                          <div className="mt-3 grid grid-cols-2 gap-3 text-sm text-slate-200">
+                            <div><span className="text-slate-500">EMA Fast</span><p>{formatOptionalCurrency(effectiveWorkstation.feature?.ema_fast, 'Need more candles')}</p></div>
+                            <div><span className="text-slate-500">EMA Slow</span><p>{formatOptionalCurrency(effectiveWorkstation.feature?.ema_slow, 'Need more candles')}</p></div>
+                            <div><span className="text-slate-500">ATR</span><p>{formatOptionalDecimal(effectiveWorkstation.feature?.atr, 'Need more candles')}</p></div>
+                            <div><span className="text-slate-500">Spread</span><p>{formatOptionalDecimal(derivedSpread, liveFieldGap)}</p></div>
+                            <div><span className="text-slate-500">Mid Price</span><p>{formatOptionalCurrency(derivedMidPrice, liveFieldGap)}</p></div>
+                            <div><span className="text-slate-500">Book Imbalance</span><p>{formatOptionalDecimal(derivedBookImbalance, liveFieldGap)}</p></div>
+                          </div>
                         </div>
                       </div>
                     </div>
@@ -689,7 +864,7 @@ function App() {
               ) : (
                 <div className="grid gap-4">
                   <MetricCard label="Runtime Status" value={botStatus.data.state} helper={`Timeframe ${botStatus.data.timeframe}`} />
-                  <MetricCard label="Runtime Mode" value={botStatus.data.mode} helper={botStatus.data.session_id ? `Session ${botStatus.data.session_id}` : 'No active session'} />
+                  <MetricCard label="Runtime Mode" value={botStatus.data.mode} helper={`Profile ${botStatus.data.trading_profile}${botStatus.data.session_id ? ` · Session ${botStatus.data.session_id}` : ''}`} />
                   <MetricCard label="Selected Symbol" value={selectedSymbol} helper={effectiveWorkstation?.is_runtime_symbol ? 'Connected to live runtime' : 'Not running for this symbol'} />
                   <MetricCard label="Last Market Event" value={formatDateTime(effectiveWorkstation?.last_market_event ?? botStatus.data.last_event_time)} helper="Latest live market timestamp" />
                   <MetricCard label="Session Error" value={botStatus.data.last_error ?? '-'} helper="Most recent runtime error, if any" />
@@ -742,11 +917,11 @@ function App() {
                         <div className="mt-3 space-y-3 text-sm text-slate-200">
                           <div>
                             <span className="text-slate-500">Signal</span>
-                            <p>{effectiveWorkstation.last_action.signal_side} - {effectiveWorkstation.last_action.signal_reasons.join(', ')}</p>
+                            <p>{effectiveWorkstation.last_action.signal_side} - {formatReasonCodes(effectiveWorkstation.last_action.signal_reasons)}</p>
                           </div>
                           <div>
                             <span className="text-slate-500">Execution</span>
-                            <p>{effectiveWorkstation.last_action.execution_status ?? 'Not executed'}{effectiveWorkstation.last_action.execution_reasons.length > 0 ? ` - ${effectiveWorkstation.last_action.execution_reasons.join(', ')}` : ''}</p>
+                            <p>{effectiveWorkstation.last_action.execution_status ?? 'Not executed'}{effectiveWorkstation.last_action.execution_reasons.length > 0 ? ` - ${formatReasonCodes(effectiveWorkstation.last_action.execution_reasons)}` : ''}</p>
                           </div>
                         </div>
                       ) : (
@@ -783,6 +958,30 @@ function App() {
                       loading={tradeQualityAnalytics.loading}
                       refreshing={tradeQualityAnalytics.refreshing}
                       error={tradeQualityAnalytics.error}
+                    />
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <PaperTradeReviewSection
+                      symbol={selectedSymbol}
+                      review={paperTradeReview.data}
+                      loading={paperTradeReview.loading}
+                      refreshing={paperTradeReview.refreshing}
+                      error={paperTradeReview.error}
+                    />
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <ProfileCalibrationSection
+                      symbol={selectedSymbol}
+                      calibration={profileCalibration.data}
+                      comparison={profileCalibrationComparison.data}
+                      loading={profileCalibration.loading}
+                      refreshing={profileCalibration.refreshing || profileCalibrationComparison.refreshing}
+                      error={profileCalibration.error ?? profileCalibrationComparison.error}
+                      actionLoading={profileApplyLoading}
+                      activeProfile={selectedTradingProfile}
+                      onApply={handleApplyProfileCalibration}
                     />
                   </div>
                 </div>

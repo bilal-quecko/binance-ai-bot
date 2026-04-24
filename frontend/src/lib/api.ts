@@ -3,6 +3,7 @@
   AISignalHistoryResponse,
   AISignalSummary,
   BotStatusResponse,
+  CandleHistoryResponse,
   DrawdownResponse,
   EquityHistoryPoint,
   EquityResponse,
@@ -15,11 +16,17 @@
   PaginatedResponse,
   PnlHistoryResponse,
   PerformanceAnalyticsResponse,
+  PaperTradeReviewResponse,
+  ProfileCalibrationApplyResponse,
+  ProfileCalibrationComparisonResponse,
+  ProfileCalibrationResponse,
   PatternAnalysisResponse,
   FusionSignalResponse,
   PositionItem,
   TechnicalAnalysisResponse,
+  TradingProfile,
   TradeQualityResponse,
+  ManualTradeResponse,
   WorkstationResponse,
   RangeFilters,
   SpotSymbolItem,
@@ -112,6 +119,56 @@ export function getTradeQualityAnalytics(
   return requestJson<TradeQualityResponse>('/performance/trade-quality', params);
 }
 
+export function getPaperTradeReview(
+  symbol: string,
+  filters?: RangeFilters,
+): Promise<PaperTradeReviewResponse> {
+  const params = buildRangeParams(filters);
+  params.set('symbol', symbol.trim().toUpperCase());
+  return requestJson<PaperTradeReviewResponse>('/performance/review', params);
+}
+
+export function getProfileCalibration(
+  symbol: string,
+  filters?: RangeFilters & { profile?: TradingProfile },
+): Promise<ProfileCalibrationResponse> {
+  const params = buildRangeParams(filters);
+  params.set('symbol', symbol.trim().toUpperCase());
+  if (filters?.profile) {
+    params.set('profile', filters.profile);
+  }
+  return requestJson<ProfileCalibrationResponse>('/performance/profile-calibration', params);
+}
+
+export function applyProfileCalibration(
+  symbol: string,
+  profile: TradingProfile,
+  selectedThresholds?: string[],
+): Promise<ProfileCalibrationApplyResponse> {
+  return requestJson<ProfileCalibrationApplyResponse>('/performance/profile-calibration/apply', undefined, {
+    method: 'POST',
+    body: JSON.stringify({
+      symbol: symbol.trim().toUpperCase(),
+      profile,
+      selected_thresholds: selectedThresholds,
+    }),
+  });
+}
+
+export function getProfileCalibrationComparison(
+  symbol: string,
+  profile: TradingProfile,
+  filters?: RangeFilters & { sessionId?: string },
+): Promise<ProfileCalibrationComparisonResponse> {
+  const params = buildRangeParams(filters);
+  params.set('symbol', symbol.trim().toUpperCase());
+  params.set('profile', profile);
+  if (filters?.sessionId) {
+    params.set('session_id', filters.sessionId);
+  }
+  return requestJson<ProfileCalibrationComparisonResponse>('/performance/profile-calibration/comparison', params);
+}
+
 export function getEquity(): Promise<EquityResponse> {
   return requestJson<EquityResponse>('/equity');
 }
@@ -139,6 +196,19 @@ export function getBotStatus(): Promise<BotStatusResponse> {
 export function getWorkstation(symbol: string): Promise<WorkstationResponse> {
   const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
   return requestJson<WorkstationResponse>('/bot/workstation', params);
+}
+
+export function getCandles(
+  symbol: string,
+  timeframe: '1m' | '5m' | '15m' | '1h',
+  limit = 120,
+): Promise<CandleHistoryResponse> {
+  const params = new URLSearchParams({
+    symbol: symbol.trim().toUpperCase(),
+    timeframe,
+    limit: String(limit),
+  });
+  return requestJson<CandleHistoryResponse>('/bot/candles', params);
 }
 
 export function getTechnicalAnalysis(symbol: string): Promise<TechnicalAnalysisResponse> {
@@ -205,10 +275,10 @@ export function getSymbols(query = '', limit = 20): Promise<SpotSymbolItem[]> {
   return requestJson<SpotSymbolItem[]>('/symbols', params);
 }
 
-export function startBot(symbol: string): Promise<BotStatusResponse> {
+export function startBot(symbol: string, tradingProfile: TradingProfile): Promise<BotStatusResponse> {
   return requestJson<BotStatusResponse>('/bot/start', undefined, {
     method: 'POST',
-    body: JSON.stringify({ symbol }),
+    body: JSON.stringify({ symbol, trading_profile: tradingProfile }),
   });
 }
 
@@ -226,6 +296,20 @@ export function resumeBot(): Promise<BotStatusResponse> {
 
 export function resetBotSession(): Promise<BotStatusResponse> {
   return requestJson<BotStatusResponse>('/bot/reset', undefined, { method: 'POST' });
+}
+
+export function manualBuyMarket(symbol: string): Promise<ManualTradeResponse> {
+  return requestJson<ManualTradeResponse>('/bot/manual-buy', undefined, {
+    method: 'POST',
+    body: JSON.stringify({ symbol }),
+  });
+}
+
+export function manualClosePosition(symbol: string): Promise<ManualTradeResponse> {
+  return requestJson<ManualTradeResponse>('/bot/manual-close', undefined, {
+    method: 'POST',
+    body: JSON.stringify({ symbol }),
+  });
 }
 
 export function getDailyPnl(day?: string): Promise<string> {

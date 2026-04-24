@@ -13,7 +13,7 @@ export function PaginationControls({ total, limit, offset, onPrevious, onNext }:
   return (
     <div className="flex items-center justify-between gap-3 border-t border-slate-800 pt-4 text-sm text-slate-400">
       <span>
-        Page {currentPage} of {totalPages} - {total} rows
+        Page {currentPage} / {totalPages} - {total} rows
       </span>
       <div className="flex items-center gap-2">
         <button

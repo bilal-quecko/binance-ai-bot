@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -25,13 +26,14 @@ from app.features.models import FeatureConfig
 from app.market_data.candles import Candle
 from app.market_data.stream_manager import StreamManager
 from app.market_data.models import MarketSnapshot
+from app.monitoring.profile_calibration import PROFILE_THRESHOLDS
 from app.paper.broker import PaperBroker
 from app.paper.models import Position
 from app.risk.limits import RiskEngine
-from app.runner import RunnerConfig, StrategyRunner
-from app.runner.models import RunnerCycleResult, TradeReadiness
+from app.runner import RunnerConfig, StrategyRunner, TradingProfile
+from app.runner.models import ManualTradeResult, RunnerCycleResult, TradeReadiness
 from app.storage import StorageRepository
-from app.storage.models import PaperBrokerStateRecord
+from app.storage.models import PaperBrokerStateRecord, ProfileTuningSetRecord
 from app.strategies.models import StrategySignal
 from app.strategies.models import TrendFollowingConfig
 from app.strategies.trend_following import TrendFollowingStrategy
@@ -63,6 +65,9 @@ class BotStatus:
     recovered_from_prior_session: bool = False
     broker_state_restored: bool = False
     recovery_message: str | None = None
+    trading_profile: TradingProfile = "balanced"
+    tuning_version_id: str | None = None
+    baseline_tuning_version_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -132,6 +137,9 @@ class PaperBotRuntime:
             recovered_from_prior_session=self._status.recovered_from_prior_session,
             broker_state_restored=self._status.broker_state_restored,
             recovery_message=self._status.recovery_message,
+            trading_profile=self._status.trading_profile,
+            tuning_version_id=self._status.tuning_version_id,
+            baseline_tuning_version_id=self._status.baseline_tuning_version_id,
         )
 
     def storage_degraded(self) -> bool:
@@ -219,6 +227,9 @@ class PaperBotRuntime:
                 started_at=self._status.started_at,
                 last_event_time=self._status.last_event_time,
                 last_error=self._status.last_error,
+                trading_profile=self._status.trading_profile,
+                tuning_version_id=self._status.tuning_version_id,
+                baseline_tuning_version_id=self._status.baseline_tuning_version_id,
             )
             self._mark_persistence_ok()
         except Exception:
@@ -298,7 +309,25 @@ class PaperBotRuntime:
             recovered_from_prior_session=True,
             broker_state_restored=broker_state is not None,
             recovery_message=recovery_message,
+            trading_profile=session_state.trading_profile,
+            tuning_version_id=session_state.tuning_version_id,
+            baseline_tuning_version_id=session_state.baseline_tuning_version_id,
         )
+        if self._runner is not None:
+            restored_thresholds = self._thresholds_for_version(
+                profile=self._status.trading_profile,
+                version_id=self._status.tuning_version_id,
+            )
+            self._runner.update_profile(
+                strategy_config=self._strategy_config_for_profile(
+                    self._status.trading_profile,
+                    thresholds=restored_thresholds,
+                ),
+                runner_config=self._runner_config_for_profile(
+                    self._status.trading_profile,
+                    thresholds=restored_thresholds,
+                ),
+            )
         self._persist_runtime_state()
 
     def _broker_has_recovered_state(self) -> bool:
@@ -307,6 +336,170 @@ class PaperBotRuntime:
         if self._runner is None:
             return False
         return bool(self._runner.get_open_positions())
+
+    def _base_tuning_thresholds(self, profile: TradingProfile) -> dict[str, Decimal]:
+        """Return the default tunable thresholds for one profile."""
+
+        return dict(PROFILE_THRESHOLDS[profile])
+
+    def _load_tuning_thresholds(
+        self,
+        *,
+        profile: TradingProfile,
+        config_json: str | None,
+    ) -> dict[str, Decimal]:
+        """Return profile tuning thresholds merged onto the built-in defaults."""
+
+        thresholds = self._base_tuning_thresholds(profile)
+        if not config_json:
+            return thresholds
+        try:
+            raw_config = json.loads(config_json)
+        except json.JSONDecodeError:
+            self._logger.warning("Ignoring invalid tuning config for profile %s.", profile)
+            return thresholds
+        if not isinstance(raw_config, dict):
+            return thresholds
+        for key in thresholds:
+            value = raw_config.get(key)
+            if value is None:
+                continue
+            try:
+                thresholds[key] = Decimal(str(value))
+            except Exception:  # pragma: no cover - defensive config parsing
+                self._logger.warning("Ignoring invalid tuning threshold %s=%r.", key, value)
+        return thresholds
+
+    def _resolve_active_tuning(
+        self,
+        *,
+        symbol: str,
+        profile: TradingProfile,
+    ) -> tuple[dict[str, Decimal], str | None, str | None]:
+        """Return thresholds and version ids for the next paper session."""
+
+        pending = self._storage_repository.get_latest_profile_tuning_set(
+            symbol=symbol,
+            profile=profile,
+            status="pending",
+        )
+        active_tuning = pending
+        if pending is not None:
+            applied_at = datetime.now(tz=UTC)
+            self._storage_repository.mark_profile_tuning_applied(
+                pending.version_id,
+                applied_at=applied_at,
+            )
+            active_tuning = ProfileTuningSetRecord(
+                version_id=pending.version_id,
+                symbol=pending.symbol,
+                profile=pending.profile,
+                status="applied",
+                config_json=pending.config_json,
+                baseline_config_json=pending.baseline_config_json,
+                created_at=pending.created_at,
+                applied_at=applied_at,
+                baseline_version_id=pending.baseline_version_id,
+                reason=pending.reason,
+            )
+        if active_tuning is None:
+            active_tuning = self._storage_repository.get_latest_profile_tuning_set(
+                symbol=symbol,
+                profile=profile,
+                status="applied",
+            )
+        if active_tuning is None:
+            return self._base_tuning_thresholds(profile), None, None
+        return (
+            self._load_tuning_thresholds(
+                profile=profile,
+                config_json=active_tuning.config_json,
+            ),
+            active_tuning.version_id,
+            active_tuning.baseline_version_id,
+        )
+
+    def _thresholds_for_version(
+        self,
+        *,
+        profile: TradingProfile,
+        version_id: str | None,
+    ) -> dict[str, Decimal]:
+        """Return thresholds for one persisted tuning version."""
+
+        if version_id is None:
+            return self._base_tuning_thresholds(profile)
+        tuning_set = self._storage_repository.get_profile_tuning_set_by_version(version_id)
+        if tuning_set is None:
+            return self._base_tuning_thresholds(profile)
+        return self._load_tuning_thresholds(
+            profile=profile,
+            config_json=tuning_set.config_json,
+        )
+
+    def _strategy_config_for_profile(
+        self,
+        profile: TradingProfile,
+        *,
+        thresholds: dict[str, Decimal] | None = None,
+    ) -> TrendFollowingConfig:
+        """Return deterministic strategy thresholds for one trading profile."""
+
+        resolved_thresholds = thresholds or self._base_tuning_thresholds(profile)
+        if profile == "conservative":
+            return TrendFollowingConfig(
+                min_atr_ratio=resolved_thresholds["min_atr_ratio"],
+                max_atr_ratio=Decimal("0.0300"),
+                max_spread_ratio=resolved_thresholds["max_spread_ratio"],
+                min_order_book_imbalance=resolved_thresholds["min_order_book_imbalance"],
+                stop_loss_atr_multiple=resolved_thresholds["stop_loss_atr_multiple"],
+                take_profit_atr_multiple=resolved_thresholds["take_profit_atr_multiple"],
+            )
+        if profile == "aggressive":
+            return TrendFollowingConfig(
+                min_atr_ratio=resolved_thresholds["min_atr_ratio"],
+                max_atr_ratio=Decimal("0.0600"),
+                max_spread_ratio=resolved_thresholds["max_spread_ratio"],
+                min_order_book_imbalance=resolved_thresholds["min_order_book_imbalance"],
+                stop_loss_atr_multiple=resolved_thresholds["stop_loss_atr_multiple"],
+                take_profit_atr_multiple=resolved_thresholds["take_profit_atr_multiple"],
+            )
+        return TrendFollowingConfig(
+            min_atr_ratio=resolved_thresholds["min_atr_ratio"],
+            max_atr_ratio=Decimal("0.0400"),
+            max_spread_ratio=resolved_thresholds["max_spread_ratio"],
+            min_order_book_imbalance=resolved_thresholds["min_order_book_imbalance"],
+            stop_loss_atr_multiple=resolved_thresholds["stop_loss_atr_multiple"],
+            take_profit_atr_multiple=resolved_thresholds["take_profit_atr_multiple"],
+        )
+
+    def _runner_config_for_profile(
+        self,
+        profile: TradingProfile,
+        *,
+        thresholds: dict[str, Decimal] | None = None,
+    ) -> RunnerConfig:
+        """Return runner/risk tuning for one paper-trading profile."""
+
+        resolved_thresholds = thresholds or self._base_tuning_thresholds(profile)
+        risk_per_trade = Decimal(str(self._settings.risk_per_trade))
+        if profile == "conservative":
+            risk_per_trade = min(risk_per_trade, Decimal("0.0040"))
+        elif profile == "aggressive":
+            risk_per_trade = max(risk_per_trade, Decimal("0.0075"))
+
+        return RunnerConfig(
+            order_quantity=Decimal("1"),
+            stop_atr_multiple=resolved_thresholds["stop_loss_atr_multiple"],
+            risk_per_trade=risk_per_trade,
+            max_daily_loss=Decimal(str(self._settings.max_daily_loss)),
+            max_open_positions=self._settings.max_open_positions,
+            min_stop_distance_ratio=resolved_thresholds["min_stop_distance_ratio"],
+            min_expected_edge_buffer_pct=resolved_thresholds["min_expected_edge_buffer_pct"],
+            trading_profile=profile,
+            session_id=self._status.session_id,
+            tuning_version_id=self._status.tuning_version_id,
+        )
 
     def workstation_state(self, symbol: str) -> WorkstationState:
         """Return the current workstation view for a symbol."""
@@ -477,7 +670,12 @@ class PaperBotRuntime:
             f"{normalized_symbol}@aggTrade",
         ]
 
-    def _build_runner(self, broker: PaperBroker | None = None) -> StrategyRunner:
+    def _build_runner(
+        self,
+        broker: PaperBroker | None = None,
+        *,
+        thresholds: dict[str, Decimal] | None = None,
+    ) -> StrategyRunner:
         """Construct a fresh paper-only strategy runner."""
 
         runtime_broker = broker or PaperBroker(initial_balances={"USDT": Decimal("10000")})
@@ -490,7 +688,12 @@ class PaperBotRuntime:
                 atr_period=3,
             )
         )
-        strategy = TrendFollowingStrategy(TrendFollowingConfig())
+        strategy = TrendFollowingStrategy(
+            self._strategy_config_for_profile(
+                self._status.trading_profile,
+                thresholds=thresholds,
+            )
+        )
         risk_engine = RiskEngine()
         return StrategyRunner(
             feature_engine=feature_engine,
@@ -499,11 +702,9 @@ class PaperBotRuntime:
             execution_engine=execution_engine,
             broker=runtime_broker,
             storage_repository=self._storage_repository,
-            config=RunnerConfig(
-                order_quantity=Decimal("1"),
-                risk_per_trade=Decimal(str(self._settings.risk_per_trade)),
-                max_daily_loss=Decimal(str(self._settings.max_daily_loss)),
-                max_open_positions=self._settings.max_open_positions,
+            config=self._runner_config_for_profile(
+                self._status.trading_profile,
+                thresholds=thresholds,
             ),
         )
 
@@ -569,9 +770,14 @@ class PaperBotRuntime:
             if self._status.state != "error":
                 self._status.state = "stopped"
                 self._status.mode = "stopped"
+            if self._status.session_id is not None:
+                self._storage_repository.finish_paper_session_run(
+                    session_id=self._status.session_id,
+                    ended_at=datetime.now(tz=UTC),
+                )
             self._persist_runtime_state()
 
-    async def start(self, symbol: str) -> BotStatus:
+    async def start(self, symbol: str, trading_profile: TradingProfile = "balanced") -> BotStatus:
         """Start live paper trading for a single Spot symbol."""
 
         if self._settings.app_mode != "paper":
@@ -585,9 +791,11 @@ class PaperBotRuntime:
             if self._task is not None and not self._task.done():
                 raise RuntimeError("The paper bot is already running. Stop it before starting a new symbol.")
 
-            if self._runner is None:
-                self._runner = self._build_runner()
-            self._last_processed_candle_open_time = {}
+            tuning_thresholds, tuning_version_id, baseline_tuning_version_id = self._resolve_active_tuning(
+                symbol=normalized_symbol,
+                profile=trading_profile,
+            )
+
             self._status = BotStatus(
                 state="running",
                 mode="auto_paper",
@@ -600,9 +808,37 @@ class PaperBotRuntime:
                 recovered_from_prior_session=False,
                 broker_state_restored=self._broker_has_recovered_state(),
                 recovery_message=None,
+                trading_profile=trading_profile,
+                tuning_version_id=tuning_version_id,
+                baseline_tuning_version_id=baseline_tuning_version_id,
             )
+            if self._runner is None:
+                try:
+                    self._runner = self._build_runner(thresholds=tuning_thresholds)
+                except TypeError:
+                    self._runner = self._build_runner()
+            else:
+                self._runner.update_profile(
+                    strategy_config=self._strategy_config_for_profile(
+                        trading_profile,
+                        thresholds=tuning_thresholds,
+                    ),
+                    runner_config=self._runner_config_for_profile(
+                        trading_profile,
+                        thresholds=tuning_thresholds,
+                    ),
+                )
+            self._last_processed_candle_open_time = {}
             self._persist_runtime_state()
             self._persist_broker_state()
+            self._storage_repository.start_paper_session_run(
+                session_id=self._status.session_id or uuid4().hex,
+                symbol=normalized_symbol,
+                trading_profile=trading_profile,
+                tuning_version_id=tuning_version_id,
+                baseline_tuning_version_id=baseline_tuning_version_id,
+                started_at=self._status.started_at or datetime.now(tz=UTC),
+            )
             self._task = asyncio.create_task(
                 self._run(normalized_symbol, self._status.timeframe),
                 name=f"paper-bot-{normalized_symbol.lower()}",
@@ -625,6 +861,11 @@ class PaperBotRuntime:
             self._status.mode = "stopped"
             self._persist_runtime_state()
             self._persist_broker_state()
+            if self._status.session_id is not None:
+                self._storage_repository.finish_paper_session_run(
+                    session_id=self._status.session_id,
+                    ended_at=datetime.now(tz=UTC),
+                )
             return self.status()
 
     async def pause(self) -> BotStatus:
@@ -665,3 +906,60 @@ class PaperBotRuntime:
         self._status = BotStatus(timeframe=self._default_timeframe())
         self._persist_runtime_state()
         return self.status()
+
+    async def manual_buy_market(self, symbol: str) -> ManualTradeResult:
+        """Execute a manual paper-market buy for the active symbol."""
+
+        return await self._execute_manual_trade(symbol, action="buy_market", side="BUY")
+
+    async def manual_close_position(self, symbol: str) -> ManualTradeResult:
+        """Execute a manual paper close for the active symbol."""
+
+        return await self._execute_manual_trade(symbol, action="close_position", side="SELL")
+
+    async def _execute_manual_trade(
+        self,
+        symbol: str,
+        *,
+        action: str,
+        side: str,
+    ) -> ManualTradeResult:
+        """Run a manual paper trade through the runner and execution engine."""
+
+        normalized_symbol = symbol.strip().upper()
+        async with self._lock:
+            if not normalized_symbol:
+                return ManualTradeResult(
+                    symbol="",
+                    action=action,  # type: ignore[arg-type]
+                    requested_side=side,  # type: ignore[arg-type]
+                    status="rejected",
+                    message="Select a symbol before sending a manual paper trade.",
+                    reason_codes=("MISSING_SYMBOL",),
+                )
+            if self._settings.app_mode != "paper":
+                return ManualTradeResult(
+                    symbol=normalized_symbol,
+                    action=action,  # type: ignore[arg-type]
+                    requested_side=side,  # type: ignore[arg-type]
+                    status="rejected",
+                    message="Manual paper trades are only available in paper mode.",
+                    reason_codes=("PAPER_ONLY",),
+                )
+            if self._runner is None or self._status.symbol != normalized_symbol or self._status.state == "stopped":
+                return ManualTradeResult(
+                    symbol=normalized_symbol,
+                    action=action,  # type: ignore[arg-type]
+                    requested_side=side,  # type: ignore[arg-type]
+                    status="rejected",
+                    message=f"Start the live runtime for {normalized_symbol} before sending manual paper trades.",
+                    reason_codes=("START_RUNTIME_FIRST",),
+                )
+
+            result = self._runner.execute_manual_trade(
+                normalized_symbol,
+                action=action,
+                side=side,
+            )
+            self._persist_broker_state()
+            return result

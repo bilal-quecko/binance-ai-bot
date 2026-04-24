@@ -180,3 +180,68 @@ def test_strategy_runner_ignores_duplicate_and_out_of_order_candles_in_cache() -
     assert runner._candles_by_symbol["BTCUSDT"][0].close == Decimal("101")  # noqa: SLF001 - targeted cache assertion
     assert runner._candles_by_symbol["BTCUSDT"][1].close == Decimal("102")  # noqa: SLF001 - targeted cache assertion
     assert len(runner._candles_by_symbol["BTCUSDT"]) == 2  # noqa: SLF001 - targeted cache assertion
+
+
+def test_strategy_runner_exposes_human_readable_non_trading_reason() -> None:
+    broker = PaperBroker(initial_balances={"USDT": Decimal("1000")})
+    runner = StrategyRunner(
+        feature_engine=FeatureEngine(
+            FeatureConfig(
+                ema_fast_period=2,
+                ema_slow_period=3,
+                rsi_period=2,
+                atr_period=2,
+            )
+        ),
+        strategy=TrendFollowingStrategy(TrendFollowingConfig()),
+        risk_engine=RiskEngine(),
+        execution_engine=ExecutionEngine(broker),
+        broker=broker,
+    )
+
+    readiness = runner.preview_trade_readiness("BTCUSDT", runtime_active=False, mode="stopped")
+
+    assert readiness.next_action == "start_runtime"
+    assert readiness.blocking_reasons == (
+        "Start the live runtime to receive live candles and order-book data.",
+    )
+
+
+def test_strategy_runner_executes_manual_buy_and_close() -> None:
+    broker = PaperBroker(initial_balances={"USDT": Decimal("1000")})
+    runner = StrategyRunner(
+        feature_engine=FeatureEngine(
+            FeatureConfig(
+                ema_fast_period=2,
+                ema_slow_period=3,
+                rsi_period=2,
+                atr_period=2,
+            )
+        ),
+        strategy=TrendFollowingStrategy(TrendFollowingConfig()),
+        risk_engine=RiskEngine(),
+        execution_engine=ExecutionEngine(broker),
+        broker=broker,
+        config=RunnerConfig(
+            order_quantity=Decimal("1"),
+            risk_per_trade=Decimal("0.01"),
+            max_daily_loss=Decimal("0.10"),
+            max_open_positions=3,
+        ),
+    )
+
+    runner.ingest_snapshot(build_snapshot(0, "100"))
+    runner.ingest_snapshot(build_snapshot(1, "101"))
+    runner.ingest_snapshot(build_snapshot(2, "102"))
+
+    buy_result = runner.execute_manual_trade("BTCUSDT", action="buy_market", side="BUY")
+    close_result = runner.execute_manual_trade("BTCUSDT", action="close_position", side="SELL")
+
+    assert buy_result.status == "executed"
+    assert buy_result.fill_result is not None
+    assert buy_result.fill_result.side == "BUY"
+    assert buy_result.current_position is not None
+    assert close_result.status == "executed"
+    assert close_result.fill_result is not None
+    assert close_result.fill_result.side == "SELL"
+    assert close_result.current_position is None

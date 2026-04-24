@@ -3,6 +3,8 @@ export type RangePreset = '1D' | '7D' | '30D' | 'ALL';
 export type AutoRefreshIntervalSeconds = 0 | 5 | 10 | 30;
 export type WorkstationDataState = 'ready' | 'waiting_for_runtime' | 'waiting_for_history' | 'degraded_storage';
 export type PatternHorizon = '1d' | '3d' | '7d' | '14d' | '30d';
+export type ChartTimeframe = '1m' | '5m' | '15m' | '1h';
+export type TradingProfile = 'conservative' | 'balanced' | 'aggressive';
 export type PersistenceState =
   | 'healthy'
   | 'degraded_in_memory_only'
@@ -36,6 +38,9 @@ export interface BotStatusResponse {
   recovered_from_prior_session: boolean;
   broker_state_restored: boolean;
   recovery_message: string | null;
+  trading_profile: TradingProfile;
+  tuning_version_id: string | null;
+  baseline_tuning_version_id: string | null;
   persistence: PersistenceHealthSummary;
 }
 
@@ -49,6 +54,17 @@ export interface CandleSummary {
   close: DecimalString;
   volume: DecimalString;
   is_closed: boolean;
+}
+
+export interface CandleHistoryResponse {
+  symbol: string;
+  timeframe: ChartTimeframe;
+  source_timeframe: string;
+  derived_from_lower_timeframe: boolean;
+  data_state: WorkstationDataState;
+  status_message: string | null;
+  candles: CandleSummary[];
+  current_price: DecimalString | null;
 }
 
 export interface TopOfBookSummary {
@@ -220,6 +236,7 @@ export interface TradeReadinessResponse {
   selected_symbol: string;
   runtime_active: boolean;
   mode: 'auto_paper' | 'paused' | 'stopped' | 'error';
+  trading_profile: TradingProfile;
   enough_candle_history: boolean;
   deterministic_entry_signal: boolean;
   deterministic_exit_signal: boolean;
@@ -228,9 +245,25 @@ export interface TradeReadinessResponse {
   broker_ready: boolean;
   next_action: string;
   reason_if_not_trading: string | null;
+  blocking_reasons: string[];
+  signal_reason_codes: string[];
   risk_reason_codes: string[];
   expected_edge_pct: DecimalString | null;
   estimated_round_trip_cost_pct: DecimalString | null;
+}
+
+export interface ManualTradeResponse {
+  symbol: string;
+  action: 'buy_market' | 'close_position';
+  requested_side: 'BUY' | 'SELL';
+  status: 'executed' | 'rejected';
+  message: string;
+  reason_codes: string[];
+  approved_quantity: DecimalString | null;
+  filled_quantity: DecimalString | null;
+  fill_price: DecimalString | null;
+  current_position_quantity: DecimalString | null;
+  current_pnl: DecimalString;
 }
 
 export interface AISignalHistoryResponse {
@@ -410,6 +443,133 @@ export interface TradeQualityResponse {
   offset: number;
   summary: TradeQualitySummary;
   details: TradeQualityDetail[];
+}
+
+export interface ReviewTradesPerSymbolItem {
+  symbol: string;
+  trade_count: number;
+}
+
+export interface PaperTradeReviewSession {
+  trades_per_hour: DecimalString | null;
+  trades_per_symbol: ReviewTradesPerSymbolItem[];
+  win_rate: DecimalString | null;
+  average_pnl: DecimalString | null;
+  average_hold_seconds: number | null;
+  fees_paid: DecimalString;
+  idle_duration_seconds: number | null;
+  total_closed_trades: number;
+}
+
+export interface BlockerFrequencyItem {
+  blocker_key: string;
+  label: string;
+  count: number;
+  frequency_pct: DecimalString;
+}
+
+export interface ProfileComparisonItem {
+  profile: TradingProfile;
+  trade_count: number;
+  realized_pnl: DecimalString;
+  win_rate: DecimalString | null;
+  average_expectancy: DecimalString | null;
+}
+
+export interface ExecutionSourceComparisonItem {
+  execution_source: 'auto' | 'manual';
+  trade_count: number;
+  realized_pnl: DecimalString;
+  win_rate: DecimalString | null;
+  average_expectancy: DecimalString | null;
+}
+
+export interface TuningSuggestionItem {
+  summary: string;
+}
+
+export interface PaperTradeReviewResponse {
+  symbol: string | null;
+  start_date: string | null;
+  end_date: string | null;
+  session: PaperTradeReviewSession;
+  blockers: BlockerFrequencyItem[];
+  profiles: ProfileComparisonItem[];
+  execution_sources: ExecutionSourceComparisonItem[];
+  suggestions: TuningSuggestionItem[];
+}
+
+export interface ThresholdChangeItem {
+  threshold: string;
+  current_value: DecimalString;
+  suggested_value: DecimalString;
+}
+
+export interface ProfileCalibrationRecommendationItem {
+  profile: TradingProfile;
+  profile_health: string;
+  recommendation: 'keep' | 'tighten' | 'loosen';
+  reason: string;
+  affected_thresholds: ThresholdChangeItem[];
+  expected_impact: string;
+  sample_size_warning: string | null;
+  trade_count: number;
+  win_rate: DecimalString | null;
+  expectancy: DecimalString | null;
+  fees_paid: DecimalString;
+  blocker_share: Record<string, DecimalString>;
+}
+
+export interface ProfileCalibrationResponse {
+  symbol: string | null;
+  start_date: string | null;
+  end_date: string | null;
+  recommendations: ProfileCalibrationRecommendationItem[];
+  active_tuning: ProfileTuningPreviewItem | null;
+  pending_tuning: ProfileTuningPreviewItem | null;
+}
+
+export interface ProfileTuningPreviewItem {
+  version_id: string;
+  profile: TradingProfile;
+  status: string;
+  created_at: string;
+  applied_at: string | null;
+  baseline_version_id: string | null;
+  reason: string;
+  affected_thresholds: ThresholdChangeItem[];
+}
+
+export interface ProfileCalibrationApplyResponse {
+  symbol: string;
+  profile: TradingProfile;
+  applied_to_next_session: boolean;
+  status_message: string;
+  pending_tuning: ProfileTuningPreviewItem;
+}
+
+export interface ProfileCalibrationComparisonMetricsItem {
+  session_count: number;
+  trade_count: number;
+  expectancy: DecimalString | null;
+  profit_factor: DecimalString | null;
+  win_rate: DecimalString | null;
+  max_drawdown: DecimalString | null;
+  fees_paid: DecimalString;
+  blocker_distribution: Record<string, DecimalString>;
+}
+
+export interface ProfileCalibrationComparisonResponse {
+  symbol: string;
+  profile: TradingProfile;
+  start_date: string | null;
+  end_date: string | null;
+  comparison_status: 'ready' | 'insufficient_data';
+  status_message: string | null;
+  active_tuning: ProfileTuningPreviewItem | null;
+  baseline_tuning: ProfileTuningPreviewItem | null;
+  before: ProfileCalibrationComparisonMetricsItem | null;
+  after: ProfileCalibrationComparisonMetricsItem | null;
 }
 
 export interface TradeItem {

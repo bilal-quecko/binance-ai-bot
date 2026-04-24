@@ -351,3 +351,134 @@ Chronological implementation checkpoints for Binance AI Bot.
   - added fusion-engine and API tests for bullish, bearish, mixed, and reduce-risk scenarios
   - full backend test suite: passed
   - frontend production build: passed
+
+## No. 19 - Trader UX Cleanup and Precision Data Display
+
+- Status: Completed
+- Scope:
+  - improved price and PnL precision for trader-facing workstation values
+  - clarified missing live-field states for spread, mid price, and book imbalance
+  - simplified advisory history to the latest three rows with pagination for older entries
+  - humanized raw strategy and risk reason codes in the workstation UI
+  - clarified the `FINAL SIGNAL` card so the decision reads like an operator-facing trade summary
+- Backend:
+  - no execution logic changes
+  - preserved the existing paper-only runtime and advisory APIs
+- Frontend:
+  - added dynamic price formatting by value range so workstation prices retain useful decimals without fake trailing precision
+  - stopped showing misleading zero-style placeholders for live microstructure fields and replaced them with explicit waiting/depth/runtime messages
+  - reduced AI advisory history to compact symbol-scoped rows showing time, bias, confidence, and action, with page controls for older entries
+  - replaced raw reason codes like `MISSING_ATR_CONTEXT` and `NO_POSITION` with human-readable operator explanations
+  - made the `FINAL SIGNAL` card emphasize direction, why now, risk level, invalidation, and best timeframe
+- Validation:
+  - full backend test suite: passed
+  - frontend production build: passed
+
+## No. 20 - Signal Activation Threshold Tuning and Paper Trade Execution Activation
+
+- Status: Completed
+- Scope:
+  - reduced paper-trading deadlock by tuning activation thresholds around volatility, spread, imbalance, and fee-aware edge buffers
+  - added explicit trader-facing non-trading reasons so the workstation explains why the bot is waiting or blocked
+  - added paper-only manual market buy and close controls for the active symbol
+  - added conservative, balanced, and aggressive paper trading profiles with balanced as the default
+- Backend:
+  - added profile-aware runtime/session state and persisted the active trading profile in runtime-session recovery storage
+  - tuned the balanced strategy/risk path to allow more realistic paper entries without removing cost-aware and risk-aware blocking
+  - extended deterministic trade readiness with human-readable blocking reasons and signal reason codes
+  - added `/bot/manual-buy` and `/bot/manual-close` paper-only endpoints through the existing execution engine and paper broker path
+- Frontend:
+  - added trading-profile selection to the live paper control panel
+  - added manual paper buy and close buttons with clear paper-only messaging
+  - surfaced human-readable no-trade blocker lists in the execution-readiness panel
+  - kept the selected symbol, runtime state, and current paper profile visible without full-page flicker
+- Validation:
+  - full backend test suite: passed
+  - Ruff lint: passed
+  - frontend production build: passed
+
+## No. 21 - Paper Trade Outcome Review Loop
+
+- Status: Completed
+- Scope:
+  - added operator-facing paper trade review analytics for session cadence, blocker frequency, profile comparison, and manual-vs-auto review
+  - exposed a symbol-scoped `/performance/review` endpoint for evidence-based tuning
+  - added an Auto Trade workstation review panel so operators can see why the current paper profile is or is not working
+- Backend:
+  - added `app/monitoring/outcome_review.py` for trades-per-hour, trades-per-symbol, win rate, average PnL, average hold time, fees paid, idle duration, blocker frequency, profile comparison, manual-vs-auto comparison, and deterministic tuning suggestions
+  - persisted trade metadata for execution source, trading profile, and runtime session id so later review analytics stay attributable
+  - added `trade_blocked` event persistence for blocked/skip outcomes so blocker analytics can show frequency percentages instead of only current-state explanations
+  - added `/performance/review` through the monitoring API with symbol/date-scoped review output
+- Frontend:
+  - added a `Paper Trade Review` section in the Auto Trade tab
+  - showed session metrics, blocker frequency, profile comparison, manual-vs-auto comparison, and concise tuning suggestions without reintroducing a cluttered dashboard
+- Validation:
+  - added backend formula coverage and API coverage
+  - full backend test suite: passed
+  - Ruff lint: passed
+  - frontend production build: passed
+
+## No. 22 - Profile Calibration Loop
+
+- Status: Completed
+- Scope:
+  - added deterministic profile calibration recommendations for conservative, balanced, and aggressive paper profiles
+  - exposed symbol/date-scoped profile-calibration guidance through the monitoring API
+  - added an Auto Trade workstation section so operators can review whether a profile should be kept, tightened, or loosened
+- Backend:
+  - added `app/monitoring/profile_calibration.py` to evaluate profile outcomes from realized expectancy, blocker distribution, fee pressure, trade frequency, win rate, and drawdown context
+  - added `/performance/profile-calibration` with typed recommendations, affected thresholds, expected impact, and insufficient-data warnings
+  - reused persisted trade metadata and blocker events from the review loop so calibration stays explainable and paper-only
+- Frontend:
+  - added a `Profile Calibration` section in the Auto Trade tab
+  - showed profile health, suggested action, affected thresholds, expected impact, and sample-size warnings without auto-applying any settings
+- Validation:
+  - added backend formula and API coverage for insufficient data, too-strict profiles, too-loose profiles, fee drag, and blocker-driven loosening
+  - full backend test suite: passed
+  - Ruff lint: passed
+  - frontend production build: passed
+
+## No. 23 - Profile Apply-and-Compare Workflow
+
+- Status: Completed
+- Scope:
+  - turned profile calibration into a controlled paper-only workflow where an operator can explicitly queue a recommended tuning set for the next session
+  - persisted tuning versions and paper session runs so the next session can be compared against its prior baseline
+  - added before/after comparison for tuned versus baseline paper sessions
+- Backend:
+  - extended storage with persisted `profile_tuning_sets` and `paper_session_runs`, plus tuning-version attribution on trades, fills, and runtime session state
+  - updated the runtime so pending tuning sets are applied only when the next paper session starts, then persisted as the active tuning version for that session
+  - added `POST /performance/profile-calibration/apply` to queue an explicit paper-only tuning recommendation
+  - added `GET /performance/profile-calibration/comparison` to compare baseline versus tuned sessions across trade count, expectancy, profit factor, win rate, drawdown, fees paid, and blocker distribution
+- Frontend:
+  - extended the Auto Trade `Profile Calibration` section with pending/applied tuning visibility
+  - added an `Apply to next session` action for the selected paper profile
+  - added a before/after comparison block so the operator can review whether the tuned session improved relative to the baseline
+- Validation:
+  - added storage coverage for persisted tuning versions and session runs
+  - added dashboard API coverage for apply, comparison, and live-mode rejection
+  - full backend test suite: passed
+  - Ruff lint: passed
+  - frontend production build: passed
+
+## No. 24 - Symbol Candlestick Chart and Trade Blocker Explanation UX
+
+- Status: Completed
+- Scope:
+  - added a symbol-scoped candle-history API for the workstation chart with `1m`, `5m`, `15m`, and derived `1h` views
+  - filled the left side of `Live Paper Controls` with a selected-symbol candlestick chart, timeframe controls, and key technical landmarks
+  - replaced raw trade blocker wording with a trader-facing explanation card that explains what happened, why the trade was blocked, and what the operator can do next
+- Backend:
+  - added `GET /bot/candles?symbol=...&timeframe=...&limit=...` in `app/api/bot_api.py`
+  - reused live closed-candle history from the runtime and derived higher chart timeframes from `1m` candles without changing execution logic
+  - kept explicit empty states for `waiting_for_runtime`, `waiting_for_history`, and temporary chart unavailability
+- Frontend:
+  - added a symbol candlestick chart panel with current price, support/resistance overlays, breakout/reversal markers, and chart timeframe buttons
+  - added structured blocker explanations for trade blockers such as protective stops that are too tight, edge below costs, weak liquidity, and insufficient candles
+  - kept the UI symbol-scoped and avoided full-page loading flicker by updating the chart in place
+- Validation:
+  - added backend API coverage for candle-history responses
+  - added frontend blocker-explanation utility coverage
+  - full backend test suite: passed
+  - Ruff lint: passed
+  - frontend production build: passed

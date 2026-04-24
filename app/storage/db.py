@@ -34,7 +34,11 @@ SCHEMA_STATEMENTS = (
         fill_price TEXT NOT NULL,
         realized_pnl TEXT NOT NULL,
         quote_balance TEXT NOT NULL,
-        event_time TEXT NOT NULL
+        event_time TEXT NOT NULL,
+        execution_source TEXT NOT NULL DEFAULT 'auto',
+        trading_profile TEXT NOT NULL DEFAULT 'balanced',
+        session_id TEXT,
+        tuning_version_id TEXT
     )
     """,
     """
@@ -48,7 +52,11 @@ SCHEMA_STATEMENTS = (
         fee_paid TEXT NOT NULL,
         realized_pnl TEXT NOT NULL,
         quote_balance TEXT NOT NULL,
-        event_time TEXT NOT NULL
+        event_time TEXT NOT NULL,
+        execution_source TEXT NOT NULL DEFAULT 'auto',
+        trading_profile TEXT NOT NULL DEFAULT 'balanced',
+        session_id TEXT,
+        tuning_version_id TEXT
     )
     """,
     """
@@ -113,11 +121,14 @@ SCHEMA_STATEMENTS = (
         singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
         state TEXT NOT NULL,
         mode TEXT NOT NULL,
+        trading_profile TEXT NOT NULL DEFAULT 'balanced',
         symbol TEXT,
         session_id TEXT,
         started_at TEXT,
         last_event_time TEXT,
-        last_error TEXT
+        last_error TEXT,
+        tuning_version_id TEXT,
+        baseline_tuning_version_id TEXT
     )
     """,
     """
@@ -136,6 +147,32 @@ SCHEMA_STATEMENTS = (
         realized_pnl TEXT NOT NULL,
         quote_asset TEXT NOT NULL,
         snapshot_time TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS profile_tuning_sets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id TEXT NOT NULL UNIQUE,
+        symbol TEXT,
+        profile TEXT NOT NULL,
+        status TEXT NOT NULL,
+        config_json TEXT NOT NULL,
+        baseline_config_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        applied_at TEXT,
+        baseline_version_id TEXT,
+        reason TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS paper_session_runs (
+        session_id TEXT PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        trading_profile TEXT NOT NULL,
+        tuning_version_id TEXT,
+        baseline_tuning_version_id TEXT,
+        started_at TEXT NOT NULL,
+        ended_at TEXT
     )
     """,
 )
@@ -161,6 +198,23 @@ OPTIONAL_TABLE_COLUMNS: dict[str, dict[str, str]] = {
         "close_time": "TEXT NOT NULL DEFAULT ''",
         "close_price": "TEXT NOT NULL DEFAULT '0'",
         "event_time": "TEXT NOT NULL DEFAULT ''",
+    },
+    "runtime_session_state": {
+        "trading_profile": "TEXT NOT NULL DEFAULT 'balanced'",
+        "tuning_version_id": "TEXT",
+        "baseline_tuning_version_id": "TEXT",
+    },
+    "trades": {
+        "execution_source": "TEXT NOT NULL DEFAULT 'auto'",
+        "trading_profile": "TEXT NOT NULL DEFAULT 'balanced'",
+        "session_id": "TEXT",
+        "tuning_version_id": "TEXT",
+    },
+    "fills": {
+        "execution_source": "TEXT NOT NULL DEFAULT 'auto'",
+        "trading_profile": "TEXT NOT NULL DEFAULT 'balanced'",
+        "session_id": "TEXT",
+        "tuning_version_id": "TEXT",
     },
 }
 

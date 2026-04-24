@@ -3,6 +3,7 @@
 import logging
 import time
 from collections.abc import Iterable
+from datetime import datetime
 from decimal import Decimal
 
 from app.execution.execution_engine import ExecutionEngine
@@ -15,9 +16,9 @@ from app.paper.broker import PaperBroker
 from app.paper.models import FillResult, OrderRequest, Position
 from app.risk.limits import RiskEngine
 from app.risk.models import RiskDecision, RiskInput
-from app.runner.models import RunnerConfig, RunnerCycleResult, TradeReadiness
+from app.runner.models import ManualTradeResult, RunnerConfig, RunnerCycleResult, TradeReadiness
 from app.storage.repositories import StorageRepository
-from app.strategies.models import StrategySignal
+from app.strategies.models import StrategySignal, TrendFollowingConfig
 from app.strategies.trend_following import TrendFollowingStrategy
 
 
@@ -183,6 +184,7 @@ class StrategyRunner:
                 selected_symbol=normalized_symbol,
                 runtime_active=False,
                 mode=mode,
+                trading_profile=self._config.trading_profile,
                 enough_candle_history=False,
                 deterministic_entry_signal=False,
                 deterministic_exit_signal=False,
@@ -191,6 +193,8 @@ class StrategyRunner:
                 broker_ready=broker_ready,
                 next_action="start_runtime",
                 reason_if_not_trading=f"Start the live runtime for {normalized_symbol} before auto paper trading can act.",
+                blocking_reasons=("Start the live runtime to receive live candles and order-book data.",),
+                signal_reason_codes=(),
                 risk_reason_codes=(),
             )
 
@@ -200,6 +204,7 @@ class StrategyRunner:
                 selected_symbol=normalized_symbol,
                 runtime_active=True,
                 mode=mode,
+                trading_profile=self._config.trading_profile,
                 enough_candle_history=False,
                 deterministic_entry_signal=False,
                 deterministic_exit_signal=False,
@@ -208,6 +213,8 @@ class StrategyRunner:
                 broker_ready=broker_ready,
                 next_action="wait_for_history",
                 reason_if_not_trading=f"Waiting for enough closed candle history to build deterministic signals for {normalized_symbol}.",
+                blocking_reasons=("Need more closed candles before deterministic entries and exits can activate.",),
+                signal_reason_codes=(),
                 risk_reason_codes=(),
             )
 
@@ -229,6 +236,8 @@ class StrategyRunner:
         deterministic_exit_signal = exit_signal is not None and exit_signal.side == "SELL"
         risk_ready = risk_decision is not None and risk_decision.decision in {"approve", "resize"}
         risk_blocked = risk_decision is not None and risk_decision.decision == "reject"
+        signal_reason_codes = actionable_signal.reason_codes
+        blocking_reasons: tuple[str, ...] = ()
 
         next_action = "wait"
         reason_if_not_trading: str | None = None
@@ -237,36 +246,43 @@ class StrategyRunner:
                 next_action = "exit"
             elif risk_blocked:
                 next_action = "blocked"
-                reason_if_not_trading = self._reason_if_not_trading(
-                    risk_decision.reason_codes,
-                    normalized_symbol,
-                )
+                blocking_reasons = self._humanize_risk_reasons(risk_decision.reason_codes, normalized_symbol)
+                reason_if_not_trading = blocking_reasons[0] if blocking_reasons else None
             else:
                 next_action = "resume_auto_trade"
-                reason_if_not_trading = "An exit signal exists, but auto paper trading is paused."
+                blocking_reasons = ("An exit setup is active, but auto paper trading is paused.",)
+                reason_if_not_trading = blocking_reasons[0]
         elif deterministic_entry_signal:
             if risk_ready and mode == "auto_paper":
                 next_action = "enter"
             elif risk_blocked:
                 next_action = "blocked"
-                reason_if_not_trading = self._reason_if_not_trading(
-                    risk_decision.reason_codes,
-                    normalized_symbol,
-                )
+                blocking_reasons = self._humanize_risk_reasons(risk_decision.reason_codes, normalized_symbol)
+                reason_if_not_trading = blocking_reasons[0] if blocking_reasons else None
             else:
                 next_action = "resume_auto_trade"
-                reason_if_not_trading = "An entry signal exists, but auto paper trading is paused."
+                blocking_reasons = ("An entry setup is active, but auto paper trading is paused.",)
+                reason_if_not_trading = blocking_reasons[0]
         elif position is not None and position.quantity > Decimal("0"):
             next_action = "hold"
-            reason_if_not_trading = "A paper position is open, and deterministic exit conditions are not active yet."
+            blocking_reasons = self._humanize_signal_reasons(exit_signal.reason_codes if exit_signal is not None else ("POSITION_OPEN",))
+            reason_if_not_trading = (
+                blocking_reasons[0]
+                if blocking_reasons
+                else "A paper position is open, and deterministic exit conditions are not active yet."
+            )
         else:
             next_action = "wait"
-            reason_if_not_trading = "Deterministic entry conditions are not active yet."
+            blocking_reasons = self._humanize_signal_reasons(entry_signal.reason_codes)
+            reason_if_not_trading = (
+                blocking_reasons[0] if blocking_reasons else "Deterministic entry conditions are not active yet."
+            )
 
         return TradeReadiness(
             selected_symbol=normalized_symbol,
             runtime_active=True,
             mode=mode,
+            trading_profile=self._config.trading_profile,
             enough_candle_history=True,
             deterministic_entry_signal=deterministic_entry_signal,
             deterministic_exit_signal=deterministic_exit_signal,
@@ -275,6 +291,8 @@ class StrategyRunner:
             broker_ready=broker_ready,
             next_action=next_action,
             reason_if_not_trading=reason_if_not_trading,
+            blocking_reasons=blocking_reasons,
+            signal_reason_codes=signal_reason_codes,
             risk_reason_codes=risk_decision.reason_codes if risk_decision is not None else (),
             expected_edge_pct=risk_decision.expected_edge_pct if risk_decision is not None else None,
             estimated_round_trip_cost_pct=(
@@ -301,6 +319,17 @@ class StrategyRunner:
         """Return the latest processed cycle result for a symbol."""
 
         return self._last_cycle_result_by_symbol.get(symbol.upper())
+
+    def update_profile(
+        self,
+        *,
+        strategy_config: TrendFollowingConfig,
+        runner_config: RunnerConfig,
+    ) -> None:
+        """Apply updated strategy and runner tuning without losing cached state."""
+
+        self._strategy.config = strategy_config
+        self._config = runner_config
 
     def _current_equity(self) -> Decimal:
         """Return paper equity from balances plus marked-to-market positions."""
@@ -341,23 +370,44 @@ class StrategyRunner:
         )
 
     @staticmethod
-    def _reason_if_not_trading(reason_codes: tuple[str, ...], symbol: str) -> str:
-        """Return a human-readable deterministic block reason."""
+    def _humanize_signal_reasons(reason_codes: tuple[str, ...]) -> tuple[str, ...]:
+        """Return trader-facing explanations for strategy-side wait reasons."""
 
-        primary = reason_codes[0] if reason_codes else ""
-        if primary == "EDGE_BELOW_COSTS":
-            return f"Expected edge for {symbol} is too small after estimated fees and slippage."
-        if primary == "DAILY_LOSS_LIMIT":
-            return "Daily loss protection is active, so new entries are blocked."
-        if primary == "OPEN_POSITION_LIMIT":
-            return "The maximum open-position limit has been reached."
-        if primary == "STOP_DISTANCE_TOO_TIGHT":
-            return "The protective stop is too tight relative to the current price."
-        if primary == "SIZE_BELOW_MINIMUM":
-            return "The risk-sized quantity falls below the configured minimum executable size."
-        if primary == "NO_POSITION_TO_EXIT":
-            return "There is no open paper position to exit for this symbol."
-        return ", ".join(reason_codes) if reason_codes else f"The deterministic path for {symbol} is still waiting."
+        messages: dict[str, str] = {
+            "MISSING_EMA": "Need more candles before trend signals can activate.",
+            "REGIME_NOT_TREND": "Trend is not confirmed yet.",
+            "MISSING_ATR_CONTEXT": "Need more volatility context before entries can activate.",
+            "VOL_TOO_LOW": "Price movement is too quiet to justify a paper entry yet.",
+            "VOL_TOO_HIGH": "Volatility is unstable, so the setup stays on hold.",
+            "MICROSTRUCTURE_UNHEALTHY": "Spread or order-book quality is not healthy enough yet.",
+            "EMA_NOT_BULLISH": "Fast EMA is not clearly above the slow EMA yet.",
+            "POSITION_OPEN": "An open paper position exists, so the bot is waiting for an exit setup.",
+            "NO_POSITION": "No open position, so no exit setup exists.",
+            "EMA_BEARISH_EXIT": "Fast EMA has crossed below the slow EMA, so an exit is active.",
+            "STOP_LOSS_HIT": "Price has reached the stop-loss threshold for the open position.",
+            "TAKE_PROFIT_HIT": "Price has reached the take-profit threshold for the open position.",
+        }
+        return tuple(messages.get(code, code.replace("_", " ").capitalize()) for code in reason_codes)
+
+    @staticmethod
+    def _humanize_risk_reasons(reason_codes: tuple[str, ...], symbol: str) -> tuple[str, ...]:
+        """Return trader-facing explanations for risk-engine blocks."""
+
+        messages: dict[str, str] = {
+            "EDGE_BELOW_COSTS": f"Expected edge for {symbol} is still too small after fees and slippage.",
+            "EXPECTED_EDGE_TOO_SMALL": "Projected reward is not strong enough for the current paper costs.",
+            "DAILY_LOSS_LIMIT": "Daily loss protection is active, so new entries are blocked.",
+            "OPEN_POSITION_LIMIT": "The configured open-position limit is already reached.",
+            "STOP_DISTANCE_TOO_TIGHT": "The protective stop is too tight relative to current price movement.",
+            "SIZE_BELOW_MINIMUM": "Risk sizing produced a quantity that is too small to execute.",
+            "NO_POSITION_TO_EXIT": "No open position exists, so there is nothing to close.",
+            "INVALID_STOP_OR_VOLATILITY": "Volatility context is still incomplete, so the order stays blocked.",
+            "INVALID_ORDER_REQUEST": "The current paper order request is incomplete.",
+            "INVALID_EQUITY_CONTEXT": "Paper account equity context is not ready yet.",
+            "RESIZED_FOR_RISK": "Risk sizing reduced the order to fit the current risk budget.",
+            "RESIZED_TO_POSITION": "Exit size was reduced to the current open position.",
+        }
+        return tuple(messages.get(code, code.replace("_", " ").capitalize()) for code in reason_codes)
 
     def _build_risk_input(
         self,
@@ -429,12 +479,201 @@ class StrategyRunner:
 
         if self._storage_repository is None:
             return
+        enriched_payload = {
+            **payload,
+            "execution_source": str(payload.get("execution_source", "auto")),
+            "trading_profile": self._config.trading_profile,
+            "session_id": self._config.session_id,
+            "tuning_version_id": self._config.tuning_version_id,
+        }
         self._storage_repository.insert_event(
             event_type=event_type,
             symbol=symbol,
             message=message,
-            payload=payload,
+            payload=enriched_payload,
             event_time=event_time,
+        )
+
+    def _market_price_for_symbol(self, symbol: str, feature_snapshot: FeatureSnapshot | None) -> Decimal:
+        """Return the best available paper market price for a symbol."""
+
+        latest_market_snapshot = self.get_latest_market_snapshot(symbol)
+        if feature_snapshot is not None and feature_snapshot.mid_price is not None:
+            return feature_snapshot.mid_price
+        if latest_market_snapshot is not None and latest_market_snapshot.last_price is not None:
+            return latest_market_snapshot.last_price
+        if feature_snapshot is not None and feature_snapshot.ema_fast is not None:
+            return feature_snapshot.ema_fast
+        return Decimal("0")
+
+    def _persist_position_and_pnl(self, symbol: str, event_time: datetime) -> tuple[Position | None, Decimal]:
+        """Persist the latest paper position and PnL state after an execution path."""
+
+        current_position = self._broker.get_position(symbol)
+        current_pnl = self._current_pnl()
+        current_equity = self._current_equity()
+        if self._storage_repository is not None:
+            self._storage_repository.insert_position_snapshot(
+                current_position,
+                event_time,
+                symbol,
+            )
+            self._storage_repository.insert_pnl_snapshot(
+                snapshot_time=event_time,
+                equity=current_equity,
+                total_pnl=current_pnl,
+                realized_pnl=self._broker.realized_pnl,
+                cash_balance=self._broker.get_balance(self._config.quote_asset),
+            )
+            self._persist_event(
+                event_type="pnl_snapshot",
+                symbol=symbol,
+                message="portfolio_snapshot",
+                payload={
+                    "realized_pnl": str(self._broker.realized_pnl),
+                    "current_equity": str(current_equity),
+                    "current_pnl": str(current_pnl),
+                },
+                event_time=event_time,
+            )
+        return current_position, current_pnl
+
+    def execute_manual_trade(
+        self,
+        symbol: str,
+        *,
+        action: str,
+        side: str,
+    ) -> ManualTradeResult:
+        """Execute a manual paper trade through the existing execution pipeline."""
+
+        normalized_symbol = symbol.upper()
+        feature_snapshot = self.get_feature_snapshot(normalized_symbol)
+        if feature_snapshot is None:
+            return ManualTradeResult(
+                symbol=normalized_symbol,
+                action=action,  # type: ignore[arg-type]
+                requested_side=side,  # type: ignore[arg-type]
+                status="rejected",
+                message="Need more candles before manual paper trading can use the safe execution path.",
+                reason_codes=("WAITING_FOR_HISTORY",),
+                current_position=self._broker.get_position(normalized_symbol),
+                current_pnl=self._current_pnl(),
+            )
+
+        latest_market_snapshot = self.get_latest_market_snapshot(normalized_symbol)
+        if latest_market_snapshot is None:
+            return ManualTradeResult(
+                symbol=normalized_symbol,
+                action=action,  # type: ignore[arg-type]
+                requested_side=side,  # type: ignore[arg-type]
+                status="rejected",
+                message="Waiting for a live market snapshot before paper execution can price the order.",
+                reason_codes=("WAITING_FOR_LIVE_SNAPSHOT",),
+                current_position=self._broker.get_position(normalized_symbol),
+                current_pnl=self._current_pnl(),
+            )
+
+        existing_position = self._broker.get_position(normalized_symbol)
+        signal = StrategySignal(
+            symbol=normalized_symbol,
+            side=side,  # type: ignore[arg-type]
+            confidence=Decimal("1.00"),
+            reason_codes=("MANUAL_PAPER_TRADE",),
+        )
+        risk_input = self._build_risk_input(feature_snapshot, signal, existing_position)
+        risk_decision = self._risk_engine.evaluate(risk_input)
+        event_time = feature_snapshot.timestamp
+        market_price = self._market_price_for_symbol(normalized_symbol, feature_snapshot)
+        order = OrderRequest(
+            symbol=normalized_symbol,
+            side=side,  # type: ignore[arg-type]
+            quantity=risk_input.requested_quantity,
+            market_price=market_price,
+            timestamp=event_time,
+            quote_asset=self._config.quote_asset,
+            mode=self._config.mode,
+        )
+        execution_result = self._execution_engine.execute(order, risk_decision)
+        self._persist_event(
+            event_type="manual_trade_request",
+            symbol=normalized_symbol,
+            message=f"manual_action={action}",
+            payload={
+                "side": side,
+                "risk_decision": risk_decision.decision,
+                "reason_codes": risk_decision.reason_codes,
+                "execution_source": "manual",
+                "trading_profile": self._config.trading_profile,
+                "session_id": self._config.session_id,
+            },
+            event_time=event_time,
+        )
+        if self._storage_repository is not None:
+            self._storage_repository.insert_trade(
+                fill_result=execution_result,
+                risk_decision=risk_decision,
+                approved_quantity=risk_decision.approved_quantity,
+                event_time=event_time,
+                execution_source="manual",
+                trading_profile=self._config.trading_profile,
+                session_id=self._config.session_id,
+                tuning_version_id=self._config.tuning_version_id,
+            )
+            if execution_result.status == "executed":
+                self._storage_repository.insert_fill(
+                    execution_result,
+                    event_time,
+                    execution_source="manual",
+                    trading_profile=self._config.trading_profile,
+                    session_id=self._config.session_id,
+                    tuning_version_id=self._config.tuning_version_id,
+                )
+            else:
+                self._persist_event(
+                    event_type="trade_blocked",
+                    symbol=normalized_symbol,
+                    message=f"blocked={(execution_result.reason_codes or risk_decision.reason_codes)[0]}",
+                    payload={
+                        "reason_codes": execution_result.reason_codes or risk_decision.reason_codes,
+                        "execution_source": "manual",
+                        "trading_profile": self._config.trading_profile,
+                        "session_id": self._config.session_id,
+                    },
+                    event_time=event_time,
+                )
+        current_position, current_pnl = self._persist_position_and_pnl(normalized_symbol, event_time)
+        self._last_cycle_result_by_symbol[normalized_symbol] = RunnerCycleResult(
+            market_snapshot=latest_market_snapshot,
+            feature_snapshot=feature_snapshot,
+            signal=signal,
+            risk_decision=risk_decision,
+            execution_result=execution_result,
+            current_position=current_position,
+            current_pnl=current_pnl,
+        )
+        if execution_result.status == "executed":
+            message = (
+                "Manual paper buy executed."
+                if side == "BUY"
+                else "Manual paper close executed."
+            )
+        elif risk_decision.decision == "reject":
+            humanized = self._humanize_risk_reasons(risk_decision.reason_codes, normalized_symbol)
+            message = humanized[0] if humanized else "Manual paper trade was blocked."
+        else:
+            message = "Manual paper trade did not execute."
+        return ManualTradeResult(
+            symbol=normalized_symbol,
+            action=action,  # type: ignore[arg-type]
+            requested_side=side,  # type: ignore[arg-type]
+            status=execution_result.status,
+            message=message,
+            reason_codes=execution_result.reason_codes or risk_decision.reason_codes,
+            risk_decision=risk_decision,
+            fill_result=execution_result,
+            current_position=current_position,
+            current_pnl=current_pnl,
         )
 
     def process_snapshot(self, snapshot: MarketSnapshot) -> RunnerCycleResult:
@@ -516,9 +755,20 @@ class StrategyRunner:
                     risk_decision=risk_decision,
                     approved_quantity=risk_decision.approved_quantity,
                     event_time=feature_snapshot.timestamp,
-                )
+                    execution_source="auto",
+                    trading_profile=self._config.trading_profile,
+                session_id=self._config.session_id,
+                tuning_version_id=self._config.tuning_version_id,
+            )
                 if execution_result.status == "executed":
-                    self._storage_repository.insert_fill(execution_result, feature_snapshot.timestamp)
+                    self._storage_repository.insert_fill(
+                        execution_result,
+                        feature_snapshot.timestamp,
+                        execution_source="auto",
+                        trading_profile=self._config.trading_profile,
+                    session_id=self._config.session_id,
+                    tuning_version_id=self._config.tuning_version_id,
+                )
                     self._persist_event(
                         event_type="fill",
                         symbol=symbol,
@@ -528,9 +778,27 @@ class StrategyRunner:
                             "fill_price": str(execution_result.fill_price),
                             "filled_quantity": str(execution_result.filled_quantity),
                             "realized_pnl": str(execution_result.realized_pnl),
+                            "execution_source": "auto",
+                            "trading_profile": self._config.trading_profile,
+                            "session_id": self._config.session_id,
                         },
                         event_time=feature_snapshot.timestamp,
                     )
+                else:
+                    blocker_reasons = execution_result.reason_codes or risk_decision.reason_codes
+                    if blocker_reasons:
+                        self._persist_event(
+                            event_type="trade_blocked",
+                            symbol=symbol,
+                            message=f"blocked={blocker_reasons[0]}",
+                            payload={
+                                "reason_codes": blocker_reasons,
+                                "execution_source": "auto",
+                                "trading_profile": self._config.trading_profile,
+                                "session_id": self._config.session_id,
+                            },
+                            event_time=feature_snapshot.timestamp,
+                        )
         else:
             self._logger.info("risk decision | symbol=%s decision=skipped reasons=%s", symbol, ("NON_ACTIONABLE_SIGNAL",))
             self._logger.info("execution result | symbol=%s status=skipped", symbol)
@@ -546,6 +814,19 @@ class StrategyRunner:
                 symbol=symbol,
                 message="status=skipped",
                 payload={"status": "skipped"},
+                event_time=feature_snapshot.timestamp,
+            )
+            blocker_reasons = signal.reason_codes or ("NON_ACTIONABLE_SIGNAL",)
+            self._persist_event(
+                event_type="trade_blocked",
+                symbol=symbol,
+                message=f"blocked={blocker_reasons[0]}",
+                payload={
+                    "reason_codes": blocker_reasons,
+                    "execution_source": "auto",
+                    "trading_profile": self._config.trading_profile,
+                    "session_id": self._config.session_id,
+                },
                 event_time=feature_snapshot.timestamp,
             )
 

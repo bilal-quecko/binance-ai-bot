@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.api.dashboard_api import get_dashboard_data_access
 from app.api.dependencies import DashboardDataAccess
+from app.config import get_settings
 from app.main import app
 from app.market_data.candles import Candle
 from app.paper.models import FillResult, Position
@@ -211,6 +212,8 @@ def test_dashboard_api_core_endpoints() -> None:
         metrics_response = client.get("/metrics")
         performance_response = client.get("/performance", params={"symbol": "BTCUSDT"})
         trade_quality_response = client.get("/performance/trade-quality", params={"symbol": "BTCUSDT"})
+        review_response = client.get("/performance/review", params={"symbol": "BTCUSDT"})
+        calibration_response = client.get("/performance/profile-calibration", params={"symbol": "BTCUSDT"})
     finally:
         app.dependency_overrides.clear()
 
@@ -383,6 +386,8 @@ def test_dashboard_api_core_endpoints() -> None:
     }
 
     assert trade_quality_response.status_code == 200
+    assert review_response.status_code == 200
+    assert calibration_response.status_code == 200
     assert trade_quality_response.json() == {
         "symbol": "BTCUSDT",
         "start_date": None,
@@ -426,6 +431,31 @@ def test_dashboard_api_core_endpoints() -> None:
             }
         ],
     }
+    review_payload = review_response.json()
+    assert review_payload["symbol"] == "BTCUSDT"
+    assert review_payload["session"]["total_closed_trades"] == 1
+    assert review_payload["session"]["average_pnl"] == "10.0000"
+    assert review_payload["session"]["fees_paid"] == "0.3"
+    assert review_payload["profiles"][1] == {
+        "profile": "balanced",
+        "trade_count": 1,
+        "realized_pnl": "10",
+        "win_rate": "100.00",
+        "average_expectancy": "10.0000",
+    }
+    assert review_payload["execution_sources"][0] == {
+        "execution_source": "auto",
+        "trade_count": 1,
+        "realized_pnl": "10",
+        "win_rate": "100.00",
+        "average_expectancy": "10.0000",
+    }
+    assert review_payload["suggestions"][0]["summary"].startswith("BTCUSDT has limited blocker pressure")
+    calibration_payload = calibration_response.json()
+    assert calibration_payload["symbol"] == "BTCUSDT"
+    assert len(calibration_payload["recommendations"]) == 3
+    assert calibration_payload["recommendations"][1]["profile"] == "balanced"
+    assert calibration_payload["recommendations"][1]["sample_size_warning"] is not None
 
 
 def test_dashboard_api_filtering_pagination_and_summary() -> None:
@@ -601,3 +631,163 @@ def test_dashboard_api_uses_dependency_backed_data_access() -> None:
     assert response.json()["total"] == 1
     assert response.json()["items"][0]["order_id"] == "FAKE-1"
     assert fake_data_access.trade_calls == [("BTCUSDT", None, None, 25, 5)]
+
+
+def test_dashboard_api_profile_calibration_apply_and_comparison() -> None:
+    db_path = _db_path()
+    repository = StorageRepository(f"sqlite:///{db_path}")
+    base_time = datetime(2024, 3, 9, 16, 0, tzinfo=UTC)
+    try:
+        for index, code in enumerate(("VOL_TOO_LOW", "REGIME_NOT_TREND", "VOL_TOO_LOW", "MISSING_ATR_CONTEXT")):
+            repository.insert_event(
+                event_type="trade_blocked",
+                symbol="BTCUSDT",
+                message=f"blocked={code}",
+                payload={"reason_codes": (code,), "trading_profile": "conservative", "session_id": "blocked-session"},
+                event_time=base_time + timedelta(minutes=index),
+            )
+        for order_id, session_id, tuning_version_id, realized_pnl, event_time in (
+            ("BASE-BUY", "baseline-session", None, Decimal("0"), base_time),
+            ("BASE-SELL", "baseline-session", None, Decimal("8"), base_time + timedelta(minutes=5)),
+            ("TUNED-BUY", "tuned-session", "tune-applied", Decimal("0"), base_time + timedelta(hours=1)),
+            ("TUNED-SELL", "tuned-session", "tune-applied", Decimal("12"), base_time + timedelta(hours=1, minutes=5)),
+        ):
+            fill = FillResult(
+                order_id=order_id,
+                status="executed",
+                symbol="BTCUSDT",
+                side="BUY" if "BUY" in order_id else "SELL",
+                requested_quantity=Decimal("1"),
+                filled_quantity=Decimal("1"),
+                fill_price=Decimal("100"),
+                fee_paid=Decimal("0.1"),
+                realized_pnl=realized_pnl,
+                quote_balance=Decimal("1000"),
+                reason_codes=("EXECUTED",),
+                position=None,
+            )
+            decision = RiskDecision(
+                decision="approve",
+                approved_quantity=Decimal("1"),
+                reason_codes=("APPROVED",),
+            )
+            repository.insert_trade(
+                fill_result=fill,
+                risk_decision=decision,
+                approved_quantity=Decimal("1"),
+                event_time=event_time,
+                trading_profile="balanced",
+                session_id=session_id,
+                tuning_version_id=tuning_version_id,
+            )
+            repository.insert_fill(
+                fill,
+                event_time,
+                trading_profile="balanced",
+                session_id=session_id,
+                tuning_version_id=tuning_version_id,
+            )
+
+        repository.insert_event(
+            event_type="trade_blocked",
+            symbol="BTCUSDT",
+            message="blocked=VOL_TOO_LOW",
+            payload={"reason_codes": ("VOL_TOO_LOW",), "trading_profile": "balanced", "session_id": "baseline-session"},
+            event_time=base_time + timedelta(minutes=1),
+        )
+        repository.insert_event(
+            event_type="trade_blocked",
+            symbol="BTCUSDT",
+            message="blocked=EDGE_BELOW_COSTS",
+            payload={"reason_codes": ("EDGE_BELOW_COSTS",), "trading_profile": "balanced", "session_id": "tuned-session"},
+            event_time=base_time + timedelta(hours=1, minutes=1),
+        )
+        repository.start_paper_session_run(
+            session_id="baseline-session",
+            symbol="BTCUSDT",
+            trading_profile="balanced",
+            tuning_version_id=None,
+            baseline_tuning_version_id=None,
+            started_at=base_time,
+        )
+        repository.finish_paper_session_run(
+            session_id="baseline-session",
+            ended_at=base_time + timedelta(minutes=10),
+        )
+        repository.create_profile_tuning_set(
+            symbol="BTCUSDT",
+            profile="balanced",
+            config_json='{"min_atr_ratio": "0.0003", "min_expected_edge_buffer_pct": "0.0006"}',
+            baseline_config_json='{"min_atr_ratio": "0.0004", "min_expected_edge_buffer_pct": "0.0008"}',
+            baseline_version_id=None,
+            reason="Observed blocker pressure shows this profile is waiting too often for confirmation or usable volatility.",
+        )
+        applied = repository.create_profile_tuning_set(
+            symbol="BTCUSDT",
+            profile="balanced",
+            config_json='{"min_atr_ratio": "0.0003", "min_expected_edge_buffer_pct": "0.0006"}',
+            baseline_config_json='{"min_atr_ratio": "0.0004", "min_expected_edge_buffer_pct": "0.0008"}',
+            baseline_version_id=None,
+            reason="Applied balanced tuning.",
+        )
+        repository.mark_profile_tuning_applied(applied.version_id, applied_at=base_time + timedelta(minutes=30))
+        repository.start_paper_session_run(
+            session_id="tuned-session",
+            symbol="BTCUSDT",
+            trading_profile="balanced",
+            tuning_version_id=applied.version_id,
+            baseline_tuning_version_id=None,
+            started_at=base_time + timedelta(hours=1),
+        )
+        repository.finish_paper_session_run(
+            session_id="tuned-session",
+            ended_at=base_time + timedelta(hours=1, minutes=10),
+        )
+    finally:
+        repository.close()
+
+    client = _make_client(db_path)
+    try:
+        apply_response = client.post(
+            "/performance/profile-calibration/apply",
+            json={"symbol": "BTCUSDT", "profile": "conservative", "selected_thresholds": ["min_atr_ratio"]},
+        )
+        comparison_response = client.get(
+            "/performance/profile-calibration/comparison",
+            params={"symbol": "BTCUSDT", "profile": "balanced"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert apply_response.status_code == 200
+    assert apply_response.json()["applied_to_next_session"] is True
+    assert apply_response.json()["pending_tuning"]["affected_thresholds"][0]["threshold"] == "min_atr_ratio"
+
+    assert comparison_response.status_code == 200
+    comparison_payload = comparison_response.json()
+    assert comparison_payload["comparison_status"] == "ready"
+    assert comparison_payload["before"]["trade_count"] == 1
+    assert comparison_payload["after"]["trade_count"] == 1
+    assert comparison_payload["after"]["expectancy"] == "12.0000"
+
+
+def test_dashboard_api_profile_calibration_apply_is_rejected_in_live_mode() -> None:
+    db_path = _db_path()
+    repository = StorageRepository(f"sqlite:///{db_path}")
+    try:
+        _seed_repository(repository)
+    finally:
+        repository.close()
+
+    client = _make_client(db_path)
+    original_settings = get_settings()
+    app.dependency_overrides[get_settings] = lambda: original_settings.model_copy(update={"app_mode": "live"})
+    try:
+        response = client.post(
+            "/performance/profile-calibration/apply",
+            json={"symbol": "BTCUSDT", "profile": "balanced"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 409

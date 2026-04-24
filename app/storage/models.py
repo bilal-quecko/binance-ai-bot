@@ -22,6 +22,10 @@ class TradeRecord:
     realized_pnl: Decimal
     quote_balance: Decimal
     event_time: datetime
+    execution_source: str = "auto"
+    trading_profile: str = "balanced"
+    session_id: str | None = None
+    tuning_version_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -37,6 +41,10 @@ class FillRecord:
     realized_pnl: Decimal
     quote_balance: Decimal
     event_time: datetime
+    execution_source: str = "auto"
+    trading_profile: str = "balanced"
+    session_id: str | None = None
+    tuning_version_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -180,11 +188,14 @@ class RuntimeSessionRecord:
 
     state: str
     mode: str
+    trading_profile: str
     symbol: str | None
     session_id: str | None
     started_at: datetime | None
     last_event_time: datetime | None
     last_error: str | None
+    tuning_version_id: str | None = None
+    baseline_tuning_version_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -195,3 +206,32 @@ class PaperBrokerStateRecord:
     positions: list[PositionSnapshotRecord]
     realized_pnl: Decimal
     snapshot_time: datetime
+
+
+@dataclass(slots=True)
+class ProfileTuningSetRecord:
+    """Persisted paper-profile tuning configuration."""
+
+    version_id: str
+    symbol: str | None
+    profile: str
+    status: str
+    config_json: str
+    baseline_config_json: str
+    created_at: datetime
+    applied_at: datetime | None
+    baseline_version_id: str | None
+    reason: str
+
+
+@dataclass(slots=True)
+class PaperSessionRunRecord:
+    """Persisted paper session metadata for before/after comparison."""
+
+    session_id: str
+    symbol: str
+    trading_profile: str
+    tuning_version_id: str | None
+    baseline_tuning_version_id: str | None
+    started_at: datetime
+    ended_at: datetime | None

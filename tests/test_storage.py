@@ -1,7 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import sqlite3
 import threading
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
@@ -453,3 +453,51 @@ def test_storage_repository_uses_wal_and_handles_concurrent_runtime_writes() -> 
     assert runtime_state is not None
     assert runtime_state.symbol == "BTCUSDT"
     assert event_count == 5
+
+
+def test_storage_repository_persists_profile_tuning_and_session_runs() -> None:
+    db_path = _db_path("profile_tuning_sessions")
+    repository = StorageRepository(f"sqlite:///{db_path}")
+    started_at = datetime(2024, 3, 9, 16, 0, tzinfo=UTC)
+    try:
+        tuning = repository.create_profile_tuning_set(
+            symbol="BTCUSDT",
+            profile="balanced",
+            config_json='{"min_atr_ratio": "0.0003"}',
+            baseline_config_json='{"min_atr_ratio": "0.0004"}',
+            baseline_version_id=None,
+            reason="Loosen the ATR floor slightly.",
+        )
+        repository.mark_profile_tuning_applied(tuning.version_id, applied_at=started_at)
+        repository.start_paper_session_run(
+            session_id="session-tuned",
+            symbol="BTCUSDT",
+            trading_profile="balanced",
+            tuning_version_id=tuning.version_id,
+            baseline_tuning_version_id=None,
+            started_at=started_at,
+        )
+        repository.finish_paper_session_run(
+            session_id="session-tuned",
+            ended_at=started_at + timedelta(minutes=15),
+        )
+    finally:
+        repository.close()
+
+    reopened = StorageRepository(f"sqlite:///{db_path}")
+    try:
+        loaded_tuning = reopened.get_profile_tuning_set_by_version(tuning.version_id)
+        session_runs = reopened.get_paper_session_runs(
+            symbol="BTCUSDT",
+            trading_profile="balanced",
+            tuning_version_id=tuning.version_id,
+        )
+    finally:
+        reopened.close()
+
+    assert loaded_tuning is not None
+    assert loaded_tuning.status == "applied"
+    assert loaded_tuning.baseline_config_json == '{"min_atr_ratio": "0.0004"}'
+    assert len(session_runs) == 1
+    assert session_runs[0].session_id == "session-tuned"
+    assert session_runs[0].ended_at == started_at + timedelta(minutes=15)

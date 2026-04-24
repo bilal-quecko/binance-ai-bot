@@ -1,4 +1,5 @@
-import { badgeTone, classNames, formatDecimal } from '../lib/format';
+import { badgeTone, classNames, formatDecimal, formatReasonCodes } from '../lib/format';
+import { explainPrimaryBlocker } from '../lib/blocker-explanations.js';
 import { describeReadiness, humanizeMode, humanizeReadinessAction, shouldShowCostMetrics } from '../lib/workstation-ux.js';
 import { MetricCard } from './MetricCard';
 import { StatePanel } from './StatePanel';
@@ -24,6 +25,7 @@ export function TradeReadinessPanel({ symbol, readiness, compact = false }: Trad
 
   const readinessSummary = describeReadiness(readiness);
   const showCostMetrics = shouldShowCostMetrics(readiness);
+  const primaryBlocker = explainPrimaryBlocker(readiness);
 
   return (
     <div className="space-y-4">
@@ -44,6 +46,7 @@ export function TradeReadinessPanel({ symbol, readiness, compact = false }: Trad
 
       <div className={classNames('grid gap-4', compact ? 'md:grid-cols-2 xl:grid-cols-3' : 'md:grid-cols-2 xl:grid-cols-4')}>
         <MetricCard label="Next Action" value={humanizeReadinessAction(readiness.next_action)} helper={readinessSummary} />
+        <MetricCard label="Trading Profile" value={readiness.trading_profile} helper="Current paper activation tuning" />
         <MetricCard label="Entry Signal" value={boolLabel(readiness.deterministic_entry_signal)} helper="Deterministic entry conditions only" />
         <MetricCard label="Exit Signal" value={boolLabel(readiness.deterministic_exit_signal)} helper="Deterministic exit conditions only" />
         <MetricCard label="Candle History Ready" value={boolLabel(readiness.enough_candle_history)} helper="Enough closed candles for features and strategy" />
@@ -74,10 +77,55 @@ export function TradeReadinessPanel({ symbol, readiness, compact = false }: Trad
         </div>
       ) : null}
 
+      {primaryBlocker ? (
+        <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Trade blocker explained</p>
+            <span className={classNames('rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em]', badgeTone(primaryBlocker.category === 'risk_protection' ? 'hold' : primaryBlocker.category === 'system_state' ? 'reject' : 'skipped'))}>
+              {primaryBlocker.category === 'risk_protection'
+                ? 'risk protection'
+                : primaryBlocker.category === 'system_state'
+                  ? 'system state'
+                  : primaryBlocker.category === 'data_requirement'
+                    ? 'needs more data'
+                    : 'setup context'}
+            </span>
+          </div>
+          <h4 className="mt-3 text-sm font-semibold text-white">{primaryBlocker.title}</h4>
+          <div className="mt-3 grid gap-3 md:grid-cols-3">
+            <div className="rounded-xl border border-slate-800/80 bg-slate-950/70 px-3 py-3">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">What happened</p>
+              <p className="mt-2 text-sm text-slate-300">{primaryBlocker.happened}</p>
+            </div>
+            <div className="rounded-xl border border-slate-800/80 bg-slate-950/70 px-3 py-3">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Why the bot blocked it</p>
+              <p className="mt-2 text-sm text-slate-300">{primaryBlocker.why}</p>
+            </div>
+            <div className="rounded-xl border border-slate-800/80 bg-slate-950/70 px-3 py-3">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">What you can do</p>
+              <p className="mt-2 text-sm text-slate-300">{primaryBlocker.action}</p>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {readiness.blocking_reasons.length > 0 ? (
+        <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Additional context</p>
+          <ul className="mt-3 space-y-2 text-sm text-slate-300">
+            {readiness.blocking_reasons.map((reason) => (
+              <li key={reason} className="rounded-xl border border-slate-800/80 bg-slate-950/70 px-3 py-2">
+                {reason}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
       {readiness.risk_reason_codes.length > 0 ? (
         <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
           <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Risk Status</p>
-          <p className="mt-3 text-sm text-slate-300">{readiness.risk_reason_codes.join(', ')}</p>
+          <p className="mt-3 text-sm text-slate-300">{formatReasonCodes(readiness.risk_reason_codes)}</p>
         </div>
       ) : null}
     </div>

@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any, Iterator
+from uuid import uuid4
 
 from app.ai.models import AISignalSnapshot
 from app.market_data.candles import Candle
@@ -25,9 +26,11 @@ from app.storage.models import (
     FillRecord,
     MarketCandleSnapshotRecord,
     PaperBrokerStateRecord,
+    PaperSessionRunRecord,
     PnlHistoryPoint,
     PnlSnapshotRecord,
     PositionSnapshotRecord,
+    ProfileTuningSetRecord,
     RuntimeSessionRecord,
     RunnerEventRecord,
     TradeRecord,
@@ -305,6 +308,8 @@ class StorageRepository:
                     "runtime_session_state",
                     "paper_broker_state",
                     "paper_broker_positions",
+                    "profile_tuning_sets",
+                    "paper_session_runs",
                 ):
                     try:
                         connection.execute(f"DELETE FROM {table_name}")
@@ -326,6 +331,9 @@ class StorageRepository:
         started_at: datetime | None,
         last_event_time: datetime | None,
         last_error: str | None,
+        trading_profile: str = "balanced",
+        tuning_version_id: str | None = None,
+        baseline_tuning_version_id: str | None = None,
     ) -> None:
         """Persist the backend-owned runtime session state."""
 
@@ -335,25 +343,32 @@ class StorageRepository:
                 connection.execute(
                 """
                 INSERT INTO runtime_session_state (
-                    singleton_id, state, mode, symbol, session_id, started_at, last_event_time, last_error
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                    singleton_id, state, mode, trading_profile, symbol, session_id, started_at, last_event_time, last_error,
+                    tuning_version_id, baseline_tuning_version_id
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(singleton_id) DO UPDATE SET
                     state = excluded.state,
                     mode = excluded.mode,
+                    trading_profile = excluded.trading_profile,
                     symbol = excluded.symbol,
                     session_id = excluded.session_id,
                     started_at = excluded.started_at,
                     last_event_time = excluded.last_event_time,
-                    last_error = excluded.last_error
+                    last_error = excluded.last_error,
+                    tuning_version_id = excluded.tuning_version_id,
+                    baseline_tuning_version_id = excluded.baseline_tuning_version_id
                 """,
                 (
                     state,
                     mode,
+                    trading_profile,
                     symbol,
                     session_id,
                     started_at.isoformat() if started_at is not None else None,
                     last_event_time.isoformat() if last_event_time is not None else None,
                     last_error,
+                    tuning_version_id,
+                    baseline_tuning_version_id,
                 ),
             )
         finally:
@@ -365,7 +380,8 @@ class StorageRepository:
         with self._connection_scope() as connection:
             row = connection.execute(
                 """
-                SELECT state, mode, symbol, session_id, started_at, last_event_time, last_error
+                SELECT state, mode, trading_profile, symbol, session_id, started_at, last_event_time, last_error,
+                       tuning_version_id, baseline_tuning_version_id
                 FROM runtime_session_state
                 WHERE singleton_id = 1
                 """
@@ -375,11 +391,14 @@ class StorageRepository:
         return RuntimeSessionRecord(
             state=row["state"],
             mode=row["mode"],
+            trading_profile=row["trading_profile"] or "balanced",
             symbol=row["symbol"],
             session_id=row["session_id"],
             started_at=_safe_datetime(row["started_at"]),
             last_event_time=_safe_datetime(row["last_event_time"]),
             last_error=row["last_error"],
+            tuning_version_id=row["tuning_version_id"],
+            baseline_tuning_version_id=row["baseline_tuning_version_id"],
         )
 
     def clear_runtime_session_state(self) -> None:
@@ -391,6 +410,250 @@ class StorageRepository:
                 connection.execute("DELETE FROM runtime_session_state")
         finally:
             connection.close()
+
+    def create_profile_tuning_set(
+        self,
+        *,
+        symbol: str | None,
+        profile: str,
+        config_json: str,
+        baseline_config_json: str,
+        baseline_version_id: str | None,
+        reason: str,
+    ) -> ProfileTuningSetRecord:
+        """Persist a paper-only tuning set for explicit later application."""
+
+        version_id = f"tune_{uuid4().hex[:12]}"
+        created_at = datetime.now(tz=UTC)
+        connection = self._open_connection()
+        try:
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE profile_tuning_sets
+                    SET status = 'superseded'
+                    WHERE status = 'pending' AND profile = ? AND (
+                        (symbol IS NULL AND ? IS NULL) OR symbol = ?
+                    )
+                    """,
+                    (profile, symbol, symbol),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO profile_tuning_sets (
+                        version_id, symbol, profile, status, config_json, baseline_config_json,
+                        created_at, applied_at, baseline_version_id, reason
+                    ) VALUES (?, ?, ?, 'pending', ?, ?, ?, NULL, ?, ?)
+                    """,
+                    (
+                        version_id,
+                        symbol,
+                        profile,
+                        config_json,
+                        baseline_config_json,
+                        created_at.isoformat(),
+                        baseline_version_id,
+                        reason,
+                    ),
+                )
+        finally:
+            connection.close()
+        return ProfileTuningSetRecord(
+            version_id=version_id,
+            symbol=symbol,
+            profile=profile,
+            status="pending",
+            config_json=config_json,
+            baseline_config_json=baseline_config_json,
+            created_at=created_at,
+            applied_at=None,
+            baseline_version_id=baseline_version_id,
+            reason=reason,
+        )
+
+    def get_latest_profile_tuning_set(
+        self,
+        *,
+        symbol: str | None,
+        profile: str,
+        status: str | None = None,
+    ) -> ProfileTuningSetRecord | None:
+        """Return the latest persisted tuning set for one symbol/profile scope."""
+
+        query = """
+            SELECT version_id, symbol, profile, status, config_json, baseline_config_json,
+                   created_at, applied_at, baseline_version_id, reason
+            FROM profile_tuning_sets
+            WHERE profile = ? AND ((symbol IS NULL AND ? IS NULL) OR symbol = ?)
+        """
+        params: list[Any] = [profile, symbol, symbol]
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY created_at DESC LIMIT 1"
+        with self._connection_scope() as connection:
+            row = connection.execute(query, tuple(params)).fetchone()
+        if row is None:
+            return None
+        return ProfileTuningSetRecord(
+            version_id=row["version_id"],
+            symbol=row["symbol"],
+            profile=row["profile"],
+            status=row["status"],
+            config_json=row["config_json"],
+            baseline_config_json=row["baseline_config_json"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            applied_at=_safe_datetime(row["applied_at"]),
+            baseline_version_id=row["baseline_version_id"],
+            reason=row["reason"],
+        )
+
+    def get_profile_tuning_set_by_version(self, version_id: str) -> ProfileTuningSetRecord | None:
+        """Return one persisted tuning set by version id."""
+
+        with self._connection_scope() as connection:
+            row = connection.execute(
+                """
+                SELECT version_id, symbol, profile, status, config_json, baseline_config_json,
+                       created_at, applied_at, baseline_version_id, reason
+                FROM profile_tuning_sets
+                WHERE version_id = ?
+                """,
+                (version_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ProfileTuningSetRecord(
+            version_id=row["version_id"],
+            symbol=row["symbol"],
+            profile=row["profile"],
+            status=row["status"],
+            config_json=row["config_json"],
+            baseline_config_json=row["baseline_config_json"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            applied_at=_safe_datetime(row["applied_at"]),
+            baseline_version_id=row["baseline_version_id"],
+            reason=row["reason"],
+        )
+
+    def mark_profile_tuning_applied(self, version_id: str, *, applied_at: datetime) -> None:
+        """Mark a pending tuning set as applied."""
+
+        connection = self._open_connection()
+        try:
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE profile_tuning_sets
+                    SET status = 'applied', applied_at = ?
+                    WHERE version_id = ?
+                    """,
+                    (applied_at.isoformat(), version_id),
+                )
+        finally:
+            connection.close()
+
+    def start_paper_session_run(
+        self,
+        *,
+        session_id: str,
+        symbol: str,
+        trading_profile: str,
+        tuning_version_id: str | None,
+        baseline_tuning_version_id: str | None,
+        started_at: datetime,
+    ) -> None:
+        """Persist one paper session run for later before/after comparison."""
+
+        connection = self._open_connection()
+        try:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO paper_session_runs (
+                        session_id, symbol, trading_profile, tuning_version_id,
+                        baseline_tuning_version_id, started_at, ended_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        symbol = excluded.symbol,
+                        trading_profile = excluded.trading_profile,
+                        tuning_version_id = excluded.tuning_version_id,
+                        baseline_tuning_version_id = excluded.baseline_tuning_version_id,
+                        started_at = excluded.started_at
+                    """,
+                    (
+                        session_id,
+                        symbol,
+                        trading_profile,
+                        tuning_version_id,
+                        baseline_tuning_version_id,
+                        started_at.isoformat(),
+                    ),
+                )
+        finally:
+            connection.close()
+
+    def finish_paper_session_run(self, *, session_id: str, ended_at: datetime) -> None:
+        """Mark a persisted paper session as finished."""
+
+        connection = self._open_connection()
+        try:
+            with connection:
+                connection.execute(
+                    "UPDATE paper_session_runs SET ended_at = ? WHERE session_id = ?",
+                    (ended_at.isoformat(), session_id),
+                )
+        finally:
+            connection.close()
+
+    def get_paper_session_runs(
+        self,
+        *,
+        symbol: str | None = None,
+        trading_profile: str | None = None,
+        tuning_version_id: str | None = None,
+        baseline_tuning_version_id: str | None = None,
+        session_id: str | None = None,
+    ) -> list[PaperSessionRunRecord]:
+        """Return persisted paper session runs with optional filters."""
+
+        query = """
+            SELECT session_id, symbol, trading_profile, tuning_version_id, baseline_tuning_version_id,
+                   started_at, ended_at
+            FROM paper_session_runs
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if symbol is not None:
+            query += " AND symbol = ?"
+            params.append(symbol)
+        if trading_profile is not None:
+            query += " AND trading_profile = ?"
+            params.append(trading_profile)
+        if tuning_version_id is not None:
+            query += " AND tuning_version_id = ?"
+            params.append(tuning_version_id)
+        if baseline_tuning_version_id is not None:
+            query += " AND baseline_tuning_version_id = ?"
+            params.append(baseline_tuning_version_id)
+        if session_id is not None:
+            query += " AND session_id = ?"
+            params.append(session_id)
+        query += " ORDER BY started_at ASC"
+        with self._connection_scope() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [
+            PaperSessionRunRecord(
+                session_id=row["session_id"],
+                symbol=row["symbol"],
+                trading_profile=row["trading_profile"],
+                tuning_version_id=row["tuning_version_id"],
+                baseline_tuning_version_id=row["baseline_tuning_version_id"],
+                started_at=datetime.fromisoformat(row["started_at"]),
+                ended_at=_safe_datetime(row["ended_at"]),
+            )
+            for row in rows
+        ]
 
     def upsert_paper_broker_state(
         self,
@@ -803,6 +1066,10 @@ class StorageRepository:
         risk_decision: RiskDecision,
         approved_quantity: Decimal,
         event_time: datetime,
+        execution_source: str = "auto",
+        trading_profile: str = "balanced",
+        session_id: str | None = None,
+        tuning_version_id: str | None = None,
     ) -> None:
         """Persist a trade record."""
 
@@ -813,8 +1080,9 @@ class StorageRepository:
                 """
                 INSERT INTO trades (
                     order_id, symbol, side, requested_quantity, approved_quantity, filled_quantity,
-                    status, risk_decision, reason_codes, fill_price, realized_pnl, quote_balance, event_time
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, risk_decision, reason_codes, fill_price, realized_pnl, quote_balance, event_time,
+                    execution_source, trading_profile, session_id, tuning_version_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     fill_result.order_id,
@@ -830,12 +1098,25 @@ class StorageRepository:
                     str(fill_result.realized_pnl),
                     str(fill_result.quote_balance),
                     event_time.isoformat(),
+                    execution_source,
+                    trading_profile,
+                    session_id,
+                    tuning_version_id,
                 ),
             )
         finally:
             connection.close()
 
-    def insert_fill(self, fill_result: FillResult, event_time: datetime) -> None:
+    def insert_fill(
+        self,
+        fill_result: FillResult,
+        event_time: datetime,
+        *,
+        execution_source: str = "auto",
+        trading_profile: str = "balanced",
+        session_id: str | None = None,
+        tuning_version_id: str | None = None,
+    ) -> None:
         """Persist a fill row for executed orders."""
 
         connection = self._open_connection()
@@ -845,8 +1126,8 @@ class StorageRepository:
                 """
                 INSERT INTO fills (
                     order_id, symbol, side, filled_quantity, fill_price, fee_paid,
-                    realized_pnl, quote_balance, event_time
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    realized_pnl, quote_balance, event_time, execution_source, trading_profile, session_id, tuning_version_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     fill_result.order_id,
@@ -858,6 +1139,10 @@ class StorageRepository:
                     str(fill_result.realized_pnl),
                     str(fill_result.quote_balance),
                     event_time.isoformat(),
+                    execution_source,
+                    trading_profile,
+                    session_id,
+                    tuning_version_id,
                 ),
             )
         finally:
@@ -1014,7 +1299,8 @@ class StorageRepository:
 
         query = """
             SELECT order_id, symbol, side, requested_quantity, approved_quantity, filled_quantity,
-                   status, risk_decision, reason_codes, fill_price, realized_pnl, quote_balance, event_time
+                   status, risk_decision, reason_codes, fill_price, realized_pnl, quote_balance, event_time,
+                   execution_source, trading_profile, session_id, tuning_version_id
             FROM trades
             WHERE 1 = 1
         """
@@ -1048,6 +1334,10 @@ class StorageRepository:
                 realized_pnl=_decimal(row["realized_pnl"]),
                 quote_balance=_decimal(row["quote_balance"]),
                 event_time=datetime.fromisoformat(row["event_time"]),
+                execution_source=row["execution_source"] or "auto",
+                trading_profile=row["trading_profile"] or "balanced",
+                session_id=row["session_id"],
+                tuning_version_id=row["tuning_version_id"],
             )
             for row in rows
         ]
@@ -1349,6 +1639,10 @@ class StorageRepository:
                 realized_pnl=_decimal(row["realized_pnl"]),
                 quote_balance=_decimal(row["quote_balance"]),
                 event_time=datetime.fromisoformat(row["event_time"]),
+                execution_source=row["execution_source"] or "auto",
+                trading_profile=row["trading_profile"] or "balanced",
+                session_id=row["session_id"],
+                tuning_version_id=row["tuning_version_id"],
             )
             for row in rows
         ]
@@ -1366,7 +1660,7 @@ class StorageRepository:
 
         query = """
             SELECT order_id, symbol, side, filled_quantity, fill_price, fee_paid,
-                   realized_pnl, quote_balance, event_time
+                   realized_pnl, quote_balance, event_time, execution_source, trading_profile, session_id, tuning_version_id
             FROM fills
             WHERE 1 = 1
         """

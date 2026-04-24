@@ -119,3 +119,35 @@ def test_trend_following_strategy_returns_sell_on_take_profit() -> None:
 
     assert signal.side == "SELL"
     assert signal.reason_codes == ("TAKE_PROFIT_HIT",)
+
+
+def test_balanced_profile_allows_entry_where_conservative_profile_waits() -> None:
+    conservative = TrendFollowingStrategy(
+        TrendFollowingConfig(
+            min_atr_ratio=Decimal("0.0008"),
+            max_atr_ratio=Decimal("0.0300"),
+            max_spread_ratio=Decimal("0.0015"),
+            min_order_book_imbalance=Decimal("-0.20"),
+        )
+    )
+    balanced = TrendFollowingStrategy(
+        TrendFollowingConfig(
+            min_atr_ratio=Decimal("0.0004"),
+            max_atr_ratio=Decimal("0.0400"),
+            max_spread_ratio=Decimal("0.0030"),
+            min_order_book_imbalance=Decimal("-0.45"),
+        )
+    )
+    snapshot = build_snapshot(
+        atr=Decimal("0.05"),
+        mid_price=Decimal("100"),
+        bid_ask_spread=Decimal("0.20"),
+        order_book_imbalance=Decimal("-0.35"),
+    )
+
+    conservative_signal = conservative.evaluate(snapshot)
+    balanced_signal = balanced.evaluate(snapshot)
+
+    assert conservative_signal.side == "HOLD"
+    assert conservative_signal.reason_codes in {("VOL_TOO_LOW",), ("MICROSTRUCTURE_UNHEALTHY",)}
+    assert balanced_signal.side == "BUY"

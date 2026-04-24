@@ -2,24 +2,37 @@ import { useId, useState } from 'react';
 
 import { badgeTone, classNames, formatDateTime } from '../lib/format';
 import { canStartBot } from '../lib/bot-controls';
-import type { BotStatusResponse, SpotSymbolItem } from '../lib/types';
+import { SymbolCandlestickChart } from './SymbolCandlestickChart';
+import type { BotStatusResponse, CandleHistoryResponse, SpotSymbolItem, TechnicalAnalysisResponse, TradingProfile } from '../lib/types';
 
 interface BotControlPanelProps {
   searchQuery: string;
   selectedSymbol: string;
   hasValidSelection: boolean;
+  tradingProfile: TradingProfile;
+  onTradingProfileChange: (profile: TradingProfile) => void;
   symbolResults: SpotSymbolItem[];
   symbolsLoading: boolean;
   symbolsError: string | null;
+  chart: CandleHistoryResponse | null;
+  chartLoading: boolean;
+  chartError: string | null;
+  chartTimeframe: '1m' | '5m' | '15m' | '1h';
+  onChartTimeframeChange: (timeframe: '1m' | '5m' | '15m' | '1h') => void;
+  technicalAnalysis: TechnicalAnalysisResponse | null;
   status: BotStatusResponse;
   actionLoading: boolean;
   actionError: string | null;
+  actionMessage: string | null;
+  hasOpenPosition: boolean;
   onSearchChange: (value: string) => void;
   onSelectSymbol: (symbol: string) => void;
   onClearSelection: () => void;
   onStart: () => void;
   onStop: () => void;
   onPauseResume: () => void;
+  onManualBuy: () => void;
+  onManualClose: () => void;
   onReset: () => void;
 }
 
@@ -40,18 +53,30 @@ export function BotControlPanel({
   searchQuery,
   selectedSymbol,
   hasValidSelection,
+  tradingProfile,
+  onTradingProfileChange,
   symbolResults,
   symbolsLoading,
   symbolsError,
+  chart,
+  chartLoading,
+  chartError,
+  chartTimeframe,
+  onChartTimeframeChange,
+  technicalAnalysis,
   status,
   actionLoading,
   actionError,
+  actionMessage,
+  hasOpenPosition,
   onSearchChange,
   onSelectSymbol,
   onClearSelection,
   onStart,
   onStop,
   onPauseResume,
+  onManualBuy,
+  onManualClose,
   onReset,
 }: BotControlPanelProps) {
   const [isOpen, setIsOpen] = useState(false);
@@ -60,6 +85,7 @@ export function BotControlPanel({
   const canStart = hasValidSelection && canStartBot(selectedSymbol, status.state, actionLoading);
   const canStop = status.state !== 'stopped' && !actionLoading;
   const canPauseResume = (status.state === 'running' || status.state === 'paused') && !actionLoading;
+  const canManualTrade = !actionLoading && selectedSymbol.length > 0 && status.symbol === selectedSymbol && (status.state === 'running' || status.state === 'paused');
   const pauseResumeLabel = status.state === 'paused' ? 'Resume' : 'Pause';
   const selectedLabel = selectedSymbol || status.symbol || '-';
   const showNoMatches = !symbolsLoading && !symbolsError && isOpen && searchQuery.trim().length > 0 && symbolResults.length === 0;
@@ -80,7 +106,7 @@ export function BotControlPanel({
       </div>
 
       <div className="grid gap-6 xl:grid-cols-[1.2fr,0.8fr]">
-        <div>
+        <div className="space-y-4">
           <div
             className="relative"
             onBlur={(event) => {
@@ -205,10 +231,65 @@ export function BotControlPanel({
               </div>
             ) : null}
           </div>
+
+          <div className="rounded-2xl border border-slate-800 bg-slate-950/40 p-4">
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Chart timeframe</p>
+                <p className="mt-1 text-sm text-slate-400">Recent closed candles with support, resistance, breakout, and reversal context.</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {(['1m', '5m', '15m', '1h'] as const).map((timeframe) => (
+                  <button
+                    key={timeframe}
+                    type="button"
+                    onClick={() => onChartTimeframeChange(timeframe)}
+                    className={classNames(
+                      'rounded-xl border px-3 py-2 text-sm font-medium transition',
+                      chartTimeframe === timeframe
+                        ? 'border-sky-400/40 bg-sky-400/10 text-sky-100'
+                        : 'border-slate-700 bg-slate-950/60 text-slate-300 hover:border-slate-500 hover:text-white',
+                    )}
+                  >
+                    {timeframe}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <SymbolCandlestickChart
+              symbol={selectedLabel === '-' ? '' : selectedLabel}
+              timeframe={chartTimeframe}
+              chart={chart}
+              chartLoading={chartLoading}
+              chartError={chartError}
+              technicalAnalysis={technicalAnalysis}
+            />
+          </div>
         </div>
 
         <div className="space-y-4 rounded-2xl border border-slate-800 bg-slate-950/40 p-4">
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Trading profile</p>
+              <div className="mt-2">
+                <select
+                  value={tradingProfile}
+                  onChange={(event) => onTradingProfileChange(event.target.value as TradingProfile)}
+                  disabled={actionLoading || status.state !== 'stopped'}
+                  className="w-full rounded-xl border border-slate-700 bg-slate-950/60 px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-sky-400 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <option value="conservative">Conservative</option>
+                  <option value="balanced">Balanced</option>
+                  <option value="aggressive">Aggressive</option>
+                </select>
+              </div>
+              <p className="mt-1 text-xs text-slate-400">
+                {status.state === 'stopped'
+                  ? 'Selected profile will be applied on the next start.'
+                  : `Runtime is using ${status.trading_profile}. Stop the runtime to switch profiles.`}
+              </p>
+            </div>
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Selected symbol</p>
               <p className="mt-2 text-lg font-semibold text-white">{selectedLabel}</p>
@@ -217,7 +298,12 @@ export function BotControlPanel({
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Current bot status</p>
               <p className="mt-2 text-lg font-semibold text-white">{status.state}</p>
-              <p className="mt-1 text-xs text-slate-400">Mode {status.mode} | timeframe {status.timeframe} | paper only</p>
+              <p className="mt-1 text-xs text-slate-400">Mode {status.mode} | profile {status.trading_profile} | timeframe {status.timeframe} | paper only</p>
+              <p className="mt-1 text-xs text-slate-500">
+                {status.tuning_version_id
+                  ? `Applied tuning ${status.tuning_version_id}`
+                  : 'Using built-in profile defaults'}
+              </p>
             </div>
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Started</p>
@@ -250,6 +336,7 @@ export function BotControlPanel({
           {status.last_error ? <p className="text-sm text-rose-300">{status.last_error}</p> : null}
           {status.recovery_message ? <p className="text-sm text-amber-300">{status.recovery_message}</p> : null}
           {actionError ? <p className="text-sm text-rose-300">{actionError}</p> : null}
+          {actionMessage ? <p className="text-sm text-emerald-300">{actionMessage}</p> : null}
 
           <div className="flex flex-wrap gap-2">
             <button
@@ -284,6 +371,38 @@ export function BotControlPanel({
             >
               Reset Session
             </button>
+          </div>
+
+          <div className="rounded-2xl border border-slate-800 bg-slate-950/40 p-4">
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Manual Paper Participation</p>
+            <p className="mt-2 text-sm text-slate-400">
+              Manual paper orders stay paper-only and still use the safe execution path when live runtime data is ready.
+            </p>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button
+                type="button"
+                disabled={!canManualTrade}
+                onClick={onManualBuy}
+                className="rounded-xl border border-sky-400/30 bg-sky-400/10 px-4 py-2 text-sm font-medium text-sky-100 transition disabled:cursor-not-allowed disabled:opacity-40 hover:border-sky-300 hover:bg-sky-400/20"
+              >
+                Buy Market
+              </button>
+              <button
+                type="button"
+                disabled={!canManualTrade || !hasOpenPosition}
+                onClick={onManualClose}
+                className="rounded-xl border border-violet-400/30 bg-violet-400/10 px-4 py-2 text-sm font-medium text-violet-100 transition disabled:cursor-not-allowed disabled:opacity-40 hover:border-violet-300 hover:bg-violet-400/20"
+              >
+                Sell / Close Position
+              </button>
+            </div>
+            <p className="mt-2 text-xs text-slate-500">
+              {canManualTrade
+                ? hasOpenPosition
+                  ? 'Manual buy and close are available for the active paper runtime.'
+                  : 'Manual buy is available. Close activates after a paper position opens.'
+                : 'Start or attach the live runtime for the selected symbol before manual paper trading can act.'}
+            </p>
           </div>
         </div>
       </div>

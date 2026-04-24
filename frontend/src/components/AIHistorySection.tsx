@@ -1,8 +1,6 @@
 import { PaginationControls } from './PaginationControls';
-import { TimeSeriesChart } from './TimeSeriesChart';
 import { StatePanel } from './StatePanel';
 import { badgeTone, classNames, formatDateTime } from '../lib/format';
-import { buildAiHistoryViewModel } from '../lib/ai-history.js';
 import type { AISignalSummary, WorkstationDataState } from '../lib/types';
 
 interface AIHistorySectionProps {
@@ -44,9 +42,6 @@ export function AIHistorySection({
   onPrevious,
   onNext,
 }: AIHistorySectionProps) {
-  const viewModel = buildAiHistoryViewModel(symbol, history);
-  const latestPage = offset === 0;
-
   if (!symbol) {
     return (
       <StatePanel
@@ -61,11 +56,11 @@ export function AIHistorySection({
     return <StatePanel title="AI history unavailable" message={error} tone="error" />;
   }
 
-  if (loading && viewModel.items.length === 0) {
+  if (loading && history.length === 0) {
     return <StatePanel title="Loading AI history" message="Reading persisted advisory snapshots for the selected symbol." tone="loading" />;
   }
 
-  if (viewModel.items.length === 0) {
+  if (history.length === 0) {
     return (
       <StatePanel
         title="No AI history yet"
@@ -73,7 +68,7 @@ export function AIHistorySection({
           statusMessage
           ?? (
             dataState === 'waiting_for_runtime'
-              ? 'Start the live paper runtime for the selected symbol to generate advisory history.'
+              ? 'Start the live runtime for the selected symbol to generate advisory history.'
               : 'The selected symbol does not have persisted advisory snapshots yet. Wait for closed candles to accumulate history.'
           )
         }
@@ -87,71 +82,14 @@ export function AIHistorySection({
       <div className="flex items-center justify-between gap-3">
         <div>
           <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">AI History</p>
-          <p className="mt-1 text-sm text-slate-400">Persisted advisory bias, confidence, and action changes for {symbol}.</p>
+          <p className="mt-1 text-sm text-slate-400">Latest 3 advisory snapshots for {symbol}. Older pages stay symbol-scoped.</p>
         </div>
         {refreshing ? <span className="text-xs text-slate-400">Refreshing...</span> : null}
       </div>
 
-      <TimeSeriesChart
-        title="Confidence Trend"
-        subtitle={latestPage ? 'Latest three persisted advisory changes for the selected symbol.' : 'Older persisted advisory changes for the selected symbol.'}
-        labels={viewModel.labels}
-        series={[
-          {
-            key: 'confidence',
-            label: 'Confidence',
-            color: '#38bdf8',
-            values: viewModel.confidenceValues,
-            format: 'decimal',
-          },
-        ]}
-        emptyMessage="No confidence history is available for the selected symbol."
-      />
-
-      <div className="grid gap-4 lg:grid-cols-[1.1fr,0.9fr]">
-        <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
-          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">{latestPage ? 'Latest Bias Changes' : 'Older Bias Changes'}</p>
-          <div className="mt-4 space-y-3">
-            {viewModel.recentItems.slice(0, 3).map((item) => (
-              <div key={`${item.symbol}-${item.timestamp}`} className="rounded-xl border border-slate-800 bg-slate-900/70 p-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className={classNames('rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em]', biasTone(item.bias))}>
-                    {item.bias}
-                  </span>
-                  <span className={classNames('rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em]', badgeTone(item.suggested_action))}>
-                    {item.suggested_action}
-                  </span>
-                  <span className="text-xs text-slate-500">{formatDateTime(item.timestamp)}</span>
-                </div>
-                <p className="mt-2 text-sm text-slate-300">{item.explanation}</p>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
-          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">{latestPage ? 'Latest Action Changes' : 'Older Action Changes'}</p>
-          <div className="mt-4 space-y-3">
-            {viewModel.recentActionChanges.length > 0 ? viewModel.recentActionChanges.slice(0, 3).map((item) => (
-              <div key={`${item.symbol}-${item.timestamp}-action`} className="rounded-xl border border-slate-800 bg-slate-900/70 p-3 text-sm text-slate-300">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className={classNames('rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em]', badgeTone(item.suggested_action))}>
-                    {item.suggested_action}
-                  </span>
-                  <span className="text-xs text-slate-500">{formatDateTime(item.timestamp)}</span>
-                </div>
-                <p className="mt-2 text-slate-400">{item.bias} bias - confidence {item.confidence}%</p>
-              </div>
-            )) : (
-              <p className="text-sm text-slate-400">No action changes are available on this page yet.</p>
-            )}
-          </div>
-        </div>
-      </div>
-
       <div className="overflow-hidden rounded-2xl border border-slate-800 bg-slate-950/50">
         <div className="border-b border-slate-800 px-4 py-3">
-          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">{latestPage ? 'Latest 3 Advisory Snapshots' : 'Older Advisory Snapshots'}</p>
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Recent Advisory Rows</p>
         </div>
         <div className="overflow-x-auto">
           <table className="min-w-full divide-y divide-slate-800 text-sm">
@@ -161,14 +99,11 @@ export function AIHistorySection({
                 <th className="px-4 py-3 font-semibold">Bias</th>
                 <th className="px-4 py-3 font-semibold">Confidence</th>
                 <th className="px-4 py-3 font-semibold">Action</th>
-                <th className="px-4 py-3 font-semibold">Entry</th>
-                <th className="px-4 py-3 font-semibold">Exit</th>
-                <th className="px-4 py-3 font-semibold">Explanation</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800 text-slate-200">
-              {viewModel.recentItems.map((item) => (
-                <tr key={`${item.symbol}-${item.timestamp}-row`}>
+              {history.slice(0, 3).map((item) => (
+                <tr key={`${item.symbol}-${item.timestamp}`}>
                   <td className="px-4 py-3 text-slate-400">{formatDateTime(item.timestamp)}</td>
                   <td className="px-4 py-3">
                     <span className={classNames('rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em]', biasTone(item.bias))}>
@@ -181,9 +116,6 @@ export function AIHistorySection({
                       {item.suggested_action}
                     </span>
                   </td>
-                  <td className="px-4 py-3">{item.entry_signal ? 'Yes' : 'No'}</td>
-                  <td className="px-4 py-3">{item.exit_signal ? 'Yes' : 'No'}</td>
-                  <td className="max-w-md px-4 py-3 text-slate-400">{item.explanation}</td>
                 </tr>
               ))}
             </tbody>
