@@ -67,6 +67,89 @@ export interface CandleHistoryResponse {
   current_price: DecimalString | null;
 }
 
+export interface BackfillStatusResponse {
+  symbol: string;
+  requested_interval: ChartTimeframe;
+  requested_lookback_days: number;
+  available_from: string | null;
+  available_to: string | null;
+  candle_count: number;
+  coverage_pct: DecimalString;
+  status: 'not_started' | 'loading' | 'ready' | 'partial' | 'failed';
+  message: string;
+  last_backfilled_at: string | null;
+  effective_interval: ChartTimeframe | null;
+}
+
+export interface SimilarSetupHorizonMetric {
+  horizon: string;
+  sample_size: number;
+  win_rate_pct: DecimalString | null;
+  expectancy_pct: DecimalString | null;
+  average_favorable_move_pct: DecimalString | null;
+  average_adverse_move_pct: DecimalString | null;
+}
+
+export interface SimilarSetupResponse {
+  status: 'ready' | 'insufficient_data';
+  reliability_label: 'insufficient_data' | 'weak' | 'mixed' | 'promising' | 'strong';
+  matching_sample_size: number;
+  best_horizon: string | null;
+  horizons: SimilarSetupHorizonMetric[];
+  explanation: string;
+  matched_attributes: string[];
+}
+
+export interface TradingAssistantResponse {
+  symbol: string;
+  decision: 'buy' | 'sell_exit' | 'wait' | 'avoid';
+  confidence_label: 'low' | 'medium' | 'high';
+  confidence_score: number;
+  risk_label: 'low' | 'medium' | 'high';
+  best_timeframe: '5m' | '15m' | '1h' | 'unknown';
+  simple_reason: string;
+  why_not_trade: string | null;
+  suggested_entry_zone: string | null;
+  suggested_stop_loss: DecimalString | null;
+  suggested_take_profit: DecimalString | null;
+  data_state: WorkstationDataState;
+  backfill_status: BackfillStatusResponse;
+  similar_setup: SimilarSetupResponse | null;
+}
+
+export interface TradeEligibilityResponse {
+  symbol: string;
+  status: 'eligible' | 'not_eligible' | 'watch_only' | 'insufficient_data';
+  evidence_strength: 'insufficient' | 'weak' | 'mixed' | 'promising' | 'strong';
+  reason: string;
+  required_confirmations: string[];
+  minimum_confidence_threshold: number;
+  preferred_horizon: string | null;
+  conditions_to_avoid: string[];
+  blocker_summary: string;
+  similar_setup_summary: string;
+  regime_summary: string;
+  fee_slippage_summary: string;
+  warnings: string[];
+  paper_only: boolean;
+  advisory_only: boolean;
+  live_trading_enabled: boolean;
+  futures_enabled: boolean;
+}
+
+export interface OpportunityResponse {
+  symbol: string;
+  score: number;
+  suggested_action: 'watch' | 'possible_buy' | 'avoid';
+  confidence: 'low' | 'medium' | 'high';
+  volatility_label: string;
+  momentum_label: string;
+  liquidity_label: string;
+  risk_label: 'low' | 'medium' | 'high';
+  reason: string;
+  data_state: WorkstationDataState;
+}
+
 export interface TopOfBookSummary {
   bid_price: DecimalString;
   bid_quantity: DecimalString;
@@ -232,6 +315,29 @@ export interface FusionSignalResponse {
   invalidation_hint: string | null;
 }
 
+export interface RegimeAnalysisResponse {
+  symbol: string;
+  horizon: PatternHorizon;
+  generated_at: string | null;
+  data_state: WorkstationDataState;
+  status_message: string | null;
+  regime_label:
+    | 'trending_up'
+    | 'trending_down'
+    | 'sideways'
+    | 'high_volatility'
+    | 'low_liquidity'
+    | 'choppy'
+    | 'breakout_building'
+    | 'reversal_risk'
+    | null;
+  confidence: number;
+  supporting_evidence: string[];
+  risk_warnings: string[];
+  preferred_trading_behavior: string | null;
+  avoid_conditions: string[];
+}
+
 export interface TradeReadinessResponse {
   selected_symbol: string;
   runtime_active: boolean;
@@ -262,7 +368,8 @@ export interface ManualTradeResponse {
   approved_quantity: DecimalString | null;
   filled_quantity: DecimalString | null;
   fill_price: DecimalString | null;
-  current_position_quantity: DecimalString | null;
+  current_position_quantity: DecimalString;
+  current_position_open: boolean;
   current_pnl: DecimalString;
 }
 
@@ -395,6 +502,122 @@ export interface PerformanceAnalyticsResponse {
   symbol_realized_pnl: DecimalString;
   max_drawdown: DecimalString;
   current_drawdown: DecimalString;
+}
+
+export interface HorizonQualityMetric {
+  horizon: string;
+  sample_size: number;
+  actionable_sample_size: number;
+  win_rate_pct: DecimalString | null;
+  expectancy_pct: DecimalString | null;
+  average_favorable_move_pct: DecimalString | null;
+  average_adverse_move_pct: DecimalString | null;
+  false_positive_rate_pct: DecimalString | null;
+  false_breakout_rate_pct: DecimalString | null;
+  winner_average_confidence: DecimalString | null;
+  loser_average_confidence: DecimalString | null;
+}
+
+export interface GroupPerformanceMetric {
+  name: string;
+  sample_size: number;
+  win_rate_pct: DecimalString | null;
+  expectancy_pct: DecimalString | null;
+}
+
+export interface ReasonPerformanceMetric {
+  reason: string;
+  sample_size: number;
+  win_rate_pct: DecimalString | null;
+  expectancy_pct: DecimalString | null;
+}
+
+export interface SignalValidationResponse {
+  symbol: string | null;
+  start_date: string | null;
+  end_date: string | null;
+  status: 'ready' | 'insufficient_data';
+  status_message: string | null;
+  total_signals: number;
+  actionable_signals: number;
+  ignored_or_blocked_signals: number;
+  horizons: HorizonQualityMetric[];
+  performance_by_action: GroupPerformanceMetric[];
+  performance_by_risk_grade: GroupPerformanceMetric[];
+  performance_by_confidence_bucket: GroupPerformanceMetric[];
+  performance_by_symbol: GroupPerformanceMetric[];
+}
+
+export interface EdgeReportResponse {
+  symbol: string | null;
+  start_date: string | null;
+  end_date: string | null;
+  status: 'ready' | 'insufficient_data';
+  status_message: string | null;
+  useful_symbols: GroupPerformanceMetric[];
+  weak_symbols: GroupPerformanceMetric[];
+  best_horizons: HorizonQualityMetric[];
+  reliable_confidence_ranges: GroupPerformanceMetric[];
+  risk_grades_to_avoid: GroupPerformanceMetric[];
+  useful_reasons: ReasonPerformanceMetric[];
+  noisy_reasons: ReasonPerformanceMetric[];
+  protective_blockers: ReasonPerformanceMetric[];
+  noisy_modules: string[];
+  suggestions: string[];
+}
+
+export interface ModuleAttributionResponse {
+  symbol: string | null;
+  start_date: string | null;
+  end_date: string | null;
+  status: 'ready' | 'insufficient_data';
+  status_message: string | null;
+  modules: GroupPerformanceMetric[];
+}
+
+export interface AdaptiveRecommendationItem {
+  recommendation_id: string;
+  recommendation_type:
+    | 'raise_min_confidence'
+    | 'lower_min_confidence'
+    | 'avoid_regime'
+    | 'prefer_horizon'
+    | 'avoid_horizon'
+    | 'restrict_symbol'
+    | 'watch_symbol'
+    | 'restrict_action_type'
+    | 'tighten_risk_grade'
+    | 'loosen_risk_grade'
+    | 'require_confirmation'
+    | 'keep_current_settings'
+    | 'insufficient_data';
+  affected_scope:
+    | 'global'
+    | 'symbol'
+    | 'regime'
+    | 'horizon'
+    | 'action_type'
+    | 'risk_grade'
+    | 'confidence_bucket';
+  affected_value: string;
+  current_observation: string;
+  suggested_change: string;
+  evidence_summary: string;
+  expected_benefit: string;
+  evidence_strength: 'insufficient' | 'weak' | 'mixed' | 'promising' | 'strong';
+  sample_size: number;
+  minimum_sample_required: number;
+  warnings: string[];
+  do_not_auto_apply: boolean;
+}
+
+export interface AdaptiveRecommendationResponse {
+  symbol: string | null;
+  start_date: string | null;
+  end_date: string | null;
+  status: 'ready' | 'insufficient_data';
+  status_message: string | null;
+  recommendations: AdaptiveRecommendationItem[];
 }
 
 export interface HoldTimeDistribution {

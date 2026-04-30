@@ -24,6 +24,7 @@ from app.storage.models import (
     DrawdownSummary,
     EquityHistoryPoint,
     FillRecord,
+    HistoricalCandleRecord,
     MarketCandleSnapshotRecord,
     PaperBrokerStateRecord,
     PaperSessionRunRecord,
@@ -33,6 +34,7 @@ from app.storage.models import (
     ProfileTuningSetRecord,
     RuntimeSessionRecord,
     RunnerEventRecord,
+    SignalValidationSnapshotRecord,
     TradeRecord,
 )
 
@@ -61,6 +63,18 @@ def _parse_reason_codes(value: str) -> tuple[str, ...]:
     """Parse persisted reason codes from JSON."""
 
     raw = json.loads(value)
+    return tuple(str(item) for item in raw)
+
+
+def _parse_json_tuple(value: str) -> tuple[str, ...]:
+    """Parse a persisted JSON string list into a stable tuple."""
+
+    try:
+        raw = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return ()
+    if not isinstance(raw, list):
+        return ()
     return tuple(str(item) for item in raw)
 
 
@@ -133,6 +147,38 @@ def _empty_ai_feature_summary() -> AISignalFeatureSummaryRecord:
         recent_false_positive_rate_5m=None,
         horizons=None,
         weakening_factors=(),
+    )
+
+
+def _signal_validation_snapshot_from_row(row: sqlite3.Row) -> SignalValidationSnapshotRecord:
+    """Convert a SQLite row into a signal-validation snapshot record."""
+
+    return SignalValidationSnapshotRecord(
+        id=int(row["id"]),
+        symbol=row["symbol"],
+        timestamp=datetime.fromisoformat(row["snapshot_time"]),
+        price=_decimal(row["price"]),
+        final_action=row["final_action"],
+        fusion_final_signal=row["fusion_final_signal"],
+        confidence=int(row["confidence"]),
+        expected_edge_pct=_decimal(row["expected_edge_pct"]) if row["expected_edge_pct"] is not None else None,
+        estimated_cost_pct=_decimal(row["estimated_cost_pct"]) if row["estimated_cost_pct"] is not None else None,
+        risk_grade=row["risk_grade"],
+        preferred_horizon=row["preferred_horizon"],
+        technical_score=_decimal(row["technical_score"]) if row["technical_score"] is not None else None,
+        technical_context_json=row["technical_context_json"],
+        sentiment_score=_decimal(row["sentiment_score"]) if row["sentiment_score"] is not None else None,
+        sentiment_context_json=row["sentiment_context_json"],
+        pattern_score=_decimal(row["pattern_score"]) if row["pattern_score"] is not None else None,
+        pattern_context_json=row["pattern_context_json"],
+        ai_context_json=row["ai_context_json"],
+        top_reasons=_parse_json_tuple(row["top_reasons_json"]),
+        warnings=_parse_json_tuple(row["warnings_json"]),
+        invalidation_hint=row["invalidation_hint"],
+        trade_opened=bool(row["trade_opened"]),
+        signal_ignored_or_blocked=bool(row["signal_ignored_or_blocked"]),
+        blocker_reasons=_parse_json_tuple(row["blocker_reasons_json"]),
+        regime_label=row["regime_label"],
     )
 
 
@@ -305,6 +351,8 @@ class StorageRepository:
                     "runner_events",
                     "ai_signal_snapshots",
                     "market_candle_snapshots",
+                    "signal_validation_snapshots",
+                    "historical_candles",
                     "runtime_session_state",
                     "paper_broker_state",
                     "paper_broker_positions",
@@ -811,6 +859,275 @@ class StorageRepository:
         finally:
             if "connection" in locals():
                 connection.close()
+
+    def insert_signal_validation_snapshot(self, snapshot: SignalValidationSnapshotRecord) -> int | None:
+        """Persist a final fusion/trading-assistant snapshot for later outcome validation."""
+
+        try:
+            connection = self._open_connection()
+            with connection:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO signal_validation_snapshots (
+                        symbol, snapshot_time, price, final_action, fusion_final_signal,
+                        confidence, expected_edge_pct, estimated_cost_pct, risk_grade, preferred_horizon,
+                        technical_score, technical_context_json, sentiment_score, sentiment_context_json,
+                        pattern_score, pattern_context_json, ai_context_json, top_reasons_json, warnings_json,
+                        invalidation_hint, trade_opened, signal_ignored_or_blocked, blocker_reasons_json, regime_label
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot.symbol.upper(),
+                        snapshot.timestamp.isoformat(),
+                        str(snapshot.price),
+                        snapshot.final_action,
+                        snapshot.fusion_final_signal,
+                        snapshot.confidence,
+                        str(snapshot.expected_edge_pct) if snapshot.expected_edge_pct is not None else None,
+                        str(snapshot.estimated_cost_pct) if snapshot.estimated_cost_pct is not None else None,
+                        snapshot.risk_grade,
+                        snapshot.preferred_horizon,
+                        str(snapshot.technical_score) if snapshot.technical_score is not None else None,
+                        snapshot.technical_context_json,
+                        str(snapshot.sentiment_score) if snapshot.sentiment_score is not None else None,
+                        snapshot.sentiment_context_json,
+                        str(snapshot.pattern_score) if snapshot.pattern_score is not None else None,
+                        snapshot.pattern_context_json,
+                        snapshot.ai_context_json,
+                        json.dumps(list(snapshot.top_reasons)),
+                        json.dumps(list(snapshot.warnings)),
+                        snapshot.invalidation_hint,
+                        int(snapshot.trade_opened),
+                        int(snapshot.signal_ignored_or_blocked),
+                        json.dumps(list(snapshot.blocker_reasons)),
+                        snapshot.regime_label,
+                    ),
+                )
+                return int(cursor.lastrowid) if cursor.lastrowid is not None else None
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Signal-validation snapshot storage is unavailable.")
+            LOGGER.warning("Skipping signal-validation snapshot persistence due to schema issue: %s", exc)
+            return None
+        finally:
+            if "connection" in locals():
+                connection.close()
+
+    def get_signal_validation_snapshots(
+        self,
+        *,
+        symbol: str | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        action: str | None = None,
+        risk_grade: str | None = None,
+        confidence_bucket: str | None = None,
+    ) -> list[SignalValidationSnapshotRecord]:
+        """Return persisted signal snapshots for validation analytics."""
+
+        query = """
+            SELECT id, symbol, snapshot_time, price, final_action, fusion_final_signal,
+                   confidence, expected_edge_pct, estimated_cost_pct, risk_grade, preferred_horizon,
+                   technical_score, technical_context_json, sentiment_score, sentiment_context_json,
+                   pattern_score, pattern_context_json, ai_context_json, top_reasons_json, warnings_json,
+                   invalidation_hint, trade_opened, signal_ignored_or_blocked, blocker_reasons_json, regime_label
+            FROM signal_validation_snapshots
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        query, params = self._apply_history_filters(
+            query=query,
+            params=params,
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            timestamp_column="snapshot_time",
+        )
+        if action is not None:
+            query += " AND final_action = ?"
+            params.append(action)
+        if risk_grade is not None:
+            query += " AND risk_grade = ?"
+            params.append(risk_grade)
+        if confidence_bucket is not None:
+            if confidence_bucket == "low":
+                query += " AND confidence < 45"
+            elif confidence_bucket == "medium":
+                query += " AND confidence >= 45 AND confidence < 70"
+            elif confidence_bucket == "high":
+                query += " AND confidence >= 70"
+        query += " ORDER BY snapshot_time ASC, id ASC"
+        try:
+            with self._connection_scope() as connection:
+                rows = connection.execute(query, tuple(params)).fetchall()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Signal-validation snapshot storage is unavailable.")
+            LOGGER.warning("Failed to read signal-validation snapshots due to schema issue: %s", exc)
+            return []
+        return [_signal_validation_snapshot_from_row(row) for row in rows]
+
+    def upsert_historical_candles(
+        self,
+        candles: list[Candle],
+        *,
+        source: str,
+    ) -> int:
+        """Persist full OHLCV candle history with deduplication by symbol/interval/open_time."""
+
+        if not candles:
+            return 0
+        connection = self._open_connection()
+        try:
+            with connection:
+                connection.executemany(
+                    """
+                    INSERT INTO historical_candles (
+                        symbol, interval, open_time, close_time, open_price, high_price, low_price,
+                        close_price, volume, quote_volume, trade_count, source, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(symbol, interval, open_time) DO UPDATE SET
+                        close_time = excluded.close_time,
+                        open_price = excluded.open_price,
+                        high_price = excluded.high_price,
+                        low_price = excluded.low_price,
+                        close_price = excluded.close_price,
+                        volume = excluded.volume,
+                        quote_volume = excluded.quote_volume,
+                        trade_count = excluded.trade_count,
+                        source = excluded.source,
+                        created_at = excluded.created_at
+                    """,
+                    [
+                        (
+                            candle.symbol.upper(),
+                            candle.timeframe,
+                            candle.open_time.isoformat(),
+                            candle.close_time.isoformat(),
+                            str(candle.open),
+                            str(candle.high),
+                            str(candle.low),
+                            str(candle.close),
+                            str(candle.volume),
+                            str(candle.quote_volume),
+                            candle.trade_count,
+                            source,
+                            candle.event_time.isoformat(),
+                        )
+                        for candle in candles
+                        if candle.is_closed
+                    ],
+                )
+            return len(candles)
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Historical candle storage is unavailable.")
+            LOGGER.warning("Skipping historical candle persistence due to schema issue: %s", exc)
+            return 0
+        finally:
+            connection.close()
+
+    def get_historical_candles(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[HistoricalCandleRecord]:
+        """Return persisted OHLCV candle history for one symbol and interval."""
+
+        query = """
+            SELECT symbol, interval, open_time, close_time, open_price, high_price, low_price,
+                   close_price, volume, quote_volume, trade_count, source, created_at
+            FROM historical_candles
+            WHERE symbol = ? AND interval = ?
+        """
+        params: list[Any] = [symbol.upper(), interval]
+        if start_time is not None:
+            query += " AND open_time >= ?"
+            params.append(start_time.isoformat())
+        if end_time is not None:
+            query += " AND open_time <= ?"
+            params.append(end_time.isoformat())
+        query += " ORDER BY open_time ASC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        try:
+            with self._connection_scope() as connection:
+                rows = connection.execute(query, tuple(params)).fetchall()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Historical candle storage is unavailable.")
+            LOGGER.warning("Failed to read historical candles due to schema issue: %s", exc)
+            return []
+        return [
+            HistoricalCandleRecord(
+                symbol=row["symbol"],
+                interval=row["interval"],
+                open_time=datetime.fromisoformat(row["open_time"]),
+                close_time=datetime.fromisoformat(row["close_time"]),
+                open_price=_decimal(row["open_price"]),
+                high_price=_decimal(row["high_price"]),
+                low_price=_decimal(row["low_price"]),
+                close_price=_decimal(row["close_price"]),
+                volume=_decimal(row["volume"]),
+                quote_volume=_decimal(row["quote_volume"]),
+                trade_count=int(row["trade_count"]),
+                source=row["source"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def latest_historical_candle(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+    ) -> HistoricalCandleRecord | None:
+        """Return the latest persisted candle for one symbol and interval."""
+
+        query = """
+            SELECT symbol, interval, open_time, close_time, open_price, high_price, low_price,
+                   close_price, volume, quote_volume, trade_count, source, created_at
+            FROM historical_candles
+            WHERE symbol = ? AND interval = ?
+            ORDER BY open_time DESC
+            LIMIT 1
+        """
+        try:
+            with self._connection_scope() as connection:
+                row = connection.execute(query, (symbol.upper(), interval)).fetchone()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Historical candle storage is unavailable.")
+            LOGGER.warning("Failed to read latest historical candle due to schema issue: %s", exc)
+            return None
+        if row is None:
+            return None
+        return HistoricalCandleRecord(
+            symbol=row["symbol"],
+            interval=row["interval"],
+            open_time=datetime.fromisoformat(row["open_time"]),
+            close_time=datetime.fromisoformat(row["close_time"]),
+            open_price=_decimal(row["open_price"]),
+            high_price=_decimal(row["high_price"]),
+            low_price=_decimal(row["low_price"]),
+            close_price=_decimal(row["close_price"]),
+            volume=_decimal(row["volume"]),
+            quote_volume=_decimal(row["quote_volume"]),
+            trade_count=int(row["trade_count"]),
+            source=row["source"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
 
     def insert_ai_signal_snapshot(self, snapshot: AISignalSnapshot) -> bool:
         """Persist an AI advisory snapshot when it materially changed."""

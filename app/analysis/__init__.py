@@ -11,6 +11,7 @@ from app.analysis.market_sentiment import (
     MarketSentimentSnapshot,
 )
 from app.analysis.pattern_summary import PatternAnalysisSnapshot, PatternPricePoint
+from app.analysis.regime import RegimeAnalysisService, RegimeAnalysisSnapshot
 from app.analysis.symbol_sentiment import (
     SymbolSentimentService,
     SymbolSentimentSnapshot,
@@ -27,6 +28,8 @@ __all__ = [
     "MarketSentimentSnapshot",
     "PatternAnalysisSnapshot",
     "PatternPricePoint",
+    "RegimeAnalysisService",
+    "RegimeAnalysisSnapshot",
     "SUPPORTED_HORIZONS",
     "SymbolSentimentService",
     "SymbolSentimentSnapshot",

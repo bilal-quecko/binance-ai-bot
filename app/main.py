@@ -16,6 +16,7 @@ from app.exchange.binance_rest import BinanceRestClient
 from app.exchange.binance_ws import BinanceWebSocketClient
 from app.exchange.symbol_service import SpotSymbolService
 from app.monitoring.logging import configure_logging
+from app.services import HistoricalBackfillService
 from app.sentiment import SymbolSentimentService
 
 
@@ -28,13 +29,19 @@ async def lifespan(app: FastAPI):
     websocket_client = BinanceWebSocketClient(base_url=settings.binance_ws_url)
     symbol_service = SpotSymbolService(rest_client)
     symbol_sentiment_service = SymbolSentimentService()
+    backfill_service = HistoricalBackfillService(
+        rest_client=rest_client,
+        database_url=settings.database_url,
+    )
     bot_runtime = PaperBotRuntime(
         settings=settings,
         websocket_client=websocket_client,
     )
 
+    app.state.rest_client = rest_client
     app.state.symbol_service = symbol_service
     app.state.symbol_sentiment_service = symbol_sentiment_service
+    app.state.backfill_service = backfill_service
     app.state.bot_runtime = bot_runtime
 
     try:

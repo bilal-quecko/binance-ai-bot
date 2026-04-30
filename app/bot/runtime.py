@@ -572,6 +572,14 @@ class PaperBotRuntime:
             return []
         return self._runner.get_candle_history(normalized_symbol)
 
+    def top_of_book(self, symbol: str):
+        """Return the latest top-of-book snapshot for one symbol when available."""
+
+        normalized_symbol = symbol.strip().upper()
+        if not normalized_symbol or self._runner is None:
+            return None
+        return self._runner.get_top_of_book(normalized_symbol)
+
     def _build_ai_signal(
         self,
         symbol: str,
@@ -731,6 +739,10 @@ class PaperBotRuntime:
                 if self._storage_repository is not None:
                     try:
                         self._storage_repository.insert_market_candle_snapshot(snapshot.candle)
+                        self._storage_repository.upsert_historical_candles(
+                            [snapshot.candle],
+                            source="live_runtime",
+                        )
                         self._mark_persistence_ok()
                     except Exception:
                         self._storage_repository.record_persistence_warning(

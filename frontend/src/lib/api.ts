@@ -1,13 +1,16 @@
 ﻿import type {
+  AdaptiveRecommendationResponse,
   AIOutcomeEvaluationResponse,
   AISignalHistoryResponse,
   AISignalSummary,
   BotStatusResponse,
+  BackfillStatusResponse,
   CandleHistoryResponse,
   DrawdownResponse,
   EquityHistoryPoint,
   EquityResponse,
   EventItem,
+  EdgeReportResponse,
   FillItem,
   HealthResponse,
   HistoryFilters,
@@ -17,19 +20,26 @@
   PnlHistoryResponse,
   PerformanceAnalyticsResponse,
   PaperTradeReviewResponse,
+  ModuleAttributionResponse,
   ProfileCalibrationApplyResponse,
   ProfileCalibrationComparisonResponse,
   ProfileCalibrationResponse,
   PatternAnalysisResponse,
   FusionSignalResponse,
+  OpportunityResponse,
   PositionItem,
   TechnicalAnalysisResponse,
+  TradeEligibilityResponse,
+  TradingAssistantResponse,
   TradingProfile,
   TradeQualityResponse,
   ManualTradeResponse,
   WorkstationResponse,
   RangeFilters,
+  RegimeAnalysisResponse,
   SpotSymbolItem,
+  SignalValidationResponse,
+  SimilarSetupResponse,
   SymbolSummaryItem,
   SymbolSentimentResponse,
   TradeItem,
@@ -117,6 +127,51 @@ export function getTradeQualityAnalytics(
   params.set('limit', '5');
   params.set('offset', '0');
   return requestJson<TradeQualityResponse>('/performance/trade-quality', params);
+}
+
+export function getSignalValidation(
+  symbol: string,
+  filters?: RangeFilters,
+): Promise<SignalValidationResponse> {
+  const params = buildRangeParams(filters);
+  params.set('symbol', symbol.trim().toUpperCase());
+  return requestJson<SignalValidationResponse>('/performance/signal-validation', params);
+}
+
+export function getEdgeReport(
+  symbol: string,
+  filters?: RangeFilters,
+): Promise<EdgeReportResponse> {
+  const params = buildRangeParams(filters);
+  params.set('symbol', symbol.trim().toUpperCase());
+  return requestJson<EdgeReportResponse>('/performance/edge-report', params);
+}
+
+export function getModuleAttribution(
+  symbol: string,
+  filters?: RangeFilters,
+): Promise<ModuleAttributionResponse> {
+  const params = buildRangeParams(filters);
+  params.set('symbol', symbol.trim().toUpperCase());
+  return requestJson<ModuleAttributionResponse>('/performance/module-attribution', params);
+}
+
+export function getSimilarSetups(
+  symbol: string,
+  filters?: RangeFilters,
+): Promise<SimilarSetupResponse> {
+  const params = buildRangeParams(filters);
+  params.set('symbol', symbol.trim().toUpperCase());
+  return requestJson<SimilarSetupResponse>('/performance/similar-setups', params);
+}
+
+export function getAdaptiveRecommendations(
+  symbol: string,
+  filters?: RangeFilters,
+): Promise<AdaptiveRecommendationResponse> {
+  const params = buildRangeParams(filters);
+  params.set('symbol', symbol.trim().toUpperCase());
+  return requestJson<AdaptiveRecommendationResponse>('/performance/adaptive-recommendations', params);
 }
 
 export function getPaperTradeReview(
@@ -211,6 +266,16 @@ export function getCandles(
   return requestJson<CandleHistoryResponse>('/bot/candles', params);
 }
 
+export function getBackfillStatus(symbol: string): Promise<BackfillStatusResponse> {
+  const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
+  return requestJson<BackfillStatusResponse>('/bot/backfill-status', params);
+}
+
+export function triggerBackfill(symbol: string): Promise<BackfillStatusResponse> {
+  const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
+  return requestJson<BackfillStatusResponse>('/bot/backfill', params, { method: 'POST' });
+}
+
 export function getTechnicalAnalysis(symbol: string): Promise<TechnicalAnalysisResponse> {
   const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
   return requestJson<TechnicalAnalysisResponse>('/bot/technical-analysis', params);
@@ -227,6 +292,17 @@ export function getPatternAnalysis(
   return requestJson<PatternAnalysisResponse>('/bot/pattern-analysis', params);
 }
 
+export function getRegimeAnalysis(
+  symbol: string,
+  horizon: string,
+): Promise<RegimeAnalysisResponse> {
+  const params = new URLSearchParams({
+    symbol: symbol.trim().toUpperCase(),
+    horizon: horizon.trim().toLowerCase(),
+  });
+  return requestJson<RegimeAnalysisResponse>('/bot/regime-analysis', params);
+}
+
 export function getMarketSentiment(symbol: string): Promise<MarketSentimentResponse> {
   const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
   return requestJson<MarketSentimentResponse>('/bot/market-sentiment', params);
@@ -240,6 +316,24 @@ export function getSymbolSentiment(symbol: string): Promise<SymbolSentimentRespo
 export function getFusionSignal(symbol: string): Promise<FusionSignalResponse> {
   const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
   return requestJson<FusionSignalResponse>('/bot/fusion-signal', params);
+}
+
+export function getTradingAssistant(symbol: string): Promise<TradingAssistantResponse> {
+  const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
+  return requestJson<TradingAssistantResponse>('/bot/trading-assistant', params);
+}
+
+export function getTradeEligibility(symbol: string, horizon?: string): Promise<TradeEligibilityResponse> {
+  const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
+  if (horizon) {
+    params.set('horizon', horizon.trim().toLowerCase());
+  }
+  return requestJson<TradeEligibilityResponse>('/bot/trade-eligibility', params);
+}
+
+export function getOpportunities(limit = 20): Promise<OpportunityResponse[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  return requestJson<OpportunityResponse[]>('/bot/opportunities', params);
 }
 
 export function getAISignal(symbol: string): Promise<AISignalSummary | null> {

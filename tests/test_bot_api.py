@@ -10,6 +10,7 @@ from app.ai.models import AIFeatureVector, AISignalSnapshot
 from fastapi.testclient import TestClient
 
 from app.api.bot_api import (
+    get_backfill_service,
     get_bot_runtime,
     get_settings_dependency,
     get_symbol_sentiment_service,
@@ -71,6 +72,32 @@ class FakeSymbolSentimentService:
             source_mode='proxy',
             components=(),
         )
+
+
+class FakeBackfillService:
+    def __init__(self) -> None:
+        self.ensure_calls = 0
+        self.status_calls = 0
+
+    async def ensure_recent_history(self, *, symbol: str, interval: str = '1m', lookback_days: int = 7, force: bool = False):
+        self.ensure_calls += 1
+        return self.status(symbol=symbol, interval=interval, lookback_days=lookback_days)
+
+    def status(self, *, symbol: str, interval: str = '1m', lookback_days: int = 7):
+        self.status_calls += 1
+        return type('Status', (), {
+            'symbol': symbol,
+            'requested_interval': interval,
+            'requested_lookback_days': lookback_days,
+            'available_from': datetime(2024, 3, 2, 16, 0, tzinfo=UTC),
+            'available_to': datetime(2024, 3, 9, 16, 0, tzinfo=UTC),
+            'candle_count': 10080,
+            'coverage_pct': Decimal('100'),
+            'status': 'ready',
+            'message': f'Historical {interval} candles are ready for {symbol}.',
+            'last_backfilled_at': datetime(2024, 3, 9, 16, 0, tzinfo=UTC),
+            'effective_interval': interval,
+        })()
 
 
 class FakeRuntime:
@@ -217,6 +244,16 @@ class FakeRuntime:
                 )
             )
         return candles
+
+    def top_of_book(self, symbol: str):
+        return TopOfBook(
+            symbol=symbol,
+            bid_price=Decimal('100.4'),
+            bid_quantity=Decimal('2'),
+            ask_price=Decimal('100.6'),
+            ask_quantity=Decimal('3'),
+            event_time=datetime(2024, 3, 9, 16, 2, tzinfo=UTC),
+        )
 
     def technical_analysis(self, symbol: str) -> TechnicalAnalysisSnapshot | None:
         snapshot_time = datetime(2024, 3, 9, 16, 2, tzinfo=UTC)
@@ -391,6 +428,69 @@ class NeutralRuntime(FakeRuntime):
             last_cycle_result=None,
             total_pnl=Decimal('0'),
             realized_pnl=Decimal('0'),
+        )
+
+
+class ManualCloseClearedRuntime(FakeRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.state = BotStatus(
+            state='paused',
+            mode='paused',
+            symbol='BTCUSDT',
+            timeframe='1m',
+            session_id='session-btcusdt',
+        )
+        self.has_position = False
+
+    async def manual_buy_market(self, symbol: str):
+        self.has_position = True
+        return await super().manual_buy_market(symbol)
+
+    async def manual_close_position(self, symbol: str):
+        if not self.has_position:
+            return ManualTradeResult(
+                symbol=symbol,
+                action='close_position',
+                requested_side='SELL',
+                status='rejected',
+                message='No open paper position exists for BTCUSDT.',
+                reason_codes=('NO_POSITION_TO_EXIT',),
+                current_position=None,
+                current_pnl=Decimal('0'),
+            )
+        self.has_position = False
+        return await super().manual_close_position(symbol)
+
+    def workstation_state(self, symbol: str) -> WorkstationState:
+        state = super().workstation_state(symbol)
+        if self.has_position:
+            return state
+        return WorkstationState(
+            symbol=state.symbol,
+            is_runtime_symbol=state.is_runtime_symbol,
+            market_snapshot=state.market_snapshot,
+            feature_snapshot=state.feature_snapshot,
+            ai_signal=state.ai_signal,
+            trade_readiness=TradeReadiness(
+                selected_symbol=symbol,
+                runtime_active=True,
+                mode=self.state.mode,
+                enough_candle_history=True,
+                deterministic_entry_signal=False,
+                deterministic_exit_signal=False,
+                risk_ready=False,
+                risk_blocked=False,
+                broker_ready=True,
+                next_action='wait',
+                reason_if_not_trading='No open paper position is active.',
+            ),
+            entry_signal=state.entry_signal,
+            exit_signal=state.exit_signal,
+            current_position=None,
+            last_cycle_result=state.last_cycle_result,
+            total_pnl=Decimal('1.25'),
+            realized_pnl=Decimal('1.25'),
         )
 
 
@@ -850,6 +950,89 @@ def test_manual_paper_trade_endpoints_return_friendly_results() -> None:
     assert close_response.status_code == 200
     assert close_response.json()['status'] == 'executed'
     assert close_response.json()['message'] == 'Manual paper close executed.'
+    assert close_response.json()['current_position_quantity'] == '0'
+    assert close_response.json()['current_position_open'] is False
+
+
+def test_manual_close_clears_position_and_workstation_stays_readable() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    fake_runtime = ManualCloseClearedRuntime()
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_bot_runtime] = lambda: fake_runtime
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    client = TestClient(app)
+
+    try:
+        buy_response = client.post('/bot/manual-buy', json={'symbol': 'BTCUSDT'})
+        close_response = client.post('/bot/manual-close', json={'symbol': 'BTCUSDT'})
+        workstation_response = client.get('/bot/workstation', params={'symbol': 'BTCUSDT'})
+        readiness = workstation_response.json()['trade_readiness']
+        status_response = client.get('/bot/status')
+    finally:
+        app.dependency_overrides.clear()
+
+    assert buy_response.status_code == 200
+    assert buy_response.json()['current_position_open'] is True
+    assert close_response.status_code == 200
+    assert close_response.json()['status'] == 'executed'
+    assert close_response.json()['current_position_quantity'] == '0'
+    assert close_response.json()['current_position_open'] is False
+    assert workstation_response.status_code == 200
+    assert workstation_response.json()['current_position'] is None
+    assert readiness['next_action'] == 'wait'
+    assert readiness['broker_ready'] is True
+    assert status_response.status_code == 200
+    assert status_response.json()['state'] == 'paused'
+    assert status_response.json()['symbol'] == 'BTCUSDT'
+
+
+def test_manual_close_without_open_position_returns_stable_rejection() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    fake_runtime = ManualCloseClearedRuntime()
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_bot_runtime] = lambda: fake_runtime
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    client = TestClient(app)
+
+    try:
+        close_response = client.post('/bot/manual-close', json={'symbol': 'BTCUSDT'})
+        workstation_response = client.get('/bot/workstation', params={'symbol': 'BTCUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert close_response.status_code == 200
+    assert close_response.json()['status'] == 'rejected'
+    assert close_response.json()['reason_codes'] == ['NO_POSITION_TO_EXIT']
+    assert close_response.json()['current_position_quantity'] == '0'
+    assert close_response.json()['current_position_open'] is False
+    assert workstation_response.status_code == 200
+    assert workstation_response.json()['current_position'] is None
+
+
+def test_manual_trade_endpoint_failure_returns_stable_rejection() -> None:
+    class FailingManualRuntime(ManualCloseClearedRuntime):
+        async def manual_close_position(self, symbol: str):
+            raise RuntimeError('simulated close failure')
+
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_bot_runtime] = lambda: FailingManualRuntime()
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    client = TestClient(app)
+
+    try:
+        close_response = client.post('/bot/manual-close', json={'symbol': 'BTCUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert close_response.status_code == 200
+    assert close_response.json()['status'] == 'rejected'
+    assert close_response.json()['reason_codes'] == ['MANUAL_TRADE_FAILED']
+    assert close_response.json()['current_position_quantity'] == '0'
+    assert close_response.json()['current_position_open'] is False
 
 
 def test_runtime_status_remains_stable_across_repeated_reads() -> None:
@@ -1102,20 +1285,20 @@ def test_workstation_endpoints_return_empty_states_without_runtime_data() -> Non
         'realized_pnl': '0',
     }
     assert technical_analysis_response.status_code == 200
-    assert technical_analysis_response.json()['data_state'] == 'waiting_for_runtime'
+    assert technical_analysis_response.json()['data_state'] == 'waiting_for_history'
     assert technical_analysis_response.json()['trend_direction'] is None
     assert pattern_analysis_response.status_code == 200
-    assert pattern_analysis_response.json()['data_state'] == 'waiting_for_history'
-    assert pattern_analysis_response.json()['overall_direction'] == 'bullish'
+    assert pattern_analysis_response.json()['data_state'] == 'waiting_for_runtime'
+    assert pattern_analysis_response.json()['overall_direction'] is None
     assert market_sentiment_response.status_code == 200
     assert market_sentiment_response.json()['data_state'] == 'ready'
     assert market_sentiment_response.json()['market_state'] == 'risk_on'
     assert symbol_sentiment_response.status_code == 200
-    assert symbol_sentiment_response.json()['data_state'] == 'waiting_for_runtime'
+    assert symbol_sentiment_response.json()['data_state'] == 'waiting_for_history'
     assert symbol_sentiment_response.json()['label'] == 'insufficient_data'
     assert symbol_sentiment_response.json()['components'] == []
     assert fusion_signal_response.status_code == 200
-    assert fusion_signal_response.json()['data_state'] == 'waiting_for_runtime'
+    assert fusion_signal_response.json()['data_state'] == 'waiting_for_history'
     assert fusion_signal_response.json()['final_signal'] == 'wait'
     assert ai_signal_response.status_code == 200
     assert ai_signal_response.json() is None
@@ -1370,7 +1553,7 @@ def test_reset_session_followed_by_workstation_read_stays_safe() -> None:
     assert workstation_response.json()['is_runtime_symbol'] is False
     assert workstation_response.json()['trade_readiness']['next_action'] == 'start_runtime'
     assert candles_response.status_code == 200
-    assert candles_response.json()['data_state'] == 'waiting_for_runtime'
+    assert candles_response.json()['data_state'] == 'waiting_for_history'
     assert ai_history_response.status_code == 200
     assert ai_history_response.json()['items'] == []
 
@@ -1575,3 +1758,110 @@ def test_workstation_endpoints_tolerate_old_sqlite_schema() -> None:
     assert ai_evaluation_response.status_code == 200
     assert ai_evaluation_response.json()['data_state'] == 'waiting_for_runtime'
     assert all(item['sample_size'] == 0 for item in ai_evaluation_response.json()['horizons'])
+
+
+def test_backfill_status_and_trading_assistant_endpoints_use_stored_history() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    repository = StorageRepository(settings.database_url)
+    base_time = datetime(2024, 3, 9, 12, 0, tzinfo=UTC)
+    candles = []
+    for index in range(90):
+        open_price = Decimal('100') + (Decimal(index) * Decimal('0.1'))
+        close_price = open_price + Decimal('0.05')
+        candles.append(
+            Candle(
+                symbol='BTCUSDT',
+                timeframe='1m',
+                open=open_price,
+                high=close_price + Decimal('0.1'),
+                low=open_price - Decimal('0.1'),
+                close=close_price,
+                volume=Decimal('10') + Decimal(index),
+                quote_volume=(Decimal('10') + Decimal(index)) * close_price,
+                open_time=base_time + timedelta(minutes=index),
+                close_time=base_time + timedelta(minutes=index, seconds=59),
+                event_time=base_time + timedelta(minutes=index, seconds=59),
+                trade_count=20 + index,
+                is_closed=True,
+            )
+        )
+    repository.upsert_historical_candles(candles, source='historical_rest')
+    repository.close()
+
+    fake_backfill_service = FakeBackfillService()
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_symbol_sentiment_service] = lambda: FakeSymbolSentimentService()
+    app.dependency_overrides[get_bot_runtime] = lambda: NeutralRuntime()
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_backfill_service] = lambda: fake_backfill_service
+    client = TestClient(app)
+
+    try:
+        backfill_response = client.get('/bot/backfill-status', params={'symbol': 'BTCUSDT'})
+        technical_response = client.get('/bot/technical-analysis', params={'symbol': 'BTCUSDT'})
+        assistant_response = client.get('/bot/trading-assistant', params={'symbol': 'BTCUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert backfill_response.status_code == 200
+    assert backfill_response.json()['status'] == 'ready'
+    assert technical_response.status_code == 200
+    assert technical_response.json()['data_state'] == 'ready'
+    assert assistant_response.status_code == 200
+    assert assistant_response.json()['symbol'] == 'BTCUSDT'
+    assert assistant_response.json()['backfill_status']['status'] == 'ready'
+    assert assistant_response.json()['decision'] in {'buy', 'wait', 'avoid', 'sell_exit'}
+    assert fake_backfill_service.ensure_calls == 0
+    assert fake_backfill_service.status_calls >= 2
+
+
+def test_candle_and_opportunity_endpoints_can_read_stored_history() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    repository = StorageRepository(settings.database_url)
+    base_time = datetime(2024, 3, 9, 10, 0, tzinfo=UTC)
+    for symbol, step in (('BTCUSDT', Decimal('2.0')), ('ETHUSDT', Decimal('0.6'))):
+        candles = []
+        for index in range(120):
+            open_price = Decimal('100') + (Decimal(index) * step)
+            close_price = open_price + (step / Decimal('4'))
+            candles.append(
+                Candle(
+                    symbol=symbol,
+                    timeframe='1m',
+                    open=open_price,
+                    high=close_price + Decimal('0.12'),
+                    low=open_price - Decimal('0.08'),
+                    close=close_price,
+                    volume=Decimal('20') + Decimal(index),
+                    quote_volume=(Decimal('20') + Decimal(index)) * close_price,
+                    open_time=base_time + timedelta(minutes=index),
+                    close_time=base_time + timedelta(minutes=index, seconds=59),
+                    event_time=base_time + timedelta(minutes=index, seconds=59),
+                    trade_count=40 + index,
+                    is_closed=True,
+                )
+            )
+        repository.upsert_historical_candles(candles, source='historical_rest')
+    repository.close()
+
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_bot_runtime] = lambda: NeutralRuntime()
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_backfill_service] = lambda: FakeBackfillService()
+    client = TestClient(app)
+
+    try:
+        candle_response = client.get('/bot/candles', params={'symbol': 'BTCUSDT', 'timeframe': '15m', 'limit': 20})
+        opportunity_response = client.get('/bot/opportunities', params={'limit': 5})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert candle_response.status_code == 200
+    assert candle_response.json()['candles']
+    assert candle_response.json()['data_state'] == 'ready'
+    assert opportunity_response.status_code == 200
+    items = opportunity_response.json()
+    assert len(items) >= 1
+    assert {'symbol', 'score', 'suggested_action', 'reason', 'data_state'} <= set(items[0].keys())

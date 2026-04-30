@@ -119,6 +119,31 @@ class BinanceRestClient:
             raise ValueError("Expected Binance 24h ticker response to be a list.")
         return [item for item in payload if isinstance(item, dict)]
 
+    async def get_klines(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 1_000,
+    ) -> list[list[Any]]:
+        """Fetch Binance Spot klines for one symbol and interval."""
+
+        params: dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "limit": min(max(limit, 1), 1_000),
+        }
+        if start_time_ms is not None:
+            params["startTime"] = start_time_ms
+        if end_time_ms is not None:
+            params["endTime"] = end_time_ms
+        payload = await self._request("GET", "/api/v3/klines", params=params)
+        if not isinstance(payload, list):
+            raise ValueError("Expected Binance klines response to be a list.")
+        return [row for row in payload if isinstance(row, list)]
+
     async def get_account_info(self) -> AccountInfo:
         """Fetch Binance Spot account information via a signed request."""
 

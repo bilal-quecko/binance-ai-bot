@@ -482,3 +482,272 @@ Chronological implementation checkpoints for Binance AI Bot.
   - full backend test suite: passed
   - Ruff lint: passed
   - frontend production build: passed
+
+## No. 25 - Historical Backfill, Beginner Trading View, and Opportunity Scanner Foundation
+
+- Status: Completed
+- Tasks Completed:
+  - added Binance REST historical kline backfill with paginated 7-day `1m` candle fetching and a deterministic `5m` fallback path when `1m` backfill is unavailable
+  - persisted full OHLCV candle history locally with upsert-by-`symbol + interval + open_time` and reused that stored history across charting and analysis
+  - updated symbol-scoped technical analysis, pattern analysis, AI advisory, fusion, charting, and proxy sentiment to prefer stored candles and merge live runtime candles on top when available
+  - added symbol-scoped backfill status and trigger endpoints, a beginner `Trading Assistant` decision endpoint, and an `Opportunities` scanner endpoint for USDT Spot symbols
+  - added Signal-tab workstation sections for `Trading Assistant` and `Best Opportunities Right Now` without removing the existing advanced modules
+- Files Updated:
+  - `app/api/bot_api.py`
+  - `app/bot/runtime.py`
+  - `app/data/historical_candles.py`
+  - `app/exchange/binance_rest.py`
+  - `app/main.py`
+  - `app/runner/strategy_runner.py`
+  - `app/services/__init__.py`
+  - `app/services/backfill_service.py`
+  - `app/storage/candle_repository.py`
+  - `app/storage/db.py`
+  - `app/storage/models.py`
+  - `app/storage/repositories.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/OpportunityScannerSection.tsx`
+  - `frontend/src/components/TradingAssistantSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_bot_api.py`
+  - `tests/test_historical_backfill.py`
+- Notes:
+  - 7-day backfill uses `1m` candles first and only falls back to `5m` if `1m` backfill fails, so higher chart timeframes can be derived while staying within a controlled request budget
+  - stored candles are kept separate from the older close-only outcome table so historical OHLCV can support charting and analysis without breaking existing evaluation paths
+  - the new `Trading Assistant` is intentionally simpler than the advanced sections and maps fusion + technical context into `buy / sell_exit / wait / avoid`
+  - the opportunity scanner is advisory-only and currently ranks symbols from available stored/live history without auto-trading or bypassing the deterministic risk path
+
+## No. 26 - Workstation Performance Consolidation
+
+- Status: Completed
+- Tasks Completed:
+  - split selected-symbol workstation refreshes from heavier auto-trade analytics so the Signal tab no longer waits on performance, review, and calibration panels
+  - stopped re-triggering historical backfill from every workstation refresh and limited automatic backfill kicks to symbol selection and runtime start flows
+  - reduced duplicate backend recomputation by reusing shared per-request candle history, technical analysis, market sentiment, and symbol sentiment when building fusion and trading-assistant responses
+  - removed opportunity-scanner refreshes from the main workstation refresh loop so scanner work no longer blocks symbol-first workstation reads
+- Files Updated:
+  - `app/api/bot_api.py`
+  - `frontend/src/App.tsx`
+  - `tests/test_bot_api.py`
+  - `PROGRESS.md`
+- Notes:
+  - this checkpoint realigns the workstation with the symbol-first workflow described in `AGENTS.md` and the staged platform direction in `ROADMAP.md`
+  - `Trading Assistant` now reads current backfill status without implicitly starting a fresh backfill task on every request
+  - fusion still remains advisory-only, but now reuses precomputed request context instead of rebuilding overlapping analysis inputs multiple times inside the same API request
+
+## No. 27 - Profitability Validation, Signal Truth Testing, and Edge Discovery Loop
+
+- Status: Completed
+- Tasks Completed:
+  - added persisted signal-validation snapshots for the selected-symbol trading-assistant path, including final action, fusion signal, confidence, edge, risk grade, horizon, technical/sentiment/pattern/AI context, reasons, warnings, invalidation hint, trade-opened state, ignored/blocked state, and blocker reasons
+  - added deterministic forward-outcome evaluation at `5m`, `15m`, `1h`, `4h`, and `24h` using stored OHLCV candles where available
+  - added signal-quality analytics for total/actionable/blocked samples, win rate, expectancy, favorable/adverse move, false positives, false breakouts, confidence calibration, action/risk/confidence/symbol grouping, blocker effectiveness, and module attribution
+  - added honest edge-discovery reports with `insufficient_data` behavior and deterministic suggestions only when measured evidence exists
+  - added `/performance/signal-validation`, `/performance/edge-report`, and `/performance/module-attribution` with symbol/date/action/horizon/risk/confidence filters
+  - added an Auto Trade `Signal Validation & Edge Report` section showing sample size, horizon performance, best/worst symbols, confidence and risk-grade performance, useful/noisy reasons, blocker effectiveness, module attribution, and measured tuning suggestions
+- Files Updated:
+  - `app/api/bot_api.py`
+  - `app/api/dashboard_api.py`
+  - `app/api/dependencies.py`
+  - `app/monitoring/signal_validation.py`
+  - `app/storage/db.py`
+  - `app/storage/models.py`
+  - `app/storage/repositories.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/SignalValidationSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_signal_validation.py`
+  - `PROGRESS.md`
+- Validation:
+  - targeted backend tests: `tests/test_signal_validation.py` passed
+  - dashboard/storage regression tests: `tests/test_dashboard_api.py tests/test_storage.py` passed
+  - bot API regression tests: `tests/test_bot_api.py` passed
+  - full backend suite: `130 passed`
+  - Ruff lint on touched Python paths: passed
+  - frontend production build: passed
+- Notes:
+  - no live trading, futures support, or AI trade placement was added
+  - profitability conclusions are not fabricated; reports return `insufficient_data` until enough evaluated directional outcomes exist
+  - suggestions are report-only and are not auto-applied to paper profiles or execution logic
+
+## No. 28.1 - Adaptive Edge Engine: Regime Detection Engine
+
+- Status: Completed
+- Tasks Completed:
+  - added a deterministic selected-symbol regime engine that classifies current conditions as `trending_up`, `trending_down`, `sideways`, `high_volatility`, `low_liquidity`, `choppy`, `breakout_building`, or `reversal_risk`
+  - combined stored/live candles, technical analysis, pattern analysis, volatility, recent candle behavior, quote volume, spread, and order-book imbalance where available
+  - returned regime label, confidence, supporting evidence, risk warnings, preferred trading behavior, and avoid conditions without allowing the regime layer to place trades
+  - added `GET /bot/regime-analysis?symbol=...&horizon=...`
+  - added a Signal-tab `Regime Analysis` section with trader-readable evidence, behavior guidance, avoid conditions, and risk warnings
+- Files Updated:
+  - `app/analysis/__init__.py`
+  - `app/analysis/regime.py`
+  - `app/api/bot_api.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/RegimeAnalysisSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_regime_analysis.py`
+  - `PROGRESS.md`
+- Validation:
+  - targeted regime tests: `tests/test_regime_analysis.py` passed
+  - bot API regression tests: `tests/test_bot_api.py` passed
+  - Ruff lint on touched Python paths: passed
+  - frontend production build: passed
+- Evidence and Next Iteration:
+  - the bot can now classify the selected symbol's current market regime deterministically and explain why that classification was chosen
+  - this checkpoint does not yet prove which regimes are profitable; it only creates the regime label needed for measuring outcomes by condition
+  - the next logical checkpoint is 28.2, Similar Setup Outcome Engine, because stored signal-validation snapshots can now be matched against a regime label and comparable setup attributes
+
+## No. 28.2 - Adaptive Edge Engine: Similar Setup Outcome Engine
+
+- Status: Completed
+- Tasks Completed:
+  - added a deterministic similar-setup engine that compares the current or latest signal snapshot against historical signal-validation snapshots
+  - matched setups by symbol, action, confidence bucket, risk grade, regime label, preferred horizon, technical direction, sentiment direction, pattern behavior, and blocker state
+  - calculated matching sample size, win rate, expectancy, average favorable/adverse move, best horizon, reliability label, matched attributes, and an honest explanation
+  - returned `insufficient_data` when fewer than three evaluated directional outcomes exist instead of fabricating reliability
+  - added `GET /performance/similar-setups` with symbol/date/action/horizon/risk/confidence/regime/setup filters
+  - tagged newly persisted signal-validation snapshots with regime labels when Trading Assistant context can produce one
+  - integrated similar-setup output into Trading Assistant and the Auto Trade `Signal Validation & Edge Report` section
+- Files Updated:
+  - `app/api/bot_api.py`
+  - `app/api/dashboard_api.py`
+  - `app/monitoring/signal_validation.py`
+  - `app/monitoring/similar_setups.py`
+  - `app/storage/db.py`
+  - `app/storage/models.py`
+  - `app/storage/repositories.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/SignalValidationSection.tsx`
+  - `frontend/src/components/TradingAssistantSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_signal_validation.py`
+  - `tests/test_similar_setups.py`
+  - `PROGRESS.md`
+- Validation:
+  - targeted backend tests: `tests/test_similar_setups.py tests/test_signal_validation.py tests/test_bot_api.py tests/test_dashboard_api.py` passed
+  - Ruff lint on touched Python paths: passed
+  - frontend production build: passed
+- Evidence and Next Iteration:
+  - the bot can now answer whether similar historical setups worked, but reliability is still sample-size gated and depends on enough stored signal snapshots plus forward candles
+  - this checkpoint does not allow automation by itself; it only supplies evidence for advisory decisions
+  - the next logical checkpoint is 28.3, Evidence-Based Trade Eligibility Gate, because regime analysis, signal validation metrics, and similar-setup outcomes can now be combined into a paper-only eligibility recommendation
+
+## No. 28.3 - Adaptive Edge Engine: Evidence-Based Trade Eligibility Gate
+
+- Status: Completed
+- Tasks Completed:
+  - added an advisory-only trade eligibility evaluator that combines current fusion signal, Trading Assistant decision, regime analysis, similar-setup evidence, signal-validation metrics, blockers, risk grade, confidence, preferred horizon, and fee/slippage edge checks
+  - returned typed eligibility statuses: `eligible`, `not_eligible`, `watch_only`, and `insufficient_data`
+  - returned evidence strength, reason, required confirmations, minimum confidence threshold, preferred horizon, conditions to avoid, blocker summary, similar-setup summary, regime summary, fee/slippage summary, and warnings
+  - added `GET /bot/trade-eligibility?symbol=...&horizon=...`
+  - kept the gate report-only; it does not place trades, enable live trading, enable futures, or bypass existing paper-only safety controls
+  - added an Auto Trade `Trade Eligibility` section that refreshes with Auto Trade analytics instead of blocking the main Signal tab refresh
+- Files Updated:
+  - `app/api/bot_api.py`
+  - `app/monitoring/trade_eligibility.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/TradeEligibilitySection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_trade_eligibility.py`
+  - `PROGRESS.md`
+- Validation:
+  - focused eligibility tests: `tests/test_trade_eligibility.py` passed
+  - affected backend tests: `tests/test_trade_eligibility.py tests/test_similar_setups.py tests/test_signal_validation.py tests/test_bot_api.py tests/test_dashboard_api.py` passed
+  - Ruff lint on touched Python paths: passed
+  - frontend production build: passed
+- Evidence and Next Iteration:
+  - the bot can now say whether the current signal deserves paper automation consideration, but only as an advisory eligibility read
+  - the gate returns `insufficient_data` when similar setup evidence or validation samples are too weak, so it does not fabricate profitability
+  - the next logical checkpoint is 28.4, Adaptive Threshold Recommendation Engine, because eligibility decisions now expose which measured conditions should influence threshold recommendations
+
+## No. 28.4 - Adaptive Edge Engine: Adaptive Threshold Recommendation Engine
+
+- Status: Completed
+- Tasks Completed:
+  - added a deterministic adaptive recommendation engine that analyzes persisted signal-validation snapshots and forward outcomes
+  - generated evidence-based recommendations for confidence thresholds, regimes, horizons, symbols, action types, risk grades, confirmation requirements, and protective blockers
+  - returned `insufficient_data` when evaluated directional samples are too low and `keep_current_settings` when evidence does not justify a conservative change
+  - added `GET /performance/adaptive-recommendations` with symbol/date/horizon/action/regime/risk-grade filters
+  - added an Auto Trade `Adaptive Recommendations` section showing recommendation type, affected area, suggested change, evidence strength, sample size, expected benefit, warnings, and manual-review state
+  - preserved report-only behavior; recommendations are not auto-applied and do not enable live trading, futures, or AI execution
+- Files Updated:
+  - `app/api/dashboard_api.py`
+  - `app/monitoring/adaptive_recommendations.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/AdaptiveRecommendationsSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_adaptive_recommendations.py`
+  - `PROGRESS.md`
+- Endpoints Added:
+  - `GET /performance/adaptive-recommendations`
+- Validation:
+  - focused adaptive recommendation tests: `tests/test_adaptive_recommendations.py` passed
+  - relevant monitoring/dashboard tests: `tests/test_adaptive_recommendations.py tests/test_signal_validation.py tests/test_similar_setups.py tests/test_trade_eligibility.py tests/test_dashboard_api.py` passed
+  - bot API regression tests: `tests/test_bot_api.py` passed
+  - Ruff lint on touched Python paths: passed
+  - frontend production build: passed
+- What Is Now Possible:
+  - the bot can recommend paper-mode threshold and rule adjustments from measured signal outcomes instead of static intuition
+  - the operator can see whether evidence suggests raising minimum confidence, avoiding regimes, preferring horizons, restricting action types, tightening risk grades, or requiring confirmation
+  - every recommendation includes sample size, minimum sample requirement, evidence strength, warning text, and `do_not_auto_apply`
+- What Remains Unproven:
+  - recommendations are not yet manually queued or compared against adapted paper sessions
+  - the system has not proven that applying recommended settings improves future paper-trading performance
+  - regime-specific and blocker-specific recommendations still depend on enough persisted signal snapshots with forward candles
+- Evidence and Next Iteration:
+  - no live trading, futures support, AI trade placement, or auto-apply workflow was added
+  - the next logical checkpoint is 28.5, Manual Apply-and-Compare for Adaptive Settings, so an operator can manually queue recommendations for the next paper session and compare baseline versus adapted results
+
+## No. 29 - V1 Market Ready Signal Provider Release
+
+- Status: Completed
+- Tasks Completed:
+  - repositioned the frontend as an `AI-Assisted Binance Signal Intelligence Platform` with a polished V1 signal-provider landing view
+  - added a primary signal summary that surfaces selected symbol, current price, final BUY/WAIT/AVOID/EXIT signal, advisory confidence, best opportunity window, risk grade, trade eligibility, why the signal exists, invalidation point, market regime, similar-setup reliability, recommended action, and paper-mode status
+  - added explicit credibility messaging for Paper Mode, Advisory Only, No Guaranteed Profit, Data Driven Signals, and Historical Validation Enabled
+  - moved detailed technical, sentiment, pattern, AI advisory, fusion, signal validation, similar setup, trade eligibility, adaptive recommendation, performance, paper review, profile calibration, and diagnostics sections behind `Advanced Details - Pro` disclosures without removing their existing functionality
+  - added compact diagnostics inside advanced details covering runtime state, selected symbol, storage health, backfill state, latest signal timestamp, and paper position state
+  - added frontend error boundaries around the app shell, V1 signal summary, and advanced details so render failures show clear fallback cards instead of a black screen
+  - kept the manual paper controls, no-position state, symbol switching, refresh loops, backfill, and paper runtime controls intact
+- Files Updated:
+  - `frontend/src/App.tsx`
+  - `frontend/src/main.tsx`
+  - `frontend/src/index.css`
+  - `frontend/src/components/AdvancedDetailsPro.tsx`
+  - `frontend/src/components/DiagnosticsPanel.tsx`
+  - `frontend/src/components/ErrorBoundary.tsx`
+  - `frontend/src/components/V1SignalDashboard.tsx`
+  - `PROGRESS.md`
+- Tests Run:
+  - full backend suite: `.\.venv\Scripts\python.exe -m pytest` (`154 passed`)
+  - Ruff lint: `.\.venv\Scripts\python.exe -m ruff check app tests` passed
+  - frontend production build: `npm run build` passed
+- V1 Capabilities:
+  - the product can now be demoed from a simple, premium signal-provider screen instead of requiring clients to interpret every advanced module at once
+  - the main screen gives a trader-readable answer for what the platform thinks, why it thinks it, whether the evidence is strong enough, and what would invalidate the view
+  - advanced validation and analytics remain available for due diligence while the default experience stays beginner-friendly
+  - the UI clearly states that signals are advisory, paper-mode, historically validated when data exists, and not guaranteed to be profitable
+- V1 Limitations:
+  - V1 remains a paper-mode signal intelligence platform, not a live trading product
+  - futures support remains intentionally unimplemented
+  - AI remains advisory-only and cannot place trades
+  - signal reliability still depends on accumulated historical snapshots, forward outcomes, and sufficient sample sizes
+  - adaptive recommendations are still report-only and are not auto-applied
+- Why It Is Market Ready:
+  - the product now presents a focused commercial signal workflow with clear credibility labels, evidence-aware language, controlled advanced detail, diagnostics, and crash-safe UI fallbacks
+  - existing advanced engines are preserved for investor/client diligence while the primary screen communicates the core value quickly
+  - no fake profitability claims, live trading, futures, or autonomous AI execution were added
+- Post-Release UX Hardening:
+  - made Start, Stop, Pause/Resume, and manual paper actions release their loading lock immediately after the control endpoint returns instead of waiting for slower analytics refreshes
+  - split Signal-tab refresh into critical signal data first and advanced details second, so symbol, status, chart, regime, fusion, assistant, and eligibility update before deep analytics finish
+  - debounced symbol search to reduce repeated symbol-list requests while typing
+  - prevented recovered runtime symbols from being re-selected repeatedly after the operator clears or changes the symbol
+  - cleared stale selected-symbol signal state immediately when a new symbol is selected so ETH data does not remain visible while BNB is loading
+  - frontend production build after hardening: `npm run build` passed

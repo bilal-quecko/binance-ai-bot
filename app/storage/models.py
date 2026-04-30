@@ -183,6 +183,56 @@ class MarketCandleSnapshotRecord:
 
 
 @dataclass(slots=True)
+class SignalValidationSnapshotRecord:
+    """Persisted final signal and trading-assistant decision for validation."""
+
+    id: int | None
+    symbol: str
+    timestamp: datetime
+    price: Decimal
+    final_action: str
+    fusion_final_signal: str
+    confidence: int
+    expected_edge_pct: Decimal | None
+    estimated_cost_pct: Decimal | None
+    risk_grade: str
+    preferred_horizon: str
+    technical_score: Decimal | None
+    technical_context_json: str
+    sentiment_score: Decimal | None
+    sentiment_context_json: str
+    pattern_score: Decimal | None
+    pattern_context_json: str
+    ai_context_json: str
+    top_reasons: tuple[str, ...]
+    warnings: tuple[str, ...]
+    invalidation_hint: str | None
+    trade_opened: bool
+    signal_ignored_or_blocked: bool
+    blocker_reasons: tuple[str, ...]
+    regime_label: str | None = None
+
+
+@dataclass(slots=True)
+class HistoricalCandleRecord:
+    """Persisted full OHLCV candle history record."""
+
+    symbol: str
+    interval: str
+    open_time: datetime
+    close_time: datetime
+    open_price: Decimal
+    high_price: Decimal
+    low_price: Decimal
+    close_price: Decimal
+    volume: Decimal
+    quote_volume: Decimal
+    trade_count: int
+    source: str
+    created_at: datetime
+
+
+@dataclass(slots=True)
 class RuntimeSessionRecord:
     """Persisted backend-owned runtime session state."""
 

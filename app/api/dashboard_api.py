@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any
 
@@ -13,6 +13,11 @@ from pydantic import BaseModel, Field, model_validator
 
 from app.api.dependencies import DashboardDataAccess, get_dashboard_data_access
 from app.config import Settings, get_settings
+from app.monitoring.adaptive_recommendations import (
+    AdaptiveRecommendation,
+    AdaptiveRecommendationReport,
+    build_adaptive_recommendation_report,
+)
 from app.monitoring.metrics import build_performance_analytics
 from app.monitoring.outcome_review import (
     BlockerFrequency,
@@ -34,6 +39,25 @@ from app.monitoring.profile_calibration import (
     build_profile_calibration_comparison,
     build_profile_calibration_report,
     with_tuning_previews,
+)
+from app.monitoring.signal_validation import (
+    EdgeReport,
+    GroupPerformanceMetric,
+    HorizonQualityMetric,
+    ModuleAttributionReport,
+    ReasonPerformanceMetric,
+    SignalValidationReport,
+    VALIDATION_HORIZONS,
+    build_edge_report,
+    build_module_attribution_report,
+    build_signal_validation_report,
+)
+from app.monitoring.similar_setups import (
+    SimilarSetupDescriptor,
+    SimilarSetupHorizonMetric,
+    SimilarSetupReport,
+    build_similar_setup_report,
+    descriptor_from_snapshot,
 )
 from app.monitoring.trade_quality import (
     HoldTimeDistributionSummary,
@@ -304,6 +328,237 @@ class PerformanceAnalyticsResponse(BaseModel):
     symbol_realized_pnl: Decimal
     max_drawdown: Decimal
     current_drawdown: Decimal
+
+
+class SignalValidationQueryParams(BaseModel):
+    """Filters for signal validation and edge-discovery analytics."""
+
+    symbol: str | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    action: str | None = None
+    horizon: str | None = None
+    risk_grade: str | None = None
+    confidence_bucket: str | None = None
+
+    @model_validator(mode="after")
+    def validate_filters(self) -> "SignalValidationQueryParams":
+        """Validate signal-validation filters."""
+
+        if self.start_date is not None and self.end_date is not None and self.end_date < self.start_date:
+            raise ValueError("end_date must be greater than or equal to start_date")
+        if self.symbol is not None:
+            self.symbol = self.symbol.upper()
+        if self.action is not None and self.action not in {"buy", "sell_exit", "wait", "avoid"}:
+            raise ValueError("action must be one of buy, sell_exit, wait, avoid")
+        if self.horizon is not None and self.horizon not in VALIDATION_HORIZONS:
+            raise ValueError("horizon must be one of 5m, 15m, 1h, 4h, 24h")
+        if self.risk_grade is not None and self.risk_grade not in {"low", "medium", "high"}:
+            raise ValueError("risk_grade must be one of low, medium, high")
+        if self.confidence_bucket is not None and self.confidence_bucket not in {"low", "medium", "high"}:
+            raise ValueError("confidence_bucket must be one of low, medium, high")
+        return self
+
+
+class SimilarSetupQueryParams(BaseModel):
+    """Filters and current setup attributes for similar-setup analytics."""
+
+    symbol: str | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    action: str | None = None
+    horizon: str | None = None
+    confidence_bucket: str | None = None
+    risk_grade: str | None = None
+    regime_label: str | None = None
+    preferred_horizon: str | None = None
+    technical_direction: str | None = None
+    sentiment_direction: str | None = None
+    pattern_behavior: str | None = None
+    blocker_state: str | None = None
+
+    @model_validator(mode="after")
+    def validate_filters(self) -> "SimilarSetupQueryParams":
+        """Validate similar-setup filters."""
+
+        if self.start_date is not None and self.end_date is not None and self.end_date < self.start_date:
+            raise ValueError("end_date must be greater than or equal to start_date")
+        if self.symbol is not None:
+            self.symbol = self.symbol.upper()
+        if self.action is not None and self.action not in {"buy", "sell_exit", "wait", "avoid"}:
+            raise ValueError("action must be one of buy, sell_exit, wait, avoid")
+        if self.horizon is not None and self.horizon not in VALIDATION_HORIZONS:
+            raise ValueError("horizon must be one of 5m, 15m, 1h, 4h, 24h")
+        if self.confidence_bucket is not None and self.confidence_bucket not in {"low", "medium", "high"}:
+            raise ValueError("confidence_bucket must be one of low, medium, high")
+        if self.risk_grade is not None and self.risk_grade not in {"low", "medium", "high"}:
+            raise ValueError("risk_grade must be one of low, medium, high")
+        if self.blocker_state is not None and self.blocker_state not in {"clear", "blocked"}:
+            raise ValueError("blocker_state must be one of clear, blocked")
+        return self
+
+
+class AdaptiveRecommendationQueryParams(BaseModel):
+    """Filters for adaptive threshold recommendation analytics."""
+
+    symbol: str | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    horizon: str | None = None
+    action: str | None = None
+    regime: str | None = None
+    risk_grade: str | None = None
+
+    @model_validator(mode="after")
+    def validate_filters(self) -> "AdaptiveRecommendationQueryParams":
+        """Validate adaptive recommendation filters."""
+
+        if self.start_date is not None and self.end_date is not None and self.end_date < self.start_date:
+            raise ValueError("end_date must be greater than or equal to start_date")
+        if self.symbol is not None:
+            self.symbol = self.symbol.upper()
+        if self.horizon is not None and self.horizon not in VALIDATION_HORIZONS:
+            raise ValueError("horizon must be one of 5m, 15m, 1h, 4h, 24h")
+        if self.action is not None and self.action not in {"buy", "sell_exit", "wait", "avoid"}:
+            raise ValueError("action must be one of buy, sell_exit, wait, avoid")
+        if self.risk_grade is not None and self.risk_grade not in {"low", "medium", "high"}:
+            raise ValueError("risk_grade must be one of low, medium, high")
+        return self
+
+
+class HorizonQualityMetricResponse(BaseModel):
+    """Serialized quality metrics for one forward horizon."""
+
+    horizon: str
+    sample_size: int
+    actionable_sample_size: int
+    win_rate_pct: Decimal | None = None
+    expectancy_pct: Decimal | None = None
+    average_favorable_move_pct: Decimal | None = None
+    average_adverse_move_pct: Decimal | None = None
+    false_positive_rate_pct: Decimal | None = None
+    false_breakout_rate_pct: Decimal | None = None
+    winner_average_confidence: Decimal | None = None
+    loser_average_confidence: Decimal | None = None
+
+
+class GroupPerformanceMetricResponse(BaseModel):
+    """Serialized grouped validation metric."""
+
+    name: str
+    sample_size: int
+    win_rate_pct: Decimal | None = None
+    expectancy_pct: Decimal | None = None
+
+
+class ReasonPerformanceMetricResponse(BaseModel):
+    """Serialized reason/blocker validation metric."""
+
+    reason: str
+    sample_size: int
+    win_rate_pct: Decimal | None = None
+    expectancy_pct: Decimal | None = None
+
+
+class SignalValidationResponse(BaseModel):
+    """Signal validation analytics response."""
+
+    symbol: str | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    status: str
+    status_message: str | None = None
+    total_signals: int
+    actionable_signals: int
+    ignored_or_blocked_signals: int
+    horizons: list[HorizonQualityMetricResponse]
+    performance_by_action: list[GroupPerformanceMetricResponse]
+    performance_by_risk_grade: list[GroupPerformanceMetricResponse]
+    performance_by_confidence_bucket: list[GroupPerformanceMetricResponse]
+    performance_by_symbol: list[GroupPerformanceMetricResponse]
+
+
+class EdgeReportResponse(BaseModel):
+    """Evidence-based edge discovery response."""
+
+    symbol: str | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    status: str
+    status_message: str | None = None
+    useful_symbols: list[GroupPerformanceMetricResponse]
+    weak_symbols: list[GroupPerformanceMetricResponse]
+    best_horizons: list[HorizonQualityMetricResponse]
+    reliable_confidence_ranges: list[GroupPerformanceMetricResponse]
+    risk_grades_to_avoid: list[GroupPerformanceMetricResponse]
+    useful_reasons: list[ReasonPerformanceMetricResponse]
+    noisy_reasons: list[ReasonPerformanceMetricResponse]
+    protective_blockers: list[ReasonPerformanceMetricResponse]
+    noisy_modules: list[str]
+    suggestions: list[str]
+
+
+class ModuleAttributionResponse(BaseModel):
+    """Module-attribution response from measured signal outcomes."""
+
+    symbol: str | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    status: str
+    status_message: str | None = None
+    modules: list[GroupPerformanceMetricResponse]
+
+
+class SimilarSetupHorizonMetricResponse(BaseModel):
+    """Serialized similar-setup horizon outcome metrics."""
+
+    horizon: str
+    sample_size: int
+    win_rate_pct: Decimal | None = None
+    expectancy_pct: Decimal | None = None
+    average_favorable_move_pct: Decimal | None = None
+    average_adverse_move_pct: Decimal | None = None
+
+
+class SimilarSetupResponse(BaseModel):
+    """Similar historical setup outcome response."""
+
+    status: str
+    reliability_label: str
+    matching_sample_size: int
+    best_horizon: str | None = None
+    horizons: list[SimilarSetupHorizonMetricResponse]
+    explanation: str
+    matched_attributes: list[str]
+
+
+class AdaptiveRecommendationItemResponse(BaseModel):
+    """One adaptive threshold/rule recommendation."""
+
+    recommendation_id: str
+    recommendation_type: str
+    affected_scope: str
+    affected_value: str
+    current_observation: str
+    suggested_change: str
+    evidence_summary: str
+    expected_benefit: str
+    evidence_strength: str
+    sample_size: int
+    minimum_sample_required: int
+    warnings: list[str]
+    do_not_auto_apply: bool
+
+
+class AdaptiveRecommendationResponse(BaseModel):
+    """Adaptive threshold recommendation response."""
+
+    symbol: str | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    status: str
+    status_message: str | None = None
+    recommendations: list[AdaptiveRecommendationItemResponse]
 
 
 class TradeQualityQueryParams(BaseModel):
@@ -620,6 +875,129 @@ def _to_drawdown_response(record: DrawdownSummary) -> DrawdownResponse:
     )
 
 
+def _to_horizon_quality_response(record: HorizonQualityMetric) -> HorizonQualityMetricResponse:
+    """Convert horizon validation metrics into a response model."""
+
+    return HorizonQualityMetricResponse(**asdict(record))
+
+
+def _to_group_performance_response(record: GroupPerformanceMetric) -> GroupPerformanceMetricResponse:
+    """Convert grouped validation metrics into a response model."""
+
+    return GroupPerformanceMetricResponse(**asdict(record))
+
+
+def _to_reason_performance_response(record: ReasonPerformanceMetric) -> ReasonPerformanceMetricResponse:
+    """Convert reason validation metrics into a response model."""
+
+    return ReasonPerformanceMetricResponse(**asdict(record))
+
+
+def _to_signal_validation_response(report: SignalValidationReport) -> SignalValidationResponse:
+    """Convert signal-validation analytics into an API response."""
+
+    return SignalValidationResponse(
+        symbol=report.symbol,
+        start_date=report.start_date,
+        end_date=report.end_date,
+        status=report.status,
+        status_message=report.status_message,
+        total_signals=report.total_signals,
+        actionable_signals=report.actionable_signals,
+        ignored_or_blocked_signals=report.ignored_or_blocked_signals,
+        horizons=[_to_horizon_quality_response(item) for item in report.horizons],
+        performance_by_action=[_to_group_performance_response(item) for item in report.performance_by_action],
+        performance_by_risk_grade=[_to_group_performance_response(item) for item in report.performance_by_risk_grade],
+        performance_by_confidence_bucket=[
+            _to_group_performance_response(item) for item in report.performance_by_confidence_bucket
+        ],
+        performance_by_symbol=[_to_group_performance_response(item) for item in report.performance_by_symbol],
+    )
+
+
+def _to_edge_report_response(report: EdgeReport) -> EdgeReportResponse:
+    """Convert edge-discovery analytics into an API response."""
+
+    return EdgeReportResponse(
+        symbol=report.symbol,
+        start_date=report.start_date,
+        end_date=report.end_date,
+        status=report.status,
+        status_message=report.status_message,
+        useful_symbols=[_to_group_performance_response(item) for item in report.useful_symbols],
+        weak_symbols=[_to_group_performance_response(item) for item in report.weak_symbols],
+        best_horizons=[_to_horizon_quality_response(item) for item in report.best_horizons],
+        reliable_confidence_ranges=[
+            _to_group_performance_response(item) for item in report.reliable_confidence_ranges
+        ],
+        risk_grades_to_avoid=[_to_group_performance_response(item) for item in report.risk_grades_to_avoid],
+        useful_reasons=[_to_reason_performance_response(item) for item in report.useful_reasons],
+        noisy_reasons=[_to_reason_performance_response(item) for item in report.noisy_reasons],
+        protective_blockers=[_to_reason_performance_response(item) for item in report.protective_blockers],
+        noisy_modules=report.noisy_modules,
+        suggestions=report.suggestions,
+    )
+
+
+def _to_module_attribution_response(report: ModuleAttributionReport) -> ModuleAttributionResponse:
+    """Convert module-attribution analytics into an API response."""
+
+    return ModuleAttributionResponse(
+        symbol=report.symbol,
+        start_date=report.start_date,
+        end_date=report.end_date,
+        status=report.status,
+        status_message=report.status_message,
+        modules=[_to_group_performance_response(item) for item in report.modules],
+    )
+
+
+def _to_similar_setup_horizon_response(record: SimilarSetupHorizonMetric) -> SimilarSetupHorizonMetricResponse:
+    """Convert similar-setup horizon metrics into a response model."""
+
+    return SimilarSetupHorizonMetricResponse(**asdict(record))
+
+
+def _to_similar_setup_response(report: SimilarSetupReport) -> SimilarSetupResponse:
+    """Convert similar-setup analytics into an API response."""
+
+    return SimilarSetupResponse(
+        status=report.status,
+        reliability_label=report.reliability_label,
+        matching_sample_size=report.matching_sample_size,
+        best_horizon=report.best_horizon,
+        horizons=[_to_similar_setup_horizon_response(item) for item in report.horizons],
+        explanation=report.explanation,
+        matched_attributes=report.matched_attributes,
+    )
+
+
+def _to_adaptive_recommendation_item_response(
+    record: AdaptiveRecommendation,
+) -> AdaptiveRecommendationItemResponse:
+    """Convert one adaptive recommendation into an API response."""
+
+    return AdaptiveRecommendationItemResponse(**asdict(record))
+
+
+def _to_adaptive_recommendation_response(
+    report: AdaptiveRecommendationReport,
+) -> AdaptiveRecommendationResponse:
+    """Convert adaptive recommendations into an API response."""
+
+    return AdaptiveRecommendationResponse(
+        symbol=report.symbol,
+        start_date=report.start_date,
+        end_date=report.end_date,
+        status=report.status,
+        status_message=report.status_message,
+        recommendations=[
+            _to_adaptive_recommendation_item_response(item)
+            for item in report.recommendations
+        ],
+    )
+
+
 def _to_hold_time_distribution_response(record: HoldTimeDistributionSummary) -> HoldTimeDistributionResponse:
     """Convert a hold-time summary into a response model."""
 
@@ -863,6 +1241,151 @@ def _build_metrics(trades: list[TradeRecord], latest_pnl: PnlSnapshotRecord | No
     )
 
 
+def _signal_validation_inputs(
+    query: SignalValidationQueryParams,
+    data_access: DashboardDataAccess,
+):
+    """Load signal snapshots and forward candles for validation endpoints."""
+
+    snapshots = data_access.get_signal_validation_snapshots(
+        symbol=query.symbol,
+        start_date=query.start_date,
+        end_date=query.end_date,
+        action=query.action,
+        risk_grade=query.risk_grade,
+        confidence_bucket=query.confidence_bucket,
+    )
+    candles_by_symbol = {}
+    for symbol in sorted({snapshot.symbol for snapshot in snapshots}):
+        symbol_snapshots = [snapshot for snapshot in snapshots if snapshot.symbol == symbol]
+        start_time = min(snapshot.timestamp for snapshot in symbol_snapshots)
+        end_time = max(snapshot.timestamp for snapshot in symbol_snapshots) + timedelta(hours=25)
+        candles_by_symbol[symbol] = data_access.get_historical_candles(
+            symbol=symbol,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    return snapshots, candles_by_symbol
+
+
+def _similar_setup_inputs(
+    query: SimilarSetupQueryParams,
+    data_access: DashboardDataAccess,
+) -> tuple[SimilarSetupDescriptor | None, list, dict, int | None]:
+    """Load current setup, historical snapshots, and candles for similar-setup analytics."""
+
+    snapshots = data_access.get_signal_validation_snapshots(
+        symbol=None,
+        start_date=query.start_date,
+        end_date=query.end_date,
+    )
+    exclude_snapshot_id = None
+    current_setup = _current_setup_from_query(query)
+    if current_setup is None or _uses_latest_snapshot_for_current_setup(query):
+        latest_candidates = [
+            snapshot
+            for snapshot in snapshots
+            if query.symbol is None or snapshot.symbol == query.symbol
+        ]
+        if latest_candidates:
+            latest_snapshot = latest_candidates[-1]
+            current_setup = descriptor_from_snapshot(latest_snapshot)
+            exclude_snapshot_id = latest_snapshot.id
+    candles_by_symbol = {}
+    for symbol in sorted({snapshot.symbol for snapshot in snapshots}):
+        symbol_snapshots = [snapshot for snapshot in snapshots if snapshot.symbol == symbol]
+        if not symbol_snapshots:
+            continue
+        start_time = min(snapshot.timestamp for snapshot in symbol_snapshots)
+        end_time = max(snapshot.timestamp for snapshot in symbol_snapshots) + timedelta(hours=25)
+        candles_by_symbol[symbol] = data_access.get_historical_candles(
+            symbol=symbol,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    return current_setup, snapshots, candles_by_symbol, exclude_snapshot_id
+
+
+def _adaptive_recommendation_inputs(
+    query: AdaptiveRecommendationQueryParams,
+    data_access: DashboardDataAccess,
+):
+    """Load signal snapshots and candles for adaptive recommendation analytics."""
+
+    snapshots = data_access.get_signal_validation_snapshots(
+        symbol=query.symbol,
+        start_date=query.start_date,
+        end_date=query.end_date,
+        action=query.action,
+        risk_grade=query.risk_grade,
+    )
+    if query.regime is not None:
+        snapshots = [snapshot for snapshot in snapshots if snapshot.regime_label == query.regime]
+    candles_by_symbol = {}
+    for symbol in sorted({snapshot.symbol for snapshot in snapshots}):
+        symbol_snapshots = [snapshot for snapshot in snapshots if snapshot.symbol == symbol]
+        if not symbol_snapshots:
+            continue
+        start_time = min(snapshot.timestamp for snapshot in symbol_snapshots)
+        end_time = max(snapshot.timestamp for snapshot in symbol_snapshots) + timedelta(hours=25)
+        candles_by_symbol[symbol] = data_access.get_historical_candles(
+            symbol=symbol,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    return snapshots, candles_by_symbol
+
+
+def _uses_latest_snapshot_for_current_setup(query: SimilarSetupQueryParams) -> bool:
+    """Return true when the query only scopes the current setup instead of describing it."""
+
+    return all(
+        value is None
+        for value in (
+            query.action,
+            query.confidence_bucket,
+            query.risk_grade,
+            query.regime_label,
+            query.preferred_horizon,
+            query.technical_direction,
+            query.sentiment_direction,
+            query.pattern_behavior,
+            query.blocker_state,
+        )
+    )
+
+
+def _current_setup_from_query(query: SimilarSetupQueryParams) -> SimilarSetupDescriptor | None:
+    """Build a current setup descriptor from explicit query attributes."""
+
+    values = (
+        query.symbol,
+        query.action,
+        query.confidence_bucket,
+        query.risk_grade,
+        query.regime_label,
+        query.preferred_horizon,
+        query.technical_direction,
+        query.sentiment_direction,
+        query.pattern_behavior,
+        query.blocker_state,
+    )
+    if all(value is None for value in values):
+        return None
+    return SimilarSetupDescriptor(
+        symbol=query.symbol,
+        action=query.action,
+        confidence_bucket=query.confidence_bucket,
+        risk_grade=query.risk_grade,
+        regime_label=query.regime_label,
+        preferred_horizon=query.preferred_horizon,
+        technical_direction=query.technical_direction,
+        sentiment_direction=query.sentiment_direction,
+        pattern_behavior=query.pattern_behavior,
+        blocker_state=query.blocker_state,
+    )
+
+
 @router.get("/health", response_model=HealthResponse)
 def get_health() -> HealthResponse:
     """Return API health for paper-mode monitoring."""
@@ -1037,6 +1560,121 @@ def get_metrics(
     trades = data_access.get_all_trades()
     latest_pnl = data_access.get_latest_equity()
     return _build_metrics(trades, latest_pnl)
+
+
+@router.get("/performance/signal-validation", response_model=SignalValidationResponse)
+def get_signal_validation(
+    query: Annotated[SignalValidationQueryParams, Depends()],
+    data_access: Annotated[DashboardDataAccess, Depends(get_dashboard_data_access)],
+) -> SignalValidationResponse:
+    """Return evidence-based signal validation metrics."""
+
+    snapshots, candles_by_symbol = _signal_validation_inputs(query, data_access)
+    return _to_signal_validation_response(
+        build_signal_validation_report(
+            snapshots=snapshots,
+            candles_by_symbol=candles_by_symbol,
+            symbol=query.symbol,
+            start_date=query.start_date,
+            end_date=query.end_date,
+            horizon=query.horizon,
+        )
+    )
+
+
+@router.get("/performance/edge-report", response_model=EdgeReportResponse)
+def get_edge_report(
+    query: Annotated[SignalValidationQueryParams, Depends()],
+    data_access: Annotated[DashboardDataAccess, Depends(get_dashboard_data_access)],
+) -> EdgeReportResponse:
+    """Return measured edge-discovery findings and deterministic suggestions."""
+
+    snapshots, candles_by_symbol = _signal_validation_inputs(query, data_access)
+    return _to_edge_report_response(
+        build_edge_report(
+            snapshots=snapshots,
+            candles_by_symbol=candles_by_symbol,
+            symbol=query.symbol,
+            start_date=query.start_date,
+            end_date=query.end_date,
+            horizon=query.horizon,
+        )
+    )
+
+
+@router.get("/performance/module-attribution", response_model=ModuleAttributionResponse)
+def get_module_attribution(
+    query: Annotated[SignalValidationQueryParams, Depends()],
+    data_access: Annotated[DashboardDataAccess, Depends(get_dashboard_data_access)],
+) -> ModuleAttributionResponse:
+    """Return module-attribution metrics from measured signal outcomes."""
+
+    snapshots, candles_by_symbol = _signal_validation_inputs(query, data_access)
+    return _to_module_attribution_response(
+        build_module_attribution_report(
+            snapshots=snapshots,
+            candles_by_symbol=candles_by_symbol,
+            symbol=query.symbol,
+            start_date=query.start_date,
+            end_date=query.end_date,
+            horizon=query.horizon,
+        )
+    )
+
+
+@router.get("/performance/similar-setups", response_model=SimilarSetupResponse)
+def get_similar_setups(
+    query: Annotated[SimilarSetupQueryParams, Depends()],
+    data_access: Annotated[DashboardDataAccess, Depends(get_dashboard_data_access)],
+) -> SimilarSetupResponse:
+    """Return measured outcomes for historically similar signal setups."""
+
+    current_setup, snapshots, candles_by_symbol, exclude_snapshot_id = _similar_setup_inputs(
+        query,
+        data_access,
+    )
+    if current_setup is None:
+        return SimilarSetupResponse(
+            status="insufficient_data",
+            reliability_label="insufficient_data",
+            matching_sample_size=0,
+            best_horizon=None,
+            horizons=[],
+            explanation="No current or latest setup is available for similar-setup matching.",
+            matched_attributes=[],
+        )
+    return _to_similar_setup_response(
+        build_similar_setup_report(
+            current_setup=current_setup,
+            snapshots=snapshots,
+            candles_by_symbol=candles_by_symbol,
+            exclude_snapshot_id=exclude_snapshot_id,
+            horizon=query.horizon,
+        )
+    )
+
+
+@router.get("/performance/adaptive-recommendations", response_model=AdaptiveRecommendationResponse)
+def get_adaptive_recommendations(
+    query: Annotated[AdaptiveRecommendationQueryParams, Depends()],
+    data_access: Annotated[DashboardDataAccess, Depends(get_dashboard_data_access)],
+) -> AdaptiveRecommendationResponse:
+    """Return deterministic adaptive threshold and rule recommendations."""
+
+    snapshots, candles_by_symbol = _adaptive_recommendation_inputs(query, data_access)
+    return _to_adaptive_recommendation_response(
+        build_adaptive_recommendation_report(
+            snapshots=snapshots,
+            candles_by_symbol=candles_by_symbol,
+            symbol=query.symbol,
+            start_date=query.start_date,
+            end_date=query.end_date,
+            horizon=query.horizon,
+            action=query.action,
+            regime=query.regime,
+            risk_grade=query.risk_grade,
+        )
+    )
 
 
 @router.get("/performance", response_model=PerformanceAnalyticsResponse)

@@ -3,41 +3,61 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AIEvaluationCard } from './components/AIEvaluationCard';
 import { AIHistorySection } from './components/AIHistorySection';
 import { AIAdvisorySection } from './components/AIAdvisorySection';
+import { AdvancedDetailsPro } from './components/AdvancedDetailsPro';
+import { AdaptiveRecommendationsSection } from './components/AdaptiveRecommendationsSection';
 import { AutoRefreshSelector } from './components/AutoRefreshSelector';
 import { BotControlPanel } from './components/BotControlPanel';
 import { DataStateIndicator } from './components/DataStateIndicator';
+import { DiagnosticsPanel } from './components/DiagnosticsPanel';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { FusionSignalSection } from './components/FusionSignalSection';
 import { MarketSentimentSection } from './components/MarketSentimentSection';
 import { MetricCard } from './components/MetricCard';
+import { OpportunityScannerSection } from './components/OpportunityScannerSection';
 import { PaperTradeReviewSection } from './components/PaperTradeReviewSection';
 import { PerformanceAnalyticsSection } from './components/PerformanceAnalyticsSection';
 import { PatternAnalysisSection } from './components/PatternAnalysisSection';
 import { PersistenceHealthCard } from './components/PersistenceHealthCard';
 import { ProfileCalibrationSection } from './components/ProfileCalibrationSection';
+import { RegimeAnalysisSection } from './components/RegimeAnalysisSection';
 import { SectionCard } from './components/SectionCard';
+import { SignalValidationSection } from './components/SignalValidationSection';
 import { StatePanel } from './components/StatePanel';
 import { SymbolSentimentSection } from './components/SymbolSentimentSection';
 import { TechnicalAnalysisSection } from './components/TechnicalAnalysisSection';
+import { TradeEligibilitySection } from './components/TradeEligibilitySection';
+import { TradingAssistantSection } from './components/TradingAssistantSection';
 import { TradeReadinessPanel } from './components/TradeReadinessPanel';
 import { TradeQualitySection } from './components/TradeQualitySection';
+import { V1SignalDashboard } from './components/V1SignalDashboard';
 import {
   getAISignalEvaluation,
   getAISignal,
   getAISignalHistory,
+  getAdaptiveRecommendations,
+  getBackfillStatus,
   getBotStatus,
   getCandles,
   getFusionSignal,
   getHealth,
+  getEdgeReport,
   getMarketSentiment,
+  getModuleAttribution,
+  getOpportunities,
   getPatternAnalysis,
   getPaperTradeReview,
   getPerformanceAnalytics,
+  getRegimeAnalysis,
+  getSignalValidation,
   getProfileCalibrationComparison,
   getProfileCalibration,
+  getSimilarSetups,
   getSymbolSentiment,
   getTechnicalAnalysis,
+  getTradeEligibility,
   getTradeQualityAnalytics,
   getSymbols,
+  getTradingAssistant,
   getWorkstation,
   manualBuyMarket,
   manualClosePosition,
@@ -47,19 +67,26 @@ import {
   resumeBot,
   startBot,
   stopBot,
+  triggerBackfill,
 } from './lib/api';
 import { badgeTone, classNames, formatCurrency, formatDateTime, formatDecimal, formatReasonCodes, pnlTone } from './lib/format';
 import type {
   AIOutcomeEvaluationResponse,
   AISignalHistoryResponse,
   AISignalSummary,
+  AdaptiveRecommendationResponse,
   AutoRefreshIntervalSeconds,
+  BackfillStatusResponse,
   BotStatusResponse,
   CandleHistoryResponse,
   ChartTimeframe,
+  EdgeReportResponse,
   HealthResponse,
   FusionSignalResponse,
+  ModuleAttributionResponse,
   MarketSentimentResponse,
+  ManualTradeResponse,
+  OpportunityResponse,
   PatternAnalysisResponse,
   PatternHorizon,
   PaperTradeReviewResponse,
@@ -67,9 +94,14 @@ import type {
   ProfileCalibrationComparisonResponse,
   PerformanceAnalyticsResponse,
   ProfileCalibrationResponse,
+  RegimeAnalysisResponse,
+  SignalValidationResponse,
+  SimilarSetupResponse,
   SpotSymbolItem,
   SymbolSentimentResponse,
   TechnicalAnalysisResponse,
+  TradeEligibilityResponse,
+  TradingAssistantResponse,
   TradingProfile,
   TradeQualityResponse,
   WorkstationResponse,
@@ -80,6 +112,11 @@ interface RemoteState<T> {
   loading: boolean;
   refreshing: boolean;
   error: string | null;
+}
+
+interface WorkspaceRefreshOptions {
+  includeSignal?: boolean;
+  includeAutoTrade?: boolean;
 }
 
 type WorkstationTab = 'signal' | 'auto-trade';
@@ -120,16 +157,26 @@ const INITIAL_AI_HISTORY: AISignalHistoryResponse = {
 };
 const INITIAL_AI_EVALUATION: AIOutcomeEvaluationResponse | null = null;
 const INITIAL_CANDLES: CandleHistoryResponse | null = null;
+const INITIAL_BACKFILL_STATUS: BackfillStatusResponse | null = null;
 const INITIAL_TECHNICAL_ANALYSIS: TechnicalAnalysisResponse | null = null;
 const INITIAL_MARKET_SENTIMENT: MarketSentimentResponse | null = null;
 const INITIAL_SYMBOL_SENTIMENT: SymbolSentimentResponse | null = null;
 const INITIAL_PATTERN_ANALYSIS: PatternAnalysisResponse | null = null;
+const INITIAL_REGIME_ANALYSIS: RegimeAnalysisResponse | null = null;
 const INITIAL_FUSION_SIGNAL: FusionSignalResponse | null = null;
+const INITIAL_TRADING_ASSISTANT: TradingAssistantResponse | null = null;
+const INITIAL_OPPORTUNITIES: OpportunityResponse[] = [];
 const INITIAL_PERFORMANCE: PerformanceAnalyticsResponse | null = null;
 const INITIAL_TRADE_QUALITY: TradeQualityResponse | null = null;
 const INITIAL_PAPER_REVIEW: PaperTradeReviewResponse | null = null;
 const INITIAL_PROFILE_CALIBRATION: ProfileCalibrationResponse | null = null;
 const INITIAL_PROFILE_CALIBRATION_COMPARISON: ProfileCalibrationComparisonResponse | null = null;
+const INITIAL_SIGNAL_VALIDATION: SignalValidationResponse | null = null;
+const INITIAL_EDGE_REPORT: EdgeReportResponse | null = null;
+const INITIAL_MODULE_ATTRIBUTION: ModuleAttributionResponse | null = null;
+const INITIAL_SIMILAR_SETUPS: SimilarSetupResponse | null = null;
+const INITIAL_TRADE_ELIGIBILITY: TradeEligibilityResponse | null = null;
+const INITIAL_ADAPTIVE_RECOMMENDATIONS: AdaptiveRecommendationResponse | null = null;
 const AI_HISTORY_PAGE_SIZE = 3;
 
 function createRemoteState<T>(data: T): RemoteState<T> {
@@ -230,20 +277,31 @@ function App() {
   const [aiHistory, setAiHistory] = useState<RemoteState<AISignalHistoryResponse>>(createRemoteState(INITIAL_AI_HISTORY));
   const [aiEvaluation, setAiEvaluation] = useState<RemoteState<AIOutcomeEvaluationResponse | null>>(createRemoteState(INITIAL_AI_EVALUATION));
   const [candles, setCandles] = useState<RemoteState<CandleHistoryResponse | null>>(createRemoteState(INITIAL_CANDLES));
+  const [backfillStatus, setBackfillStatus] = useState<RemoteState<BackfillStatusResponse | null>>(createRemoteState(INITIAL_BACKFILL_STATUS));
   const [technicalAnalysis, setTechnicalAnalysis] = useState<RemoteState<TechnicalAnalysisResponse | null>>(createRemoteState(INITIAL_TECHNICAL_ANALYSIS));
   const [marketSentiment, setMarketSentiment] = useState<RemoteState<MarketSentimentResponse | null>>(createRemoteState(INITIAL_MARKET_SENTIMENT));
   const [symbolSentiment, setSymbolSentiment] = useState<RemoteState<SymbolSentimentResponse | null>>(createRemoteState(INITIAL_SYMBOL_SENTIMENT));
   const [patternAnalysis, setPatternAnalysis] = useState<RemoteState<PatternAnalysisResponse | null>>(createRemoteState(INITIAL_PATTERN_ANALYSIS));
+  const [regimeAnalysis, setRegimeAnalysis] = useState<RemoteState<RegimeAnalysisResponse | null>>(createRemoteState(INITIAL_REGIME_ANALYSIS));
   const [fusionSignal, setFusionSignal] = useState<RemoteState<FusionSignalResponse | null>>(createRemoteState(INITIAL_FUSION_SIGNAL));
+  const [tradingAssistant, setTradingAssistant] = useState<RemoteState<TradingAssistantResponse | null>>(createRemoteState(INITIAL_TRADING_ASSISTANT));
+  const [opportunities, setOpportunities] = useState<RemoteState<OpportunityResponse[]>>(createRemoteState(INITIAL_OPPORTUNITIES));
   const [performanceAnalytics, setPerformanceAnalytics] = useState<RemoteState<PerformanceAnalyticsResponse | null>>(createRemoteState(INITIAL_PERFORMANCE));
   const [tradeQualityAnalytics, setTradeQualityAnalytics] = useState<RemoteState<TradeQualityResponse | null>>(createRemoteState(INITIAL_TRADE_QUALITY));
   const [paperTradeReview, setPaperTradeReview] = useState<RemoteState<PaperTradeReviewResponse | null>>(createRemoteState(INITIAL_PAPER_REVIEW));
   const [profileCalibration, setProfileCalibration] = useState<RemoteState<ProfileCalibrationResponse | null>>(createRemoteState(INITIAL_PROFILE_CALIBRATION));
   const [profileCalibrationComparison, setProfileCalibrationComparison] = useState<RemoteState<ProfileCalibrationComparisonResponse | null>>(createRemoteState(INITIAL_PROFILE_CALIBRATION_COMPARISON));
+  const [signalValidation, setSignalValidation] = useState<RemoteState<SignalValidationResponse | null>>(createRemoteState(INITIAL_SIGNAL_VALIDATION));
+  const [edgeReport, setEdgeReport] = useState<RemoteState<EdgeReportResponse | null>>(createRemoteState(INITIAL_EDGE_REPORT));
+  const [moduleAttribution, setModuleAttribution] = useState<RemoteState<ModuleAttributionResponse | null>>(createRemoteState(INITIAL_MODULE_ATTRIBUTION));
+  const [similarSetups, setSimilarSetups] = useState<RemoteState<SimilarSetupResponse | null>>(createRemoteState(INITIAL_SIMILAR_SETUPS));
+  const [tradeEligibility, setTradeEligibility] = useState<RemoteState<TradeEligibilityResponse | null>>(createRemoteState(INITIAL_TRADE_ELIGIBILITY));
+  const [adaptiveRecommendations, setAdaptiveRecommendations] = useState<RemoteState<AdaptiveRecommendationResponse | null>>(createRemoteState(INITIAL_ADAPTIVE_RECOMMENDATIONS));
   const [symbolResults, setSymbolResults] = useState<RemoteState<SpotSymbolItem[]>>(createRemoteState<SpotSymbolItem[]>([]));
 
   const [selectedSymbol, setSelectedSymbol] = useState('');
   const [symbolSearch, setSymbolSearch] = useState('');
+  const [hasAdoptedRuntimeSymbol, setHasAdoptedRuntimeSymbol] = useState(false);
   const [selectedPatternHorizon, setSelectedPatternHorizon] = useState<PatternHorizon>('7d');
   const [selectedChartTimeframe, setSelectedChartTimeframe] = useState<ChartTimeframe>('1m');
   const [selectedTradingProfile, setSelectedTradingProfile] = useState<TradingProfile>('balanced');
@@ -264,136 +322,296 @@ function App() {
     }
   }, []);
 
-  const refreshWorkspace = useCallback(async (symbol: string) => {
+  const refreshOpportunities = useCallback(async () => {
+    setOpportunities((current) => setPending(current));
+    try {
+      const opportunityData = await getOpportunities(10);
+      setOpportunities({ data: opportunityData, loading: false, refreshing: false, error: null });
+      setLastUpdatedAt(new Date());
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to refresh opportunity rankings.';
+      setOpportunities((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+    }
+  }, []);
+
+  const refreshWorkspace = useCallback(async (
+    symbol: string,
+    options: WorkspaceRefreshOptions = {},
+  ) => {
+    const includeSignal = options.includeSignal ?? true;
+    const includeAutoTrade = options.includeAutoTrade ?? false;
     const requestedSymbol = symbol.trim().toUpperCase();
     setHealth((current) => setPending(current));
     setBotStatus((current) => setPending(current));
-    setWorkstation((current) => setPending(current));
-    setAiSignal((current) => setPending(current));
-    setAiHistory((current) => setPending(current));
-    setAiEvaluation((current) => setPending(current));
-    setCandles((current) => setPending(current));
-    setTechnicalAnalysis((current) => setPending(current));
-    setMarketSentiment((current) => setPending(current));
-    setSymbolSentiment((current) => setPending(current));
-    setPatternAnalysis((current) => setPending(current));
-    setFusionSignal((current) => setPending(current));
-    setPerformanceAnalytics((current) => setPending(current));
-    setTradeQualityAnalytics((current) => setPending(current));
-    setPaperTradeReview((current) => setPending(current));
-    setProfileCalibration((current) => setPending(current));
-    setProfileCalibrationComparison((current) => setPending(current));
+    if (includeSignal) {
+      setWorkstation((current) => setPending(current));
+      setAiSignal((current) => setPending(current));
+      setAiHistory((current) => setPending(current));
+      setAiEvaluation((current) => setPending(current));
+      setCandles((current) => setPending(current));
+      setBackfillStatus((current) => setPending(current));
+      setTechnicalAnalysis((current) => setPending(current));
+      setMarketSentiment((current) => setPending(current));
+      setSymbolSentiment((current) => setPending(current));
+      setPatternAnalysis((current) => setPending(current));
+      setRegimeAnalysis((current) => setPending(current));
+      setFusionSignal((current) => setPending(current));
+      setTradingAssistant((current) => setPending(current));
+      setTradeEligibility((current) => setPending(current));
+    }
+    if (includeAutoTrade) {
+      setPerformanceAnalytics((current) => setPending(current));
+      setTradeQualityAnalytics((current) => setPending(current));
+      setPaperTradeReview((current) => setPending(current));
+      setProfileCalibration((current) => setPending(current));
+      setProfileCalibrationComparison((current) => setPending(current));
+      setSignalValidation((current) => setPending(current));
+      setEdgeReport((current) => setPending(current));
+      setModuleAttribution((current) => setPending(current));
+      setSimilarSetups((current) => setPending(current));
+      setTradeEligibility((current) => setPending(current));
+      setAdaptiveRecommendations((current) => setPending(current));
+    }
 
     try {
       const [healthData, botStatusData] = await Promise.all([getHealth(), getBotStatus()]);
       const resolvedSymbol = requestedSymbol || botStatusData.symbol || '';
-      if (!requestedSymbol && botStatusData.symbol) {
-        setSelectedSymbol(botStatusData.symbol);
-        setSymbolSearch(botStatusData.symbol);
-      }
-
-      const [
-        workstationData,
-        aiSignalData,
-        aiHistoryData,
-        aiEvaluationData,
-        candleData,
-        technicalAnalysisData,
-        marketSentimentData,
-        symbolSentimentData,
-        patternAnalysisData,
-        fusionSignalData,
-        performanceData,
-        tradeQualityData,
-        paperReviewData,
-        profileCalibrationData,
-        profileCalibrationComparisonData,
-      ] = await Promise.all([
-        resolvedSymbol ? getWorkstation(resolvedSymbol) : Promise.resolve<WorkstationResponse | null>(null),
-        resolvedSymbol ? getAISignal(resolvedSymbol) : Promise.resolve<AISignalSummary | null>(null),
-        resolvedSymbol
-          ? getAISignalHistory(resolvedSymbol, { limit: AI_HISTORY_PAGE_SIZE, offset: aiHistoryOffset })
-          : Promise.resolve<AISignalHistoryResponse>(INITIAL_AI_HISTORY),
-        resolvedSymbol ? getAISignalEvaluation(resolvedSymbol) : Promise.resolve<AIOutcomeEvaluationResponse | null>(null),
-        resolvedSymbol ? getCandles(resolvedSymbol, selectedChartTimeframe, 120) : Promise.resolve<CandleHistoryResponse | null>(null),
-        resolvedSymbol ? getTechnicalAnalysis(resolvedSymbol) : Promise.resolve<TechnicalAnalysisResponse | null>(null),
-        resolvedSymbol ? getMarketSentiment(resolvedSymbol) : Promise.resolve<MarketSentimentResponse | null>(null),
-        resolvedSymbol ? getSymbolSentiment(resolvedSymbol) : Promise.resolve<SymbolSentimentResponse | null>(null),
-        resolvedSymbol ? getPatternAnalysis(resolvedSymbol, selectedPatternHorizon) : Promise.resolve<PatternAnalysisResponse | null>(null),
-        resolvedSymbol ? getFusionSignal(resolvedSymbol) : Promise.resolve<FusionSignalResponse | null>(null),
-        resolvedSymbol ? getPerformanceAnalytics(resolvedSymbol) : Promise.resolve<PerformanceAnalyticsResponse | null>(null),
-        resolvedSymbol ? getTradeQualityAnalytics(resolvedSymbol) : Promise.resolve<TradeQualityResponse | null>(null),
-        resolvedSymbol ? getPaperTradeReview(resolvedSymbol) : Promise.resolve<PaperTradeReviewResponse | null>(null),
-        resolvedSymbol
-          ? getProfileCalibration(resolvedSymbol, { profile: selectedTradingProfile })
-          : Promise.resolve<ProfileCalibrationResponse | null>(null),
-        resolvedSymbol
-          ? getProfileCalibrationComparison(resolvedSymbol, selectedTradingProfile)
-          : Promise.resolve<ProfileCalibrationComparisonResponse | null>(null),
-      ]);
-
       setHealth({ data: healthData, loading: false, refreshing: false, error: null });
       setBotStatus({ data: botStatusData, loading: false, refreshing: false, error: null });
+      if (!hasAdoptedRuntimeSymbol && !requestedSymbol && !symbolSearch.trim() && botStatusData.symbol && botStatusData.state !== 'stopped') {
+        setSelectedSymbol(botStatusData.symbol);
+        setSymbolSearch(botStatusData.symbol);
+        setHasAdoptedRuntimeSymbol(true);
+      }
       if (botStatusData.state !== 'stopped') {
         setSelectedTradingProfile(botStatusData.trading_profile);
       }
-      setWorkstation({ data: workstationData, loading: false, refreshing: false, error: null });
-      setAiSignal({ data: aiSignalData, loading: false, refreshing: false, error: null });
-      setAiHistory({ data: aiHistoryData, loading: false, refreshing: false, error: null });
-      setAiEvaluation({ data: aiEvaluationData, loading: false, refreshing: false, error: null });
-      setCandles({ data: candleData, loading: false, refreshing: false, error: null });
-      setTechnicalAnalysis({ data: technicalAnalysisData, loading: false, refreshing: false, error: null });
-      setMarketSentiment({ data: marketSentimentData, loading: false, refreshing: false, error: null });
-      setSymbolSentiment({ data: symbolSentimentData, loading: false, refreshing: false, error: null });
-      setPatternAnalysis({ data: patternAnalysisData, loading: false, refreshing: false, error: null });
-      setFusionSignal({ data: fusionSignalData, loading: false, refreshing: false, error: null });
-      setPerformanceAnalytics({ data: performanceData, loading: false, refreshing: false, error: null });
-      setTradeQualityAnalytics({ data: tradeQualityData, loading: false, refreshing: false, error: null });
-      setPaperTradeReview({ data: paperReviewData, loading: false, refreshing: false, error: null });
-      setProfileCalibration({ data: profileCalibrationData, loading: false, refreshing: false, error: null });
-      setProfileCalibrationComparison({ data: profileCalibrationComparisonData, loading: false, refreshing: false, error: null });
+
+      let criticalSignalData:
+        | [
+            WorkstationResponse | null,
+            CandleHistoryResponse | null,
+            BackfillStatusResponse | null,
+            RegimeAnalysisResponse | null,
+            FusionSignalResponse | null,
+            TradingAssistantResponse | null,
+            TradeEligibilityResponse | null,
+          ]
+        | null = null;
+      let advancedSignalData:
+        | [
+            AISignalSummary | null,
+            AISignalHistoryResponse,
+            AIOutcomeEvaluationResponse | null,
+            TechnicalAnalysisResponse | null,
+            MarketSentimentResponse | null,
+            SymbolSentimentResponse | null,
+            PatternAnalysisResponse | null,
+          ]
+        | null = null;
+      if (includeSignal) {
+        criticalSignalData = await Promise.all([
+          resolvedSymbol ? getWorkstation(resolvedSymbol) : Promise.resolve<WorkstationResponse | null>(null),
+          resolvedSymbol ? getCandles(resolvedSymbol, selectedChartTimeframe, 120) : Promise.resolve<CandleHistoryResponse | null>(null),
+          resolvedSymbol ? getBackfillStatus(resolvedSymbol) : Promise.resolve<BackfillStatusResponse | null>(null),
+          resolvedSymbol ? getRegimeAnalysis(resolvedSymbol, selectedPatternHorizon) : Promise.resolve<RegimeAnalysisResponse | null>(null),
+          resolvedSymbol ? getFusionSignal(resolvedSymbol) : Promise.resolve<FusionSignalResponse | null>(null),
+          resolvedSymbol ? getTradingAssistant(resolvedSymbol) : Promise.resolve<TradingAssistantResponse | null>(null),
+          resolvedSymbol ? getTradeEligibility(resolvedSymbol) : Promise.resolve<TradeEligibilityResponse | null>(null),
+        ]);
+        const [
+          workstationData,
+          candleData,
+          backfillStatusData,
+          regimeAnalysisData,
+          fusionSignalData,
+          tradingAssistantData,
+          tradeEligibilityData,
+        ] = criticalSignalData;
+        setWorkstation({ data: workstationData, loading: false, refreshing: false, error: null });
+        setCandles({ data: candleData, loading: false, refreshing: false, error: null });
+        setBackfillStatus({ data: backfillStatusData, loading: false, refreshing: false, error: null });
+        setRegimeAnalysis({ data: regimeAnalysisData, loading: false, refreshing: false, error: null });
+        setFusionSignal({ data: fusionSignalData, loading: false, refreshing: false, error: null });
+        setTradingAssistant({ data: tradingAssistantData, loading: false, refreshing: false, error: null });
+        setTradeEligibility({ data: tradeEligibilityData, loading: false, refreshing: false, error: null });
+
+        advancedSignalData = await Promise.all([
+          resolvedSymbol ? getAISignal(resolvedSymbol) : Promise.resolve<AISignalSummary | null>(null),
+          resolvedSymbol
+            ? getAISignalHistory(resolvedSymbol, { limit: AI_HISTORY_PAGE_SIZE, offset: aiHistoryOffset })
+            : Promise.resolve<AISignalHistoryResponse>(INITIAL_AI_HISTORY),
+          resolvedSymbol ? getAISignalEvaluation(resolvedSymbol) : Promise.resolve<AIOutcomeEvaluationResponse | null>(null),
+          resolvedSymbol ? getTechnicalAnalysis(resolvedSymbol) : Promise.resolve<TechnicalAnalysisResponse | null>(null),
+          resolvedSymbol ? getMarketSentiment(resolvedSymbol) : Promise.resolve<MarketSentimentResponse | null>(null),
+          resolvedSymbol ? getSymbolSentiment(resolvedSymbol) : Promise.resolve<SymbolSentimentResponse | null>(null),
+          resolvedSymbol ? getPatternAnalysis(resolvedSymbol, selectedPatternHorizon) : Promise.resolve<PatternAnalysisResponse | null>(null),
+        ]);
+      }
+      let autoTradeData:
+        | [
+            PerformanceAnalyticsResponse | null,
+            TradeQualityResponse | null,
+            PaperTradeReviewResponse | null,
+            ProfileCalibrationResponse | null,
+            ProfileCalibrationComparisonResponse | null,
+            SignalValidationResponse | null,
+            EdgeReportResponse | null,
+            ModuleAttributionResponse | null,
+            SimilarSetupResponse | null,
+            TradeEligibilityResponse | null,
+            AdaptiveRecommendationResponse | null,
+          ]
+        | null = null;
+      if (includeAutoTrade) {
+        autoTradeData = await Promise.all([
+          resolvedSymbol ? getPerformanceAnalytics(resolvedSymbol) : Promise.resolve<PerformanceAnalyticsResponse | null>(null),
+          resolvedSymbol ? getTradeQualityAnalytics(resolvedSymbol) : Promise.resolve<TradeQualityResponse | null>(null),
+          resolvedSymbol ? getPaperTradeReview(resolvedSymbol) : Promise.resolve<PaperTradeReviewResponse | null>(null),
+          resolvedSymbol
+            ? getProfileCalibration(resolvedSymbol, { profile: selectedTradingProfile })
+            : Promise.resolve<ProfileCalibrationResponse | null>(null),
+          resolvedSymbol
+            ? getProfileCalibrationComparison(resolvedSymbol, selectedTradingProfile)
+            : Promise.resolve<ProfileCalibrationComparisonResponse | null>(null),
+          resolvedSymbol ? getSignalValidation(resolvedSymbol) : Promise.resolve<SignalValidationResponse | null>(null),
+          resolvedSymbol ? getEdgeReport(resolvedSymbol) : Promise.resolve<EdgeReportResponse | null>(null),
+          resolvedSymbol ? getModuleAttribution(resolvedSymbol) : Promise.resolve<ModuleAttributionResponse | null>(null),
+          resolvedSymbol ? getSimilarSetups(resolvedSymbol) : Promise.resolve<SimilarSetupResponse | null>(null),
+          resolvedSymbol ? getTradeEligibility(resolvedSymbol) : Promise.resolve<TradeEligibilityResponse | null>(null),
+          resolvedSymbol ? getAdaptiveRecommendations(resolvedSymbol) : Promise.resolve<AdaptiveRecommendationResponse | null>(null),
+        ]);
+      }
+
+      if (advancedSignalData !== null) {
+        const [
+          aiSignalData,
+          aiHistoryData,
+          aiEvaluationData,
+          technicalAnalysisData,
+          marketSentimentData,
+          symbolSentimentData,
+          patternAnalysisData,
+        ] = advancedSignalData;
+        setAiSignal({ data: aiSignalData, loading: false, refreshing: false, error: null });
+        setAiHistory({ data: aiHistoryData, loading: false, refreshing: false, error: null });
+        setAiEvaluation({ data: aiEvaluationData, loading: false, refreshing: false, error: null });
+        setTechnicalAnalysis({ data: technicalAnalysisData, loading: false, refreshing: false, error: null });
+        setMarketSentiment({ data: marketSentimentData, loading: false, refreshing: false, error: null });
+        setSymbolSentiment({ data: symbolSentimentData, loading: false, refreshing: false, error: null });
+        setPatternAnalysis({ data: patternAnalysisData, loading: false, refreshing: false, error: null });
+      }
+      if (autoTradeData !== null) {
+        const [
+          performanceData,
+          tradeQualityData,
+          paperReviewData,
+          profileCalibrationData,
+          profileCalibrationComparisonData,
+          signalValidationData,
+          edgeReportData,
+          moduleAttributionData,
+          similarSetupsData,
+          tradeEligibilityData,
+          adaptiveRecommendationData,
+        ] = autoTradeData;
+        setPerformanceAnalytics({ data: performanceData, loading: false, refreshing: false, error: null });
+        setTradeQualityAnalytics({ data: tradeQualityData, loading: false, refreshing: false, error: null });
+        setPaperTradeReview({ data: paperReviewData, loading: false, refreshing: false, error: null });
+        setProfileCalibration({ data: profileCalibrationData, loading: false, refreshing: false, error: null });
+        setProfileCalibrationComparison({ data: profileCalibrationComparisonData, loading: false, refreshing: false, error: null });
+        setSignalValidation({ data: signalValidationData, loading: false, refreshing: false, error: null });
+        setEdgeReport({ data: edgeReportData, loading: false, refreshing: false, error: null });
+        setModuleAttribution({ data: moduleAttributionData, loading: false, refreshing: false, error: null });
+        setSimilarSetups({ data: similarSetupsData, loading: false, refreshing: false, error: null });
+        setTradeEligibility({ data: tradeEligibilityData, loading: false, refreshing: false, error: null });
+        setAdaptiveRecommendations({ data: adaptiveRecommendationData, loading: false, refreshing: false, error: null });
+      }
       setLastUpdatedAt(new Date());
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to refresh workstation state.';
       setHealth((current) => ({ ...current, loading: false, refreshing: false, error: message }));
       setBotStatus((current) => ({ ...current, loading: false, refreshing: false, error: message }));
-      if (symbol.trim().length > 0) {
+      if (includeSignal && symbol.trim().length > 0) {
         setWorkstation((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setAiSignal((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setAiHistory((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setAiEvaluation((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setCandles((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setBackfillStatus((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setTechnicalAnalysis((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setMarketSentiment((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setSymbolSentiment((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setPatternAnalysis((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setRegimeAnalysis((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setFusionSignal((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setTradingAssistant((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setTradeEligibility((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+      }
+      if (includeAutoTrade && symbol.trim().length > 0) {
         setPerformanceAnalytics((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setTradeQualityAnalytics((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setPaperTradeReview((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setProfileCalibration((current) => ({ ...current, loading: false, refreshing: false, error: message }));
         setProfileCalibrationComparison((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setSignalValidation((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setEdgeReport((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setModuleAttribution((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setSimilarSetups((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setTradeEligibility((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+        setAdaptiveRecommendations((current) => ({ ...current, loading: false, refreshing: false, error: message }));
       }
     }
-  }, [aiHistoryOffset, selectedChartTimeframe, selectedPatternHorizon, selectedTradingProfile]);
+  }, [aiHistoryOffset, hasAdoptedRuntimeSymbol, selectedChartTimeframe, selectedPatternHorizon, selectedTradingProfile, symbolSearch]);
 
   useEffect(() => {
-    void loadSymbols(symbolSearch);
+    const timeoutId = window.setTimeout(() => {
+      void loadSymbols(symbolSearch);
+    }, 250);
+    return () => window.clearTimeout(timeoutId);
   }, [loadSymbols, symbolSearch]);
 
   useEffect(() => {
-    void refreshWorkspace(selectedSymbol);
+    void refreshWorkspace(selectedSymbol, { includeSignal: true, includeAutoTrade: false });
   }, [refreshWorkspace, selectedSymbol]);
+
+  useEffect(() => {
+    if (tab !== 'auto-trade' || selectedSymbol.trim().length === 0) {
+      return;
+    }
+    void refreshWorkspace(selectedSymbol, { includeSignal: false, includeAutoTrade: true });
+  }, [refreshWorkspace, selectedSymbol, tab]);
+
+  useEffect(() => {
+    void refreshOpportunities();
+  }, [refreshOpportunities]);
+
+  useEffect(() => {
+    const symbol = selectedSymbol.trim();
+    if (!symbol) {
+      return;
+    }
+    setBackfillStatus((current) => setPending(current));
+    void triggerBackfill(symbol)
+      .then((status) => {
+        setBackfillStatus({ data: status, loading: false, refreshing: false, error: null });
+        setLastUpdatedAt(new Date());
+      })
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : 'Unable to start historical backfill.';
+        setBackfillStatus((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+      });
+  }, [selectedSymbol]);
 
   useEffect(() => {
     if (autoRefreshSeconds === 0 || selectedSymbol.trim().length === 0) {
       return undefined;
     }
     const intervalId = window.setInterval(() => {
-      void refreshWorkspace(selectedSymbol);
+      void refreshWorkspace(selectedSymbol, { includeSignal: true, includeAutoTrade: tab === 'auto-trade' });
     }, autoRefreshSeconds * 1000);
     return () => window.clearInterval(intervalId);
-  }, [autoRefreshSeconds, refreshWorkspace, selectedSymbol]);
+  }, [autoRefreshSeconds, refreshWorkspace, selectedSymbol, tab]);
 
   const handleSymbolSearchChange = useCallback((value: string) => {
     setSymbolSearch(value);
@@ -408,14 +626,23 @@ function App() {
     setAiHistoryOffset(0);
     setSelectedSymbol(symbol);
     setSymbolSearch(symbol);
+    setHasAdoptedRuntimeSymbol(true);
     setBotActionError(null);
     setBotActionMessage(null);
+    setWorkstation({ data: null, loading: true, refreshing: false, error: null });
+    setCandles({ data: null, loading: true, refreshing: false, error: null });
+    setBackfillStatus({ data: null, loading: true, refreshing: false, error: null });
+    setRegimeAnalysis({ data: null, loading: true, refreshing: false, error: null });
+    setFusionSignal({ data: null, loading: true, refreshing: false, error: null });
+    setTradingAssistant({ data: null, loading: true, refreshing: false, error: null });
+    setTradeEligibility({ data: null, loading: true, refreshing: false, error: null });
   }, []);
 
   const handleClearSelection = useCallback(() => {
     setAiHistoryOffset(0);
     setSelectedSymbol('');
     setSymbolSearch('');
+    setHasAdoptedRuntimeSymbol(true);
     setBotActionError(null);
     setBotActionMessage(null);
     setWorkstation({ data: null, loading: false, refreshing: false, error: null });
@@ -423,24 +650,35 @@ function App() {
     setAiHistory({ data: INITIAL_AI_HISTORY, loading: false, refreshing: false, error: null });
     setAiEvaluation({ data: null, loading: false, refreshing: false, error: null });
     setCandles({ data: null, loading: false, refreshing: false, error: null });
+    setBackfillStatus({ data: null, loading: false, refreshing: false, error: null });
     setTechnicalAnalysis({ data: null, loading: false, refreshing: false, error: null });
     setMarketSentiment({ data: null, loading: false, refreshing: false, error: null });
     setSymbolSentiment({ data: null, loading: false, refreshing: false, error: null });
     setPatternAnalysis({ data: null, loading: false, refreshing: false, error: null });
+    setRegimeAnalysis({ data: null, loading: false, refreshing: false, error: null });
     setFusionSignal({ data: null, loading: false, refreshing: false, error: null });
+    setTradingAssistant({ data: null, loading: false, refreshing: false, error: null });
     setPerformanceAnalytics({ data: null, loading: false, refreshing: false, error: null });
     setTradeQualityAnalytics({ data: null, loading: false, refreshing: false, error: null });
     setPaperTradeReview({ data: null, loading: false, refreshing: false, error: null });
     setProfileCalibration({ data: null, loading: false, refreshing: false, error: null });
     setProfileCalibrationComparison({ data: null, loading: false, refreshing: false, error: null });
+    setSignalValidation({ data: null, loading: false, refreshing: false, error: null });
+    setEdgeReport({ data: null, loading: false, refreshing: false, error: null });
+    setModuleAttribution({ data: null, loading: false, refreshing: false, error: null });
+    setSimilarSetups({ data: null, loading: false, refreshing: false, error: null });
+    setTradeEligibility({ data: null, loading: false, refreshing: false, error: null });
+    setAdaptiveRecommendations({ data: null, loading: false, refreshing: false, error: null });
   }, []);
 
   const runBotAction = useCallback(async (action: () => Promise<BotStatusResponse>) => {
     setBotActionLoading(true);
     setBotActionError(null);
     setBotActionMessage(null);
+    let refreshSymbol = selectedSymbol;
     try {
       const nextStatus = await action();
+      refreshSymbol = nextStatus.symbol ?? selectedSymbol;
       setBotStatus({ data: nextStatus, loading: false, refreshing: false, error: null });
       setSelectedTradingProfile(nextStatus.trading_profile);
       if (nextStatus.symbol) {
@@ -448,30 +686,46 @@ function App() {
         setSelectedSymbol(nextStatus.symbol);
         setSymbolSearch(nextStatus.symbol);
       }
-      await refreshWorkspace(nextStatus.symbol ?? selectedSymbol);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to update the paper bot.';
       setBotActionError(message);
+      return;
     } finally {
       setBotActionLoading(false);
     }
-  }, [refreshWorkspace, selectedSymbol]);
+    void refreshWorkspace(refreshSymbol, { includeSignal: true, includeAutoTrade: tab === 'auto-trade' });
+  }, [refreshWorkspace, selectedSymbol, tab]);
 
-  const runManualTradeAction = useCallback(async (action: () => Promise<{ message: string }>) => {
+  const runManualTradeAction = useCallback(async (action: () => Promise<ManualTradeResponse>) => {
     setBotActionLoading(true);
     setBotActionError(null);
     setBotActionMessage(null);
     try {
       const result = await action();
       setBotActionMessage(result.message);
-      await refreshWorkspace(selectedSymbol);
+      if (!result.current_position_open) {
+        setWorkstation((current) => {
+          if (!current.data || current.data.symbol !== result.symbol) {
+            return current;
+          }
+          return {
+            ...current,
+            data: {
+              ...current.data,
+              current_position: null,
+            },
+          };
+        });
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to submit the manual paper trade.';
       setBotActionError(message);
+      return;
     } finally {
       setBotActionLoading(false);
     }
-  }, [refreshWorkspace, selectedSymbol]);
+    void refreshWorkspace(selectedSymbol, { includeSignal: true, includeAutoTrade: tab === 'auto-trade' });
+  }, [refreshWorkspace, selectedSymbol, tab]);
 
   const handleResetSession = useCallback(async () => {
     setBotActionLoading(true);
@@ -487,15 +741,25 @@ function App() {
       setAiHistory({ data: INITIAL_AI_HISTORY, loading: false, refreshing: false, error: null });
       setAiEvaluation({ data: null, loading: false, refreshing: false, error: null });
       setCandles({ data: null, loading: false, refreshing: false, error: null });
+      setBackfillStatus({ data: null, loading: false, refreshing: false, error: null });
       setTechnicalAnalysis({ data: null, loading: false, refreshing: false, error: null });
       setMarketSentiment({ data: null, loading: false, refreshing: false, error: null });
       setSymbolSentiment({ data: null, loading: false, refreshing: false, error: null });
       setPatternAnalysis({ data: null, loading: false, refreshing: false, error: null });
+      setRegimeAnalysis({ data: null, loading: false, refreshing: false, error: null });
+      setFusionSignal({ data: null, loading: false, refreshing: false, error: null });
+      setTradingAssistant({ data: null, loading: false, refreshing: false, error: null });
       setPerformanceAnalytics({ data: null, loading: false, refreshing: false, error: null });
       setTradeQualityAnalytics({ data: null, loading: false, refreshing: false, error: null });
       setPaperTradeReview({ data: null, loading: false, refreshing: false, error: null });
       setProfileCalibration({ data: null, loading: false, refreshing: false, error: null });
       setProfileCalibrationComparison({ data: null, loading: false, refreshing: false, error: null });
+      setSignalValidation({ data: null, loading: false, refreshing: false, error: null });
+      setEdgeReport({ data: null, loading: false, refreshing: false, error: null });
+      setModuleAttribution({ data: null, loading: false, refreshing: false, error: null });
+      setSimilarSetups({ data: null, loading: false, refreshing: false, error: null });
+      setTradeEligibility({ data: null, loading: false, refreshing: false, error: null });
+      setAdaptiveRecommendations({ data: null, loading: false, refreshing: false, error: null });
       setLastUpdatedAt(new Date());
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to reset the paper session.';
@@ -517,6 +781,30 @@ function App() {
     }
     return null;
   }, [aiSignal.data, selectedSymbol]);
+  const effectiveFusionSignal = useMemo(() => {
+    if (fusionSignal.data?.symbol === selectedSymbol) {
+      return fusionSignal.data;
+    }
+    return null;
+  }, [fusionSignal.data, selectedSymbol]);
+  const effectiveTradingAssistant = useMemo(() => {
+    if (tradingAssistant.data?.symbol === selectedSymbol) {
+      return tradingAssistant.data;
+    }
+    return null;
+  }, [selectedSymbol, tradingAssistant.data]);
+  const effectiveTradeEligibility = useMemo(() => {
+    if (tradeEligibility.data?.symbol === selectedSymbol) {
+      return tradeEligibility.data;
+    }
+    return null;
+  }, [selectedSymbol, tradeEligibility.data]);
+  const effectiveRegimeAnalysis = useMemo(() => {
+    if (regimeAnalysis.data?.symbol === selectedSymbol) {
+      return regimeAnalysis.data;
+    }
+    return null;
+  }, [regimeAnalysis.data, selectedSymbol]);
 
   const trendLabel = effectiveWorkstation?.trend_bias ?? 'Waiting for live data';
   const workstationDataState = effectiveWorkstation?.data_state ?? 'waiting_for_runtime';
@@ -542,7 +830,7 @@ function App() {
     try {
       const result: ProfileCalibrationApplyResponse = await applyProfileCalibration(selectedSymbol, profile, thresholds);
       setBotActionMessage(result.status_message);
-      await refreshWorkspace(selectedSymbol);
+      await refreshWorkspace(selectedSymbol, { includeSignal: false, includeAutoTrade: true });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to apply the tuning recommendation.';
       setBotActionError(message);
@@ -566,10 +854,10 @@ function App() {
         <header className="rounded-3xl border border-slate-800/80 bg-slate-950/70 p-6 shadow-glow backdrop-blur">
           <div className="flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between">
             <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.3em] text-sky-300">Binance AI Bot</p>
-              <h1 className="mt-2 text-3xl font-semibold text-white">Single-Symbol Paper Trading Workstation</h1>
+              <p className="text-xs font-semibold uppercase tracking-[0.3em] text-sky-300">AI-Assisted Binance Signal Intelligence Platform</p>
+              <h1 className="mt-2 text-3xl font-semibold text-white">V1 Market Ready Signal Provider</h1>
               <p className="mt-3 max-w-3xl text-sm text-slate-400">
-                Use one live Binance Spot symbol at a time. Signal mode shows the current market state and strategy bias. Auto Trade mode controls the paper runtime and current paper position.
+                Data-driven Binance Spot signals with paper-mode validation, advisory AI context, smart risk filters, and no autonomous execution.
               </p>
             </div>
             <div className="grid gap-3 text-sm text-slate-400 sm:justify-items-end">
@@ -578,7 +866,10 @@ function App() {
                   {health.data?.status ?? 'loading'}
                 </span>
                 <span className="rounded-full bg-slate-800 px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em] text-slate-300">
-                  {botStatus.data.paper_only ? 'paper only' : 'live'}
+                  {botStatus.data.paper_only ? 'paper mode' : 'paper safety unknown'}
+                </span>
+                <span className="rounded-full bg-slate-800 px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em] text-slate-300">
+                  advisory only
                 </span>
               </div>
               <div className="flex flex-col gap-2 sm:items-end">
@@ -589,7 +880,10 @@ function App() {
               <p>Refresh interval {refreshLabel}</p>
               <button
                 type="button"
-                onClick={() => void refreshWorkspace(selectedSymbol)}
+                onClick={() => {
+                  void refreshWorkspace(selectedSymbol, { includeSignal: true, includeAutoTrade: tab === 'auto-trade' });
+                  void refreshOpportunities();
+                }}
                 className="rounded-xl border border-sky-400/30 bg-sky-400/10 px-4 py-2 font-medium text-sky-100 transition hover:border-sky-300 hover:bg-sky-400/20"
               >
                 Refresh workspace
@@ -663,12 +957,31 @@ function App() {
             <SectionCard
               title="Signal"
               description="Live symbol context plus persisted advisory history for the selected symbol."
-              action={workstation.refreshing || workstation.loading || aiSignal.refreshing || aiHistory.refreshing || technicalAnalysis.refreshing || marketSentiment.refreshing || symbolSentiment.refreshing || patternAnalysis.refreshing ? <span className="text-xs text-slate-400">Refreshing...</span> : null}
+              action={workstation.refreshing || workstation.loading || aiSignal.refreshing || aiHistory.refreshing || technicalAnalysis.refreshing || marketSentiment.refreshing || symbolSentiment.refreshing || patternAnalysis.refreshing || regimeAnalysis.refreshing ? <span className="text-xs text-slate-400">Refreshing...</span> : null}
             >
               {selectedSymbol.length === 0 ? (
                 <StatePanel title="No symbol selected" message="Pick a symbol to load live signal state." tone="empty" />
               ) : (
                 <div className="space-y-5">
+                  <ErrorBoundary fallbackTitle="Signal summary unavailable">
+                    <V1SignalDashboard
+                      selectedSymbol={selectedSymbol}
+                      workstation={effectiveWorkstation}
+                      fusionSignal={effectiveFusionSignal}
+                      tradingAssistant={effectiveTradingAssistant}
+                      tradeEligibility={effectiveTradeEligibility}
+                      regimeAnalysis={effectiveRegimeAnalysis}
+                      similarSetups={similarSetups.data}
+                      botStatus={botStatus.data}
+                      loading={workstation.loading || fusionSignal.loading || tradingAssistant.loading}
+                      error={workstation.error ?? fusionSignal.error ?? tradingAssistant.error}
+                    />
+                  </ErrorBoundary>
+
+                  <ErrorBoundary fallbackTitle="Advanced details unavailable">
+                    <AdvancedDetailsPro
+                      action={workstation.refreshing || fusionSignal.refreshing || tradingAssistant.refreshing ? <span className="text-xs text-slate-400">Refreshing...</span> : null}
+                    >
                   <DataStateIndicator dataState={workstationDataState} message={workstationStatusMessage} />
 
                   {effectiveWorkstation === null || effectiveWorkstation.is_runtime_symbol === false ? (
@@ -695,7 +1008,7 @@ function App() {
                         />
                       </div>
 
-                      <div className="grid gap-4 lg:grid-cols-2">
+                  <div className="grid gap-4 lg:grid-cols-2">
                         <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
                           <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Entry Signal</p>
                           <div className="mt-3 flex items-center gap-3">
@@ -765,9 +1078,30 @@ function App() {
                   )}
 
                   <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <TradingAssistantSection
+                      symbol={selectedSymbol}
+                      assistant={effectiveTradingAssistant}
+                      loading={tradingAssistant.loading}
+                      refreshing={tradingAssistant.refreshing}
+                      error={tradingAssistant.error}
+                    />
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <OpportunityScannerSection
+                      opportunities={opportunities.data}
+                      loading={opportunities.loading}
+                      refreshing={opportunities.refreshing}
+                      error={opportunities.error}
+                      selectedSymbol={selectedSymbol}
+                      onSelectSymbol={handleSelectSymbol}
+                    />
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
                     <FusionSignalSection
                       symbol={selectedSymbol}
-                      signal={fusionSignal.data}
+                      signal={effectiveFusionSignal}
                       loading={fusionSignal.loading}
                       refreshing={fusionSignal.refreshing}
                       error={fusionSignal.error}
@@ -781,6 +1115,16 @@ function App() {
                       loading={technicalAnalysis.loading}
                       refreshing={technicalAnalysis.refreshing}
                       error={technicalAnalysis.error}
+                    />
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <RegimeAnalysisSection
+                      symbol={selectedSymbol}
+                      analysis={effectiveRegimeAnalysis}
+                      loading={regimeAnalysis.loading}
+                      refreshing={regimeAnalysis.refreshing}
+                      error={regimeAnalysis.error}
                     />
                   </div>
 
@@ -854,6 +1198,20 @@ function App() {
                       statusMessage={aiEvaluation.data?.status_message ?? workstationStatusMessage}
                     />
                   </div>
+
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <DiagnosticsPanel
+                      selectedSymbol={selectedSymbol}
+                      health={health.data}
+                      status={botStatus.data}
+                      workstation={effectiveWorkstation}
+                      backfillStatus={backfillStatus.data}
+                      latestSignalTimestamp={effectiveFusionSignal?.generated_at ?? effectiveAiSignal?.timestamp ?? effectiveWorkstation?.last_market_event ?? null}
+                      persistence={effectiveWorkstation?.persistence ?? botStatus.data.persistence}
+                    />
+                  </div>
+                  </AdvancedDetailsPro>
+                  </ErrorBoundary>
                 </div>
               )}
             </SectionCard>
@@ -941,6 +1299,30 @@ function App() {
                     <TradeReadinessPanel symbol={selectedSymbol} readiness={readiness} />
                   </div>
 
+                  <ErrorBoundary fallbackTitle="Advanced paper analytics unavailable">
+                    <AdvancedDetailsPro
+                      action={tradeEligibility.refreshing || adaptiveRecommendations.refreshing || signalValidation.refreshing ? <span className="text-xs text-slate-400">Refreshing...</span> : null}
+                    >
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <TradeEligibilitySection
+                      symbol={selectedSymbol}
+                      eligibility={effectiveTradeEligibility}
+                      loading={tradeEligibility.loading}
+                      refreshing={tradeEligibility.refreshing}
+                      error={tradeEligibility.error}
+                    />
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <AdaptiveRecommendationsSection
+                      symbol={selectedSymbol}
+                      recommendations={adaptiveRecommendations.data}
+                      loading={adaptiveRecommendations.loading}
+                      refreshing={adaptiveRecommendations.refreshing}
+                      error={adaptiveRecommendations.error}
+                    />
+                  </div>
+
                   <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
                     <PerformanceAnalyticsSection
                       symbol={selectedSymbol}
@@ -984,6 +1366,33 @@ function App() {
                       onApply={handleApplyProfileCalibration}
                     />
                   </div>
+
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <SignalValidationSection
+                      symbol={selectedSymbol}
+                      validation={signalValidation.data}
+                      edgeReport={edgeReport.data}
+                      moduleAttribution={moduleAttribution.data}
+                      similarSetups={similarSetups.data}
+                      loading={signalValidation.loading}
+                      refreshing={signalValidation.refreshing || edgeReport.refreshing || moduleAttribution.refreshing || similarSetups.refreshing}
+                      error={signalValidation.error ?? edgeReport.error ?? moduleAttribution.error ?? similarSetups.error}
+                    />
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                    <DiagnosticsPanel
+                      selectedSymbol={selectedSymbol}
+                      health={health.data}
+                      status={botStatus.data}
+                      workstation={effectiveWorkstation}
+                      backfillStatus={backfillStatus.data}
+                      latestSignalTimestamp={effectiveFusionSignal?.generated_at ?? effectiveAiSignal?.timestamp ?? effectiveWorkstation?.last_market_event ?? null}
+                      persistence={effectiveWorkstation?.persistence ?? botStatus.data.persistence}
+                    />
+                  </div>
+                  </AdvancedDetailsPro>
+                  </ErrorBoundary>
                 </div>
               )}
             </SectionCard>

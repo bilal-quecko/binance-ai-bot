@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 from fastapi import Depends, HTTPException
@@ -21,6 +21,7 @@ from app.storage.models import (
     PnlSnapshotRecord,
     PositionSnapshotRecord,
     RunnerEventRecord,
+    SignalValidationSnapshotRecord,
     TradeRecord,
 )
 
@@ -198,6 +199,43 @@ class DashboardDataAccess:
         return self.repository.get_market_candle_history(
             symbol=symbol,
             end_date=end_date,
+        )
+
+    def get_signal_validation_snapshots(
+        self,
+        *,
+        symbol: str | None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        action: str | None = None,
+        risk_grade: str | None = None,
+        confidence_bucket: str | None = None,
+    ) -> list[SignalValidationSnapshotRecord]:
+        """Return persisted signal snapshots for validation analytics."""
+
+        return self.repository.get_signal_validation_snapshots(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            action=action,
+            risk_grade=risk_grade,
+            confidence_bucket=confidence_bucket,
+        )
+
+    def get_historical_candles(
+        self,
+        *,
+        symbol: str,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+    ):
+        """Return stored OHLCV candles for signal outcome validation."""
+
+        return self.repository.get_historical_candles(
+            symbol=symbol,
+            interval="1m",
+            start_time=start_time,
+            end_time=end_time,
         )
 
     def get_all_positions(self) -> list[PositionSnapshotRecord]:
