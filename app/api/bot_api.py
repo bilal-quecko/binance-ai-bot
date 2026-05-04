@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 import json
 import logging
 from typing import Annotated, Literal
@@ -32,6 +32,8 @@ from app.ai.service import AISignalService
 from app.bot import BotStatus, PaperBotRuntime, WorkstationState
 from app.bot.runtime import PersistenceState
 from app.config import Settings, get_settings
+from app.data.historical_candles import SupportedInterval, interval_to_timedelta, now_utc, parse_rest_kline
+from app.exchange.binance_rest import BinanceRestClient
 from app.data import MarketContextService
 from app.features.feature_store import FeatureEngine
 from app.features.models import FeatureConfig, FeatureSnapshot
@@ -61,6 +63,13 @@ from app.monitoring.trade_eligibility import (
     TradeEligibilityInput,
     TradeEligibilityResult,
     evaluate_trade_eligibility,
+)
+from app.monitoring.futures_opportunity_scanner import (
+    FuturesOpportunityScanReport,
+    FuturesOpportunityScanner,
+    FuturesPaperSignal,
+    FuturesSignalContext,
+    MIN_CANDLES_FOR_FUTURES_SIGNAL,
 )
 
 router = APIRouter()
@@ -249,6 +258,59 @@ class OpportunityResponse(BaseModel):
     risk_label: Literal["low", "medium", "high"]
     reason: str
     data_state: DataState
+
+
+class FuturesPaperSignalResponse(BaseModel):
+    """Paper-only futures long/short scanner signal for one symbol."""
+
+    symbol: str
+    direction: Literal["long", "short", "wait", "avoid"]
+    opportunity_score: int
+    direction_score: int
+    momentum_score: int
+    trend_score: int
+    volatility_quality_score: int
+    liquidity_score: int
+    risk_score: int
+    validation_score: int | None = None
+    confidence: int
+    evidence_strength: Literal["insufficient", "unvalidated", "weak", "mixed", "promising", "strong"]
+    trend: str
+    momentum: str
+    best_horizon: str
+    risk_grade: Literal["low", "medium", "high"]
+    regime: str | None = None
+    current_price: Decimal | None = None
+    reason: str
+    invalidation_hint: str | None = None
+    suggested_entry_zone: str | None = None
+    suggested_stop_loss: Decimal | None = None
+    suggested_take_profit: Decimal | None = None
+    estimated_fee_impact: Decimal | None = None
+    leverage_suggestion: str
+    liquidation_safety_note: str
+    similar_setup_summary: str
+    eligibility_status: str
+    warnings: list[str] = Field(default_factory=list)
+    timestamp: datetime
+
+
+class FuturesOpportunityScanResponse(BaseModel):
+    """Paper-only futures opportunity scanner response."""
+
+    generated_at: datetime
+    scan_state: Literal["ready", "partial", "insufficient_data", "degraded"]
+    long_candidates: list[FuturesPaperSignalResponse] = Field(default_factory=list)
+    short_candidates: list[FuturesPaperSignalResponse] = Field(default_factory=list)
+    neutral_candidates: list[FuturesPaperSignalResponse] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    scanned_count: int
+    failed_symbols: list[str] = Field(default_factory=list)
+    paper_only: bool = True
+    advisory_only: bool = True
+    live_futures_trading_enabled: bool = False
+    real_orders_enabled: bool = False
+    max_leverage_suggestion: str = "3x paper-only"
 
 
 class TopOfBookResponse(BaseModel):
@@ -1326,6 +1388,14 @@ def get_backfill_service(request: Request) -> HistoricalBackfillService:
                 repository.close()
 
     return _StorageOnlyBackfillService()  # type: ignore[return-value]
+
+
+def get_rest_client(request: Request) -> BinanceRestClient:
+    """Return the shared Binance REST client from app state."""
+
+    if hasattr(request.app.state, "rest_client"):
+        return request.app.state.rest_client
+    return BinanceRestClient(get_settings())
 
 
 def get_settings_dependency() -> Settings:
@@ -2557,6 +2627,345 @@ def _opportunity_from_candles(
     )
 
 
+def _to_futures_signal_response(signal: FuturesPaperSignal) -> FuturesPaperSignalResponse:
+    """Convert a paper futures scanner signal into an API response."""
+
+    return FuturesPaperSignalResponse(
+        symbol=signal.symbol,
+        direction=signal.direction,
+        opportunity_score=signal.opportunity_score,
+        direction_score=signal.direction_score,
+        momentum_score=signal.momentum_score,
+        trend_score=signal.trend_score,
+        volatility_quality_score=signal.volatility_quality_score,
+        liquidity_score=signal.liquidity_score,
+        risk_score=signal.risk_score,
+        validation_score=signal.validation_score,
+        confidence=signal.confidence,
+        evidence_strength=signal.evidence_strength,
+        trend=signal.trend,
+        momentum=signal.momentum,
+        best_horizon=signal.best_horizon,
+        risk_grade=signal.risk_grade,
+        regime=signal.regime,
+        current_price=signal.current_price,
+        reason=signal.reason,
+        invalidation_hint=signal.invalidation_hint,
+        suggested_entry_zone=signal.suggested_entry_zone,
+        suggested_stop_loss=signal.suggested_stop_loss,
+        suggested_take_profit=signal.suggested_take_profit,
+        estimated_fee_impact=signal.estimated_fee_impact,
+        leverage_suggestion=signal.leverage_suggestion,
+        liquidation_safety_note=signal.liquidation_safety_note,
+        similar_setup_summary=signal.similar_setup_summary,
+        eligibility_status=signal.eligibility_status,
+        warnings=list(signal.warnings),
+        timestamp=signal.timestamp,
+    )
+
+
+def _to_futures_scan_response(report: FuturesOpportunityScanReport) -> FuturesOpportunityScanResponse:
+    """Convert paper futures scanner report into the API response shape."""
+
+    return FuturesOpportunityScanResponse(
+        generated_at=report.generated_at,
+        scan_state=report.scan_state,
+        long_candidates=[_to_futures_signal_response(signal) for signal in report.long_candidates],
+        short_candidates=[_to_futures_signal_response(signal) for signal in report.short_candidates],
+        neutral_candidates=[_to_futures_signal_response(signal) for signal in report.neutral_candidates],
+        warnings=report.warnings,
+        scanned_count=report.scanned_count,
+        failed_symbols=report.failed_symbols,
+    )
+
+
+def _build_futures_paper_signal_for_symbol(
+    *,
+    scanner: FuturesOpportunityScanner,
+    symbol: str,
+    horizon: str,
+    runtime: PaperBotRuntime,
+    repository: StorageRepository,
+    sentiment_service: SymbolSentimentService,
+    backfill_service: HistoricalBackfillService,
+) -> FuturesPaperSignal:
+    """Build one paper-only futures scanner signal without touching execution."""
+
+    context = _build_signal_analysis_context(
+        runtime=runtime,
+        repository=repository,
+        symbol=symbol,
+        sentiment_service=sentiment_service,
+    )
+    workstation_state, _, _ = _safe_workstation_state(runtime, symbol)
+    workstation_status = runtime.status()
+    workstation_data_state, workstation_status_message = _derive_workstation_data_state(
+        state=workstation_state,
+        status=workstation_status,
+        storage_degraded=runtime.storage_degraded(),
+        storage_message=runtime.storage_status_message(),
+        state_failed=False,
+        state_failure_message=None,
+    )
+    workstation = _to_workstation_response(
+        state=workstation_state,
+        runtime=runtime,
+        status=workstation_status,
+        data_state=workstation_data_state,
+        status_message=workstation_status_message,
+    )
+    technical_analysis, _ = _safe_technical_analysis(
+        runtime,
+        repository,
+        symbol,
+        context=context,
+    )
+    technical_response = _to_technical_analysis_response(
+        symbol=symbol,
+        analysis=technical_analysis,
+        data_state=(
+            "ready"
+            if technical_analysis is not None and technical_analysis.data_state == "ready"
+            else "waiting_for_history"
+        ),
+        status_message=technical_analysis.status_message if technical_analysis is not None else None,
+    )
+    fusion_analysis, _ = _safe_fusion_signal(
+        symbol=symbol,
+        runtime=runtime,
+        repository=repository,
+        sentiment_service=sentiment_service,
+        workstation_state=workstation_state,
+        context=context,
+    )
+    fusion_state, fusion_message = _derive_fusion_data_state(
+        symbol=symbol,
+        status=runtime.status(),
+        analysis=fusion_analysis,
+        analysis_failed=False,
+    )
+    fusion_response = _to_fusion_signal_response(
+        symbol=symbol,
+        analysis=fusion_analysis,
+        data_state=fusion_state,
+        status_message=fusion_message,
+    )
+    backfill_status = backfill_service.status(symbol=symbol, interval="1m", lookback_days=7)
+    pattern_analysis, _ = _safe_pattern_analysis(
+        runtime,
+        symbol=symbol,
+        horizon=horizon,
+        repository=repository,
+        candles=context.candles,
+    )
+    regime_analysis, _ = _safe_regime_analysis(
+        symbol=symbol,
+        horizon=horizon,
+        runtime=runtime,
+        repository=repository,
+        sentiment_service=sentiment_service,
+        context=context,
+    )
+    assistant = _build_trading_assistant_response(
+        symbol=symbol,
+        backfill_status=backfill_status,
+        fusion_signal=fusion_response,
+        technical_analysis=technical_response,
+        workstation=workstation,
+    )
+    current_snapshot = _build_signal_validation_snapshot_record(
+        symbol=symbol,
+        assistant=assistant,
+        fusion_signal=fusion_response,
+        workstation=workstation,
+        context=context,
+        pattern_analysis=pattern_analysis,
+        regime_analysis=regime_analysis,
+    )
+    similar_setup = _similar_setup_report_for_snapshot(
+        repository=repository,
+        current_snapshot=current_snapshot,
+    )
+    validation_report = _signal_validation_report_for_symbol(
+        repository=repository,
+        symbol=symbol,
+        horizon=fusion_response.preferred_horizon,
+    )
+    blocker_reasons = current_snapshot.blocker_reasons if current_snapshot is not None else ()
+    eligibility = evaluate_trade_eligibility(
+        TradeEligibilityInput(
+            symbol=symbol,
+            action=assistant.decision,
+            confidence=assistant.confidence_score,
+            risk_grade=assistant.risk_label,
+            preferred_horizon=fusion_response.preferred_horizon,
+            expected_edge_pct=fusion_response.expected_edge_pct,
+            estimated_cost_pct=current_snapshot.estimated_cost_pct if current_snapshot is not None else None,
+            blocker_reasons=blocker_reasons,
+            current_warnings=tuple(fusion_response.warnings),
+            regime_label=regime_analysis.regime_label if regime_analysis is not None else None,
+            regime_confidence=regime_analysis.confidence if regime_analysis is not None else None,
+            regime_warnings=regime_analysis.risk_warnings if regime_analysis is not None else (),
+            regime_avoid_conditions=regime_analysis.avoid_conditions if regime_analysis is not None else (),
+            similar_setup=similar_setup,
+            signal_validation=validation_report,
+        )
+    )
+    return scanner.analyze_symbol(
+        FuturesSignalContext(
+            symbol=symbol,
+            candles=context.candles,
+            technical_analysis=technical_analysis,
+            regime_analysis=regime_analysis,
+            similar_setup=similar_setup,
+            trade_eligibility=eligibility,
+            preferred_horizon=fusion_response.preferred_horizon,
+            expected_edge_pct=fusion_response.expected_edge_pct,
+            invalidation_hint=fusion_response.invalidation_hint,
+            blocker_reasons=blocker_reasons,
+            warnings=tuple(fusion_response.warnings),
+            spread_ratio_pct=_spread_ratio_pct(runtime=runtime, symbol=symbol),
+        )
+    )
+
+
+def _spread_ratio_pct(*, runtime: PaperBotRuntime, symbol: str) -> Decimal | None:
+    top_of_book_getter = getattr(runtime, "top_of_book", None)
+    top = top_of_book_getter(symbol) if callable(top_of_book_getter) else None
+    if top is None or top.bid_price <= Decimal("0"):
+        return None
+    return (((top.ask_price - top.bid_price) / top.bid_price) * Decimal("100")).quantize(
+        Decimal("0.0001"),
+        rounding=ROUND_HALF_UP,
+    )
+
+
+async def _build_market_wide_futures_signal_for_symbol(
+    *,
+    scanner: FuturesOpportunityScanner,
+    symbol: str,
+    horizon: str,
+    repository: StorageRepository,
+    rest_client: BinanceRestClient,
+) -> FuturesPaperSignal:
+    """Build one scanner signal from fresh/stored market-wide OHLCV data."""
+
+    candles_15m = await _load_or_fetch_futures_scan_candles(
+        repository=repository,
+        rest_client=rest_client,
+        symbol=symbol,
+        interval="15m",
+        lookback_days=7,
+    )
+    candles_1h = await _load_or_fetch_futures_scan_candles(
+        repository=repository,
+        rest_client=rest_client,
+        symbol=symbol,
+        interval="1h",
+        lookback_days=7,
+    )
+    technical_analysis: TechnicalAnalysisSnapshot | None = None
+    if len(candles_15m) >= 24:
+        try:
+            feature_snapshot = FeatureEngine(FeatureConfig()).build_snapshot(candles_15m)
+            technical_analysis = TechnicalAnalysisService().analyze(
+                symbol=symbol,
+                candles=candles_15m,
+                feature_snapshot=feature_snapshot,
+            )
+        except Exception:
+            LOGGER.exception("Failed to build futures scanner technical analysis for %s.", symbol)
+            technical_analysis = None
+
+    return scanner.analyze_symbol(
+        FuturesSignalContext(
+            symbol=symbol,
+            candles=candles_15m,
+            higher_timeframe_candles=candles_1h,
+            technical_analysis=technical_analysis,
+            regime_analysis=None,
+            similar_setup=None,
+            trade_eligibility=None,
+            preferred_horizon=horizon,
+            warnings=(),
+        )
+    )
+
+
+async def _load_or_fetch_futures_scan_candles(
+    *,
+    repository: StorageRepository,
+    rest_client: BinanceRestClient,
+    symbol: str,
+    interval: SupportedInterval,
+    lookback_days: int,
+) -> list[Candle]:
+    """Load recent scanner candles, fetching from Binance when local data is stale."""
+
+    end_time = now_utc()
+    start_time = end_time - timedelta(days=lookback_days)
+    stored = [
+        _historical_record_to_candle(record)
+        for record in repository.get_historical_candles(
+            symbol=symbol,
+            interval=interval,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    ]
+    if len(stored) >= MIN_CANDLES_FOR_FUTURES_SIGNAL and not _futures_scan_candles_stale(stored, interval):
+        return stored
+
+    expected_limit = int(timedelta(days=lookback_days) / interval_to_timedelta(interval)) + 4
+    rows = await rest_client.get_klines(
+        symbol=symbol,
+        interval=interval,
+        start_time_ms=int(start_time.timestamp() * 1000),
+        end_time_ms=int(end_time.timestamp() * 1000),
+        limit=min(1000, max(MIN_CANDLES_FOR_FUTURES_SIGNAL, expected_limit)),
+    )
+    fetched = [
+        parse_rest_kline(symbol, interval, row)
+        for row in rows
+        if len(row) >= 9 and int(row[6]) < int(now_utc().timestamp() * 1000)
+    ]
+    if fetched:
+        repository.upsert_historical_candles(fetched, source="futures_scanner_rest")
+        return fetched
+    return stored
+
+
+def _futures_scan_candles_stale(candles: list[Candle], interval: SupportedInterval) -> bool:
+    if not candles:
+        return True
+    return now_utc() - candles[-1].close_time > max(interval_to_timedelta(interval) * 2, timedelta(minutes=30))
+
+
+def _historical_record_to_candle(record: HistoricalCandleRecord) -> Candle:
+    return Candle(
+        symbol=record.symbol,
+        timeframe=record.interval,
+        open=record.open_price,
+        high=record.high_price,
+        low=record.low_price,
+        close=record.close_price,
+        volume=record.volume,
+        quote_volume=record.quote_volume,
+        open_time=record.open_time,
+        close_time=record.close_time,
+        event_time=record.created_at,
+        trade_count=record.trade_count,
+        is_closed=True,
+    )
+
+
+def _normalize_futures_scanner_horizon(horizon: str) -> str:
+    normalized = horizon.strip().lower()
+    if normalized in {"15m", "1h"}:
+        return normalized
+    return normalize_horizon(normalized)
+
+
 def _to_ai_outcome_evaluation_response(
     *,
     symbol: str,
@@ -3619,6 +4028,66 @@ async def get_opportunities(
             key=lambda item: (item.data_state != "ready", -item.score, item.symbol),
         )
         return ranked[:limit]
+    finally:
+        repository.close()
+
+
+@router.get("/bot/futures-opportunities", response_model=FuturesOpportunityScanResponse)
+async def get_futures_opportunities(
+    quote_asset: str = "USDT",
+    limit: Annotated[int, Query(ge=1, le=50)] = 20,
+    horizon: str = Query(default="7d"),
+    min_opportunity_score: Annotated[int, Query(ge=0, le=100)] = 0,
+    min_confidence: Annotated[int, Query(ge=0, le=100)] = 0,
+    include_weak_evidence: bool = True,
+    include_avoid: bool = True,
+    settings: Annotated[Settings, Depends(get_settings_dependency)] = None,
+    symbol_service: Annotated[SpotSymbolService, Depends(get_symbol_service)] = None,
+    rest_client: Annotated[BinanceRestClient, Depends(get_rest_client)] = None,
+) -> FuturesOpportunityScanResponse:
+    """Scan symbols for paper-only futures long/short opportunities."""
+
+    normalized_quote = quote_asset.strip().upper() or "USDT"
+    try:
+        normalized_horizon = _normalize_futures_scanner_horizon(horizon)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    scanner = FuturesOpportunityScanner()
+    candidates = await symbol_service.search_symbols(query="", limit=limit)
+    candidates = [record for record in candidates if record.quote_asset.upper() == normalized_quote][:limit]
+    repository = StorageRepository(settings.database_url)
+    signals: list[FuturesPaperSignal] = []
+    failed_symbols: list[str] = []
+    try:
+        for record in candidates:
+            try:
+                signal = await _build_market_wide_futures_signal_for_symbol(
+                    scanner=scanner,
+                    symbol=record.symbol,
+                    horizon=normalized_horizon,
+                    repository=repository,
+                    rest_client=rest_client,
+                )
+                current_threshold = max(min_opportunity_score, min_confidence)
+                weak_validation = signal.evidence_strength in {"insufficient", "unvalidated", "weak"}
+                if signal.direction in {"long", "short"}:
+                    if signal.opportunity_score < current_threshold:
+                        continue
+                    if weak_validation and not include_weak_evidence:
+                        continue
+                    signals.append(signal)
+                elif signal.direction == "wait" or include_avoid:
+                    signals.append(signal)
+            except Exception:
+                LOGGER.exception("Failed to scan paper futures opportunity for %s.", record.symbol)
+                failed_symbols.append(record.symbol)
+        report = scanner.build_report(
+            signals=signals,
+            failed_symbols=failed_symbols,
+            include_avoid=include_avoid,
+        )
+        return _to_futures_scan_response(report)
     finally:
         repository.close()
 

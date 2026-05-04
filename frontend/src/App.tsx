@@ -11,6 +11,7 @@ import { DataStateIndicator } from './components/DataStateIndicator';
 import { DiagnosticsPanel } from './components/DiagnosticsPanel';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { FusionSignalSection } from './components/FusionSignalSection';
+import { FuturesPaperScannerSection } from './components/FuturesPaperScannerSection';
 import { MarketSentimentSection } from './components/MarketSentimentSection';
 import { MetricCard } from './components/MetricCard';
 import { OpportunityScannerSection } from './components/OpportunityScannerSection';
@@ -39,6 +40,7 @@ import {
   getBotStatus,
   getCandles,
   getFusionSignal,
+  getFuturesOpportunities,
   getHealth,
   getEdgeReport,
   getMarketSentiment,
@@ -83,6 +85,7 @@ import type {
   EdgeReportResponse,
   HealthResponse,
   FusionSignalResponse,
+  FuturesOpportunityScanResponse,
   ModuleAttributionResponse,
   MarketSentimentResponse,
   ManualTradeResponse,
@@ -166,6 +169,7 @@ const INITIAL_REGIME_ANALYSIS: RegimeAnalysisResponse | null = null;
 const INITIAL_FUSION_SIGNAL: FusionSignalResponse | null = null;
 const INITIAL_TRADING_ASSISTANT: TradingAssistantResponse | null = null;
 const INITIAL_OPPORTUNITIES: OpportunityResponse[] = [];
+const INITIAL_FUTURES_OPPORTUNITIES: FuturesOpportunityScanResponse | null = null;
 const INITIAL_PERFORMANCE: PerformanceAnalyticsResponse | null = null;
 const INITIAL_TRADE_QUALITY: TradeQualityResponse | null = null;
 const INITIAL_PAPER_REVIEW: PaperTradeReviewResponse | null = null;
@@ -286,6 +290,7 @@ function App() {
   const [fusionSignal, setFusionSignal] = useState<RemoteState<FusionSignalResponse | null>>(createRemoteState(INITIAL_FUSION_SIGNAL));
   const [tradingAssistant, setTradingAssistant] = useState<RemoteState<TradingAssistantResponse | null>>(createRemoteState(INITIAL_TRADING_ASSISTANT));
   const [opportunities, setOpportunities] = useState<RemoteState<OpportunityResponse[]>>(createRemoteState(INITIAL_OPPORTUNITIES));
+  const [futuresOpportunities, setFuturesOpportunities] = useState<RemoteState<FuturesOpportunityScanResponse | null>>(createRemoteState(INITIAL_FUTURES_OPPORTUNITIES));
   const [performanceAnalytics, setPerformanceAnalytics] = useState<RemoteState<PerformanceAnalyticsResponse | null>>(createRemoteState(INITIAL_PERFORMANCE));
   const [tradeQualityAnalytics, setTradeQualityAnalytics] = useState<RemoteState<TradeQualityResponse | null>>(createRemoteState(INITIAL_TRADE_QUALITY));
   const [paperTradeReview, setPaperTradeReview] = useState<RemoteState<PaperTradeReviewResponse | null>>(createRemoteState(INITIAL_PAPER_REVIEW));
@@ -304,6 +309,13 @@ function App() {
   const [hasAdoptedRuntimeSymbol, setHasAdoptedRuntimeSymbol] = useState(false);
   const [selectedPatternHorizon, setSelectedPatternHorizon] = useState<PatternHorizon>('7d');
   const [selectedChartTimeframe, setSelectedChartTimeframe] = useState<ChartTimeframe>('1m');
+  const [futuresScannerFilters, setFuturesScannerFilters] = useState({
+    maxSymbols: 12,
+    minOpportunityScore: 70,
+    includeWeakEvidence: true,
+    horizon: '7d',
+    includeAvoid: true,
+  });
   const [selectedTradingProfile, setSelectedTradingProfile] = useState<TradingProfile>('balanced');
   const [aiHistoryOffset, setAiHistoryOffset] = useState(0);
   const [botActionLoading, setBotActionLoading] = useState(false);
@@ -333,6 +345,18 @@ function App() {
       setOpportunities((current) => ({ ...current, loading: false, refreshing: false, error: message }));
     }
   }, []);
+
+  const refreshFuturesOpportunities = useCallback(async () => {
+    setFuturesOpportunities((current) => setPending(current));
+    try {
+      const scanData = await getFuturesOpportunities(futuresScannerFilters);
+      setFuturesOpportunities({ data: scanData, loading: false, refreshing: false, error: null });
+      setLastUpdatedAt(new Date());
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to refresh futures paper scanner.';
+      setFuturesOpportunities((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+    }
+  }, [futuresScannerFilters]);
 
   const refreshWorkspace = useCallback(async (
     symbol: string,
@@ -585,6 +609,10 @@ function App() {
   useEffect(() => {
     void refreshOpportunities();
   }, [refreshOpportunities]);
+
+  useEffect(() => {
+    void refreshFuturesOpportunities();
+  }, [refreshFuturesOpportunities]);
 
   useEffect(() => {
     const symbol = selectedSymbol.trim();
@@ -883,6 +911,7 @@ function App() {
                 onClick={() => {
                   void refreshWorkspace(selectedSymbol, { includeSignal: true, includeAutoTrade: tab === 'auto-trade' });
                   void refreshOpportunities();
+                  void refreshFuturesOpportunities();
                 }}
                 className="rounded-xl border border-sky-400/30 bg-sky-400/10 px-4 py-2 font-medium text-sky-100 transition hover:border-sky-300 hover:bg-sky-400/20"
               >
@@ -922,6 +951,18 @@ function App() {
           onManualClose={() => void runManualTradeAction(() => manualClosePosition(selectedSymbol))}
           onReset={() => void handleResetSession()}
         />
+
+        <ErrorBoundary fallbackTitle="Futures paper scanner unavailable">
+          <FuturesPaperScannerSection
+            scan={futuresOpportunities.data}
+            loading={futuresOpportunities.loading}
+            refreshing={futuresOpportunities.refreshing}
+            error={futuresOpportunities.error}
+            filters={futuresScannerFilters}
+            onFiltersChange={setFuturesScannerFilters}
+            onRefresh={() => void refreshFuturesOpportunities()}
+          />
+        </ErrorBoundary>
 
         <div className="flex flex-wrap gap-2">
           {([

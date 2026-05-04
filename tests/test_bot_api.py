@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from app.api.bot_api import (
     get_backfill_service,
     get_bot_runtime,
+    get_rest_client,
     get_settings_dependency,
     get_symbol_sentiment_service,
     get_symbol_service,
@@ -98,6 +99,54 @@ class FakeBackfillService:
             'last_backfilled_at': datetime(2024, 3, 9, 16, 0, tzinfo=UTC),
             'effective_interval': interval,
         })()
+
+
+class FakeFuturesRestClient:
+    def __init__(self, *, failing_symbols: set[str] | None = None) -> None:
+        self.failing_symbols = failing_symbols or set()
+        self.calls: list[tuple[str, str]] = []
+
+    async def get_klines(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 1000,
+    ):
+        self.calls.append((symbol, interval))
+        if symbol in self.failing_symbols:
+            raise RuntimeError('klines unavailable')
+        count = 96 if interval == '15m' else 48
+        step = Decimal('0.25')
+        if symbol == 'ETHUSDT':
+            step = Decimal('-0.25')
+        base_time = datetime.now(tz=UTC) - timedelta(minutes=(15 if interval == '15m' else 60) * (count + 1))
+        interval_ms = 900_000 if interval == '15m' else 3_600_000
+        rows = []
+        for index in range(count):
+            open_time = int((base_time + timedelta(milliseconds=interval_ms * index)).timestamp() * 1000)
+            close_time = open_time + interval_ms - 1
+            open_price = Decimal('200') + (Decimal(index) * step)
+            close_price = open_price + (step / Decimal('2'))
+            high = max(open_price, close_price) + Decimal('0.3')
+            low = min(open_price, close_price) - Decimal('0.3')
+            rows.append([
+                open_time,
+                str(open_price),
+                str(high),
+                str(low),
+                str(close_price),
+                '100',
+                close_time,
+                '1000000',
+                100,
+                '0',
+                '0',
+                '0',
+            ])
+        return rows[:limit]
 
 
 class FakeRuntime:
@@ -1865,3 +1914,120 @@ def test_candle_and_opportunity_endpoints_can_read_stored_history() -> None:
     items = opportunity_response.json()
     assert len(items) >= 1
     assert {'symbol', 'score', 'suggested_action', 'reason', 'data_state'} <= set(items[0].keys())
+
+
+def test_futures_opportunities_response_shape_and_safety_flags() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    repository = StorageRepository(settings.database_url)
+    base_time = datetime(2024, 3, 9, 10, 0, tzinfo=UTC)
+    candles = []
+    for index in range(60):
+        open_price = Decimal('100') + (Decimal(index) * Decimal('0.4'))
+        close_price = open_price + Decimal('0.2')
+        candles.append(
+            Candle(
+                symbol='BTCUSDT',
+                timeframe='1m',
+                open=open_price,
+                high=close_price + Decimal('0.2'),
+                low=open_price - Decimal('0.1'),
+                close=close_price,
+                volume=Decimal('100'),
+                quote_volume=Decimal('1000000'),
+                open_time=base_time + timedelta(minutes=index),
+                close_time=base_time + timedelta(minutes=index, seconds=59),
+                event_time=base_time + timedelta(minutes=index, seconds=59),
+                trade_count=100,
+                is_closed=True,
+            )
+        )
+    repository.upsert_historical_candles(candles, source='historical_rest')
+    repository.close()
+
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_symbol_sentiment_service] = lambda: FakeSymbolSentimentService()
+    app.dependency_overrides[get_bot_runtime] = lambda: NeutralRuntime()
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_backfill_service] = lambda: FakeBackfillService()
+    app.dependency_overrides[get_rest_client] = lambda: FakeFuturesRestClient()
+    client = TestClient(app)
+
+    try:
+        response = client.get('/bot/futures-opportunities', params={'limit': 2, 'include_avoid': 'true'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['paper_only'] is True
+    assert body['advisory_only'] is True
+    assert body['live_futures_trading_enabled'] is False
+    assert body['real_orders_enabled'] is False
+    assert body['max_leverage_suggestion'] == '3x paper-only'
+    assert {'generated_at', 'scan_state', 'long_candidates', 'short_candidates', 'neutral_candidates'} <= set(body)
+    candidates = body['long_candidates'] + body['short_candidates'] + body['neutral_candidates']
+    assert candidates
+    assert {
+        'symbol',
+        'direction',
+        'opportunity_score',
+        'confidence',
+        'evidence_strength',
+        'trend',
+        'momentum',
+        'leverage_suggestion',
+        'liquidation_safety_note',
+    } <= set(candidates[0])
+    assert body['long_candidates']
+    assert body['short_candidates']
+    assert body['long_candidates'][0]['evidence_strength'] == 'unvalidated'
+
+
+def test_futures_opportunities_returns_partial_when_symbol_scan_fails() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    repository = StorageRepository(settings.database_url)
+    base_time = datetime(2024, 3, 9, 10, 0, tzinfo=UTC)
+    candles = []
+    for index in range(60):
+        price = Decimal('100') + Decimal(index)
+        candles.append(
+            Candle(
+                symbol='BTCUSDT',
+                timeframe='1m',
+                open=price,
+                high=price + Decimal('0.5'),
+                low=price - Decimal('0.5'),
+                close=price + Decimal('0.2'),
+                volume=Decimal('100'),
+                quote_volume=Decimal('1000000'),
+                open_time=base_time + timedelta(minutes=index),
+                close_time=base_time + timedelta(minutes=index, seconds=59),
+                event_time=base_time + timedelta(minutes=index, seconds=59),
+                trade_count=100,
+                is_closed=True,
+            )
+        )
+    repository.upsert_historical_candles(candles, source='historical_rest')
+    repository.close()
+
+    app.dependency_overrides[get_symbol_service] = lambda: FakeSymbolService()
+    app.dependency_overrides[get_symbol_sentiment_service] = lambda: FakeSymbolSentimentService()
+    app.dependency_overrides[get_bot_runtime] = lambda: NeutralRuntime()
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_backfill_service] = lambda: FakeBackfillService()
+    app.dependency_overrides[get_rest_client] = lambda: FakeFuturesRestClient(failing_symbols={'ETHUSDT'})
+    client = TestClient(app)
+
+    try:
+        response = client.get('/bot/futures-opportunities', params={'limit': 2})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['scan_state'] == 'partial'
+    assert body['failed_symbols'] == ['ETHUSDT']
+    assert body['live_futures_trading_enabled'] is False
+    assert body['real_orders_enabled'] is False

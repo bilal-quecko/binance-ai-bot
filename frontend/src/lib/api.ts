@@ -12,6 +12,7 @@
   EventItem,
   EdgeReportResponse,
   FillItem,
+  FuturesOpportunityScanResponse,
   HealthResponse,
   HistoryFilters,
   MetricsResponse,
@@ -334,6 +335,25 @@ export function getTradeEligibility(symbol: string, horizon?: string): Promise<T
 export function getOpportunities(limit = 20): Promise<OpportunityResponse[]> {
   const params = new URLSearchParams({ limit: String(limit) });
   return requestJson<OpportunityResponse[]>('/bot/opportunities', params);
+}
+
+export interface FuturesOpportunityFilters {
+  maxSymbols: number;
+  minOpportunityScore: number;
+  includeWeakEvidence: boolean;
+  horizon: string;
+  includeAvoid: boolean;
+}
+
+export function getFuturesOpportunities(filters: FuturesOpportunityFilters): Promise<FuturesOpportunityScanResponse> {
+  const params = new URLSearchParams({
+    limit: String(filters.maxSymbols),
+    min_opportunity_score: String(filters.minOpportunityScore),
+    include_weak_evidence: filters.includeWeakEvidence ? 'true' : 'false',
+    horizon: filters.horizon,
+    include_avoid: filters.includeAvoid ? 'true' : 'false',
+  });
+  return requestJson<FuturesOpportunityScanResponse>('/bot/futures-opportunities', params);
 }
 
 export function getAISignal(symbol: string): Promise<AISignalSummary | null> {

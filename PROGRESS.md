@@ -751,3 +751,122 @@ Chronological implementation checkpoints for Binance AI Bot.
   - prevented recovered runtime symbols from being re-selected repeatedly after the operator clears or changes the symbol
   - cleared stale selected-symbol signal state immediately when a new symbol is selected so ETH data does not remain visible while BNB is loading
   - frontend production build after hardening: `npm run build` passed
+
+## No. 30 - Futures Paper Long/Short Opportunity Scanner
+
+- Status: Completed
+- What Changed:
+  - added a paper-only futures intelligence scanner that ranks Binance quote-asset symbols as `long`, `short`, `wait`, or `avoid`
+  - added deterministic long/short scoring from stored/live candles, technical structure, momentum, regime, similar-setup evidence, trade eligibility, blockers, fee/spread impact, and risk filters
+  - added a typed futures-paper signal model with direction, confidence, evidence strength, best horizon, risk grade, regime, current price, reason, invalidation hint, entry/stop/take-profit guidance, estimated fee impact, leverage suggestion, liquidation safety note, similar setup summary, eligibility status, warnings, and timestamp
+  - added conservative safety behavior: insufficient evidence never becomes LONG/SHORT, choppy and low-liquidity regimes are AVOID, leverage suggestions stay at `1x paper-only`, and reported max leverage is capped at `3x paper-only`
+  - added `GET /bot/futures-opportunities` with `quote_asset`, `limit`, `horizon`, `min_confidence`, and `include_avoid` filters
+  - added a visible `Futures Paper Scanner` UI section with Paper Futures Mode, Advisory Only, No Real Orders, and Long/Short Simulation labels
+  - rendered LONG candidates in green, SHORT candidates in red, and WAIT/AVOID candidates in neutral styling without blocking the V1 main signal screen
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `app/monitoring/futures_opportunity_scanner.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_bot_api.py`
+  - `tests/test_futures_opportunity_scanner.py`
+  - `PROGRESS.md`
+- Endpoint Added:
+  - `GET /bot/futures-opportunities`
+- Tests Run:
+  - focused scanner/API tests: `.\.venv\Scripts\python.exe -m pytest tests\test_futures_opportunity_scanner.py tests\test_bot_api.py -k "futures_opportunit"` (`8 passed`)
+  - bot API tests: `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py` (`24 passed`)
+  - Ruff lint: `.\.venv\Scripts\python.exe -m ruff check app\api\bot_api.py app\monitoring\futures_opportunity_scanner.py tests\test_futures_opportunity_scanner.py tests\test_bot_api.py` passed
+  - frontend production build: `npm run build` passed
+- Safety Limitations:
+  - no real futures trading, live futures execution, Binance futures order placement, or AI execution path was added
+  - this is an advisory paper scanner only; it does not open, close, or simulate persistent futures positions
+  - leverage guidance is conservative and report-only, with default `1x paper-only` and max `3x paper-only`
+  - original implementation was evidence-gated; see No. 30 correction below for the market-wide opportunity-scanner behavior
+  - existing spot paper mode and the V1 signal-provider screen remain intact
+- Next Suggested Phase:
+  - add a paper-only futures watchlist/session simulator that records hypothetical long/short outcomes from scanner signals, then validate whether scanner-ranked LONG/SHORT candidates outperform WAIT/AVOID without enabling live execution
+
+## No. 30 Correction - Market-Wide Futures Paper Opportunity Scanner
+
+- Status: Completed
+- Correction Summary:
+  - updated the No. 30 scanner from a validation-gated, selected-symbol-dependent scanner into a market-wide opportunity scanner
+  - scanner now fetches fresh Binance 15m and 1h OHLCV candles for scanned USDT symbols when local data is missing or stale
+  - fetched scanner candles are cached in historical candle storage with source `futures_scanner_rest`
+  - LONG/SHORT classification now comes from current market structure, trend, momentum, volatility quality, liquidity, and risk scores
+  - missing internal signal-validation or similar-setup evidence no longer blocks LONG/SHORT candidates
+  - candidates with limited internal evidence are labeled `unvalidated` or weak instead of being suppressed
+  - final ranking now primarily uses `opportunity_score`, with validation only adjusting confidence
+  - replaced the old insufficient-evidence wording with current-filter wording and weak-validation warnings
+- Added Scores:
+  - `opportunity_score`
+  - `direction_score`
+  - `trend_score`
+  - `momentum_score`
+  - `volatility_quality_score`
+  - `liquidity_score`
+  - `risk_score`
+  - optional `validation_score`
+- Frontend:
+  - added scanner controls for minimum opportunity score, max symbols, weak evidence inclusion, WAIT/AVOID inclusion, and horizon
+  - added spinner/progress messaging while a scan request is active
+  - kept prior partial results visible while refreshing
+  - candidate cards now show opportunity score, confidence, evidence strength, trend, momentum, best horizon, reason, warning, stop loss, and take profit
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `app/monitoring/futures_opportunity_scanner.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_bot_api.py`
+  - `tests/test_futures_opportunity_scanner.py`
+  - `PROGRESS.md`
+- Tests Run:
+  - focused scanner tests: `.\.venv\Scripts\python.exe -m pytest tests\test_futures_opportunity_scanner.py --basetemp=tests\.tmp_pytest_futures` (`10 passed`)
+  - bot API tests: `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py --basetemp=tests\.tmp_pytest_bot` (`24 passed`)
+  - Ruff: `.\.venv\Scripts\python.exe -m ruff check app\monitoring\futures_opportunity_scanner.py app\api\bot_api.py tests\test_futures_opportunity_scanner.py tests\test_bot_api.py` passed
+  - frontend production build: `npm run build` passed
+- Safety:
+  - no real futures trading, live futures execution, Binance futures order placement, or autonomous AI execution was added
+  - scanner remains paper-only and advisory-only
+
+## No. 31 - SQLite Persistence Path Hardening and Documentation Alignment
+
+- Status: Completed
+- SQLite Persistence Path Hardening:
+  - changed the default local database URL from `sqlite:///./binance_ai_bot.db` to `sqlite:///./data/binance_ai_bot.db`
+  - kept the SQLite database repo-local and stable for local development while allowing `.env` overrides
+  - ensured the configured SQLite parent directory is created automatically during path resolution
+  - changed storage path resolution so WAL unavailability no longer forces temp storage when the configured database path is writable
+  - kept WAL as the preferred journal mode where supported
+  - added a clear warning when WAL is unavailable but persistent SQLite default journaling is used
+  - kept temp storage only for paths that cannot support persistent SQLite writes, with a warning that paper sessions, signal history, and validation data may not survive cleanup or restart
+- Documentation Alignment:
+  - updated `README.md` to describe the current AI-Assisted Binance Signal Intelligence Platform, V1 signal dashboard, Advanced Details - Pro, local SQLite setup, endpoints, paper limitations, safety disclaimers, and SQLite troubleshooting
+  - updated `AGENTS.md` with current development priorities, paper-only and AI-advisory rules, V1 UI rules, Advanced Details - Pro guidance, futures paper scanner rules, documentation requirements, and persistence rules
+  - updated `ROADMAP.md` to mark V1 Signal Provider, signal validation, regime analysis, similar setup outcomes, trade eligibility, adaptive recommendations, and the current futures paper scanner state accurately
+- Files Changed:
+  - `.env.example`
+  - `.gitignore`
+  - `AGENTS.md`
+  - `README.md`
+  - `ROADMAP.md`
+  - `PROGRESS.md`
+  - `app/config/settings.py`
+  - `app/storage/db.py`
+  - `app/storage/repositories.py`
+  - `tests/test_settings.py`
+  - `tests/test_storage.py`
+- Tests Run:
+  - focused storage/config tests: `.\.venv\Scripts\python.exe -m pytest tests\test_storage.py tests\test_settings.py --basetemp=tests\.tmp_pytest` (`16 passed`)
+  - relevant backend tests: `.\.venv\Scripts\python.exe -m pytest tests\test_dashboard_api.py tests\test_health.py --basetemp=tests\.tmp_pytest` (`6 passed`)
+  - persistence/status backend slice: `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py -k "status or persistence" --basetemp=tests\.tmp_pytest_bot` (`4 passed, 20 deselected`)
+  - Ruff on touched Python paths: `.\.venv\Scripts\python.exe -m ruff check app\storage\db.py app\storage\repositories.py app\config\settings.py tests\test_storage.py tests\test_settings.py` passed
+- Remaining Limitations:
+  - the current sandbox reports SQLite `disk I/O error` for direct workspace database writes, so real repository tests may still use the existing temp fallback in this environment
+  - no live trading, real futures execution, or autonomous AI execution was added
+  - no profitability guarantees were added

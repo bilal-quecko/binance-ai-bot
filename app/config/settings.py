@@ -39,7 +39,7 @@ class Settings(BaseSettings):
         alias="BINANCE_WS_URL",
     )
 
-    database_url: str = Field(default="sqlite:///./binance_ai_bot.db", alias="DATABASE_URL")
+    database_url: str = Field(default="sqlite:///./data/binance_ai_bot.db", alias="DATABASE_URL")
 
     @property
     def symbol_list(self) -> list[str]:

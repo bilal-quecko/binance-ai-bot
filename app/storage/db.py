@@ -313,11 +313,18 @@ OPTIONAL_TABLE_COLUMNS: dict[str, dict[str, str]] = {
 def resolve_sqlite_path(database_url: str) -> Path:
     """Resolve a sqlite database URL to a local filesystem path."""
 
+    requested_path = requested_sqlite_path(database_url)
+    requested_path.parent.mkdir(parents=True, exist_ok=True)
+    return _resolve_usable_sqlite_path(requested_path)
+
+
+def requested_sqlite_path(database_url: str) -> Path:
+    """Resolve a sqlite database URL to the configured local filesystem path."""
+
     if not database_url.startswith("sqlite:///"):
         raise ValueError("Only sqlite:/// database URLs are supported for paper-mode storage.")
     requested_path = Path(database_url.removeprefix("sqlite:///")).resolve()
-    requested_path.parent.mkdir(parents=True, exist_ok=True)
-    return _resolve_usable_sqlite_path(requested_path)
+    return requested_path
 
 
 def create_db_connection(database_url: str) -> sqlite3.Connection:
@@ -333,14 +340,20 @@ def create_db_connection(database_url: str) -> sqlite3.Connection:
 
 
 def _resolve_usable_sqlite_path(requested_path: Path) -> Path:
-    """Return a SQLite path that supports local paper-mode journaling."""
+    """Return a persistent SQLite path, falling back to temp only if it is unusable."""
 
     cached_path = _SQLITE_PATH_FALLBACK_CACHE.get(requested_path)
     if cached_path is not None:
         cached_path.parent.mkdir(parents=True, exist_ok=True)
         return cached_path
 
-    if _sqlite_path_supports_wal(requested_path):
+    if _sqlite_path_accepts_persistent_writes(requested_path):
+        if not _sqlite_path_supports_wal(requested_path):
+            LOGGER.warning(
+                "SQLite path %s is writable but WAL is unavailable in this environment; "
+                "using persistent SQLite default journaling instead.",
+                requested_path,
+            )
         _SQLITE_PATH_FALLBACK_CACHE[requested_path] = requested_path
         return requested_path
 
@@ -349,12 +362,33 @@ def _resolve_usable_sqlite_path(requested_path: Path) -> Path:
     fallback_name = f"{requested_path.stem}_{sha1(str(requested_path).encode('utf-8')).hexdigest()[:12]}{requested_path.suffix}"
     fallback_path = fallback_root / fallback_name
     LOGGER.warning(
-        "SQLite path %s does not support WAL in this environment; using temp storage %s instead.",
+        "SQLite path %s is not writable for persistent storage; using temp storage %s instead. "
+        "Paper sessions, signal history, and validation data may not survive cleanup or restart.",
         requested_path,
         fallback_path,
     )
     _SQLITE_PATH_FALLBACK_CACHE[requested_path] = fallback_path
     return fallback_path
+
+
+def _sqlite_path_accepts_persistent_writes(requested_path: Path) -> bool:
+    """Return whether the requested database path can persist main-database writes."""
+
+    try:
+        connection = sqlite3.connect(requested_path, check_same_thread=False)
+        try:
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS app_storage_probe (id INTEGER PRIMARY KEY)"
+            )
+            connection.execute("DROP TABLE app_storage_probe")
+            connection.commit()
+            return True
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        LOGGER.warning("SQLite path %s is not usable for persistent storage: %s", requested_path, exc)
+        return False
 
 
 def _sqlite_path_supports_wal(requested_path: Path) -> bool:

@@ -150,6 +150,55 @@ export interface OpportunityResponse {
   data_state: WorkstationDataState;
 }
 
+export interface FuturesPaperSignalResponse {
+  symbol: string;
+  direction: 'long' | 'short' | 'wait' | 'avoid';
+  opportunity_score: number;
+  direction_score: number;
+  momentum_score: number;
+  trend_score: number;
+  volatility_quality_score: number;
+  liquidity_score: number;
+  risk_score: number;
+  validation_score: number | null;
+  confidence: number;
+  evidence_strength: 'insufficient' | 'unvalidated' | 'weak' | 'mixed' | 'promising' | 'strong';
+  trend: string;
+  momentum: string;
+  best_horizon: string;
+  risk_grade: 'low' | 'medium' | 'high';
+  regime: string | null;
+  current_price: DecimalString | null;
+  reason: string;
+  invalidation_hint: string | null;
+  suggested_entry_zone: string | null;
+  suggested_stop_loss: DecimalString | null;
+  suggested_take_profit: DecimalString | null;
+  estimated_fee_impact: DecimalString | null;
+  leverage_suggestion: string;
+  liquidation_safety_note: string;
+  similar_setup_summary: string;
+  eligibility_status: string;
+  warnings: string[];
+  timestamp: string;
+}
+
+export interface FuturesOpportunityScanResponse {
+  generated_at: string;
+  scan_state: 'ready' | 'partial' | 'insufficient_data' | 'degraded';
+  long_candidates: FuturesPaperSignalResponse[];
+  short_candidates: FuturesPaperSignalResponse[];
+  neutral_candidates: FuturesPaperSignalResponse[];
+  warnings: string[];
+  scanned_count: number;
+  failed_symbols: string[];
+  paper_only: boolean;
+  advisory_only: boolean;
+  live_futures_trading_enabled: boolean;
+  real_orders_enabled: boolean;
+  max_leverage_suggestion: string;
+}
+
 export interface TopOfBookSummary {
   bid_price: DecimalString;
   bid_quantity: DecimalString;

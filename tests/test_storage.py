@@ -11,6 +11,7 @@ from app.paper.models import Position
 from app.paper.models import FillResult
 from app.risk.models import RiskDecision
 from app.storage import StorageRepository
+from app.storage import db as storage_db
 from app.storage.db import resolve_sqlite_path
 
 
@@ -18,6 +19,16 @@ def _db_path(name: str) -> Path:
     base = Path("tests/.tmp_storage")
     base.mkdir(parents=True, exist_ok=True)
     return (base / f"{name}_{uuid4().hex}.sqlite").resolve()
+
+
+def _tmp_dir(name: str) -> Path:
+    path = Path("tests/.tmp_storage") / f"{name}_{uuid4().hex}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path.resolve()
+
+
+def _clear_sqlite_path_cache() -> None:
+    storage_db._SQLITE_PATH_FALLBACK_CACHE.clear()  # noqa: SLF001 - storage path regression coverage
 
 
 def _ai_snapshot(
@@ -90,6 +101,60 @@ def test_storage_repository_creates_required_tables() -> None:
         "runtime_session_state",
         "trades",
     } <= table_names
+
+
+def test_resolve_sqlite_path_creates_repo_local_data_directory(
+    monkeypatch,
+) -> None:
+    _clear_sqlite_path_cache()
+    workspace = _tmp_dir("repo_local_data")
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(storage_db, "_sqlite_path_accepts_persistent_writes", lambda path: True)
+    monkeypatch.setattr(storage_db, "_sqlite_path_supports_wal", lambda path: True)
+
+    db_path = resolve_sqlite_path("sqlite:///./data/binance_ai_bot.db")
+
+    assert db_path == (workspace / "data" / "binance_ai_bot.db").resolve()
+    assert db_path.parent.is_dir()
+
+
+def test_resolve_sqlite_path_keeps_writable_path_when_wal_is_unavailable(
+    monkeypatch,
+    caplog,
+) -> None:
+    _clear_sqlite_path_cache()
+    workspace = _tmp_dir("wal_fallback")
+    monkeypatch.setattr(storage_db, "_sqlite_path_accepts_persistent_writes", lambda path: True)
+    monkeypatch.setattr(storage_db, "_sqlite_path_supports_wal", lambda requested_path: False)
+    database_url = f"sqlite:///{workspace / 'data' / 'wal_fallback.sqlite'}"
+
+    db_path = resolve_sqlite_path(database_url)
+
+    assert db_path == (workspace / "data" / "wal_fallback.sqlite").resolve()
+    assert "using persistent SQLite default journaling instead" in caplog.text
+    assert "using temp storage" not in caplog.text
+
+
+def test_resolve_sqlite_path_uses_temp_only_when_persistent_path_is_unusable(
+    monkeypatch,
+    caplog,
+) -> None:
+    _clear_sqlite_path_cache()
+    workspace = _tmp_dir("unusable_path")
+    temp_root = _tmp_dir("temp_fallback")
+    requested_path = workspace / "data" / "unusable.sqlite"
+    monkeypatch.setattr(
+        storage_db,
+        "_sqlite_path_accepts_persistent_writes",
+        lambda path: False,
+    )
+    monkeypatch.setattr(storage_db.tempfile, "gettempdir", lambda: str(temp_root))
+
+    db_path = resolve_sqlite_path(f"sqlite:///{requested_path}")
+
+    assert db_path != requested_path.resolve()
+    assert db_path.parent.name == "sqlite"
+    assert "using temp storage" in caplog.text
 
 
 def test_storage_repository_persists_and_reads_trade_history() -> None:
