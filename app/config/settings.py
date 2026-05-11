@@ -34,12 +34,21 @@ class Settings(BaseSettings):
     binance_api_key: str = Field(default="", alias="BINANCE_API_KEY")
     binance_api_secret: str = Field(default="", alias="BINANCE_API_SECRET")
     binance_base_url: str = Field(default="https://api.binance.com", alias="BINANCE_BASE_URL")
+    binance_futures_base_url: str = Field(default="https://fapi.binance.com", alias="BINANCE_FUTURES_BASE_URL")
+    binance_derivatives_data_enabled: bool = Field(default=False, alias="BINANCE_DERIVATIVES_DATA_ENABLED")
     binance_ws_url: str = Field(
         default="wss://stream.binance.com:9443/ws",
         alias="BINANCE_WS_URL",
     )
 
     database_url: str = Field(default="sqlite:///./data/binance_ai_bot.db", alias="DATABASE_URL")
+    heatmap_provider: str = Field(default="mock", alias="HEATMAP_PROVIDER")
+    heatmap_vendor_base_url: str = Field(default="", alias="HEATMAP_VENDOR_BASE_URL")
+    heatmap_vendor_api_key: str = Field(default="", alias="HEATMAP_VENDOR_API_KEY")
+    heatmap_vendor_name: str = Field(default="", alias="HEATMAP_VENDOR_NAME")
+    heatmap_vendor_clusters_path: str = Field(default="", alias="HEATMAP_VENDOR_CLUSTERS_PATH")
+    heatmap_vendor_symbol_param: str = Field(default="symbol", alias="HEATMAP_VENDOR_SYMBOL_PARAM")
+    heatmap_request_timeout_seconds: int = Field(default=10, alias="HEATMAP_REQUEST_TIMEOUT_SECONDS")
 
     @property
     def symbol_list(self) -> list[str]:

@@ -12,6 +12,8 @@
   EventItem,
   EdgeReportResponse,
   FillItem,
+  FuturesLivePriceResponse,
+  FuturesLiveSubscriptionResponse,
   FuturesOpportunityScanResponse,
   HealthResponse,
   HistoryFilters,
@@ -19,6 +21,9 @@
   MarketSentimentResponse,
   PaginatedResponse,
   PnlHistoryResponse,
+  PostSignalHistoryResponse,
+  PostSignalPerformanceSummaryResponse,
+  PostSignalSnapshotResponse,
   PerformanceAnalyticsResponse,
   PaperTradeReviewResponse,
   ModuleAttributionResponse,
@@ -38,6 +43,8 @@
   WorkstationResponse,
   RangeFilters,
   RegimeAnalysisResponse,
+  ScannerValidationEvaluateResponse,
+  ScannerValidationReportResponse,
   SpotSymbolItem,
   SignalValidationResponse,
   SimilarSetupResponse,
@@ -47,25 +54,82 @@
 } from './types';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '/api';
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const FUTURES_SCANNER_TIMEOUT_MS = 60_000;
+
+export type ApiErrorCategory =
+  | 'backend_unavailable'
+  | 'scanner_timeout'
+  | 'binance_unavailable'
+  | 'network_proxy_error'
+  | 'http_error'
+  | 'unknown';
+
+export class ApiRequestError extends Error {
+  category: ApiErrorCategory;
+  status?: number;
+
+  constructor(message: string, category: ApiErrorCategory, status?: number) {
+    super(message);
+    this.name = 'ApiRequestError';
+    this.category = category;
+    this.status = status;
+  }
+}
+
+interface RequestJsonOptions extends RequestInit {
+  timeoutMs?: number;
+}
 
 function buildUrl(path: string, params?: URLSearchParams): string {
   const suffix = params && params.toString().length > 0 ? `?${params.toString()}` : '';
   return `${API_BASE_URL}${path}${suffix}`;
 }
 
-async function requestJson<T>(path: string, params?: URLSearchParams, init?: RequestInit): Promise<T> {
-  const response = await fetch(buildUrl(path, params), {
-    ...init,
-    headers: {
-      Accept: 'application/json',
-      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
-      ...(init?.headers ?? {}),
-    },
-  });
+async function requestJson<T>(path: string, params?: URLSearchParams, init?: RequestJsonOptions): Promise<T> {
+  const timeoutMs = init?.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  init?.signal?.addEventListener('abort', () => controller.abort(), { once: true });
+  const { timeoutMs: _timeoutMs, signal: _signal, ...fetchInit } = init ?? {};
+
+  let response: Response;
+  try {
+    response = await fetch(buildUrl(path, params), {
+      ...fetchInit,
+      signal: controller.signal,
+      headers: {
+        Accept: 'application/json',
+        ...(fetchInit?.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(fetchInit?.headers ?? {}),
+      },
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new ApiRequestError('Request timed out before the backend returned a response.', 'scanner_timeout');
+    }
+    if (error instanceof TypeError) {
+      throw new ApiRequestError('Network or proxy error while contacting the backend.', 'network_proxy_error');
+    }
+    throw new ApiRequestError(error instanceof Error ? error.message : 'Unknown network error.', 'unknown');
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+  void _timeoutMs;
+  void _signal;
 
   if (!response.ok) {
     const detail = await response.text();
-    throw new Error(`Request failed (${response.status}): ${detail || response.statusText}`);
+    if (response.status === 502 || response.status === 503) {
+      throw new ApiRequestError('Backend unavailable. The API server may be offline or restarting.', 'backend_unavailable', response.status);
+    }
+    if (response.status === 504 || response.status === 408) {
+      throw new ApiRequestError('Scanner timed out before the backend completed.', 'scanner_timeout', response.status);
+    }
+    if (response.status === 429 || response.status >= 500) {
+      throw new ApiRequestError(`Binance API or backend dependency is temporarily unavailable (${response.status}).`, 'binance_unavailable', response.status);
+    }
+    throw new ApiRequestError(`Request failed (${response.status}): ${detail || response.statusText}`, 'http_error', response.status);
   }
 
   return (await response.json()) as T;
@@ -117,6 +181,26 @@ export function getPerformanceAnalytics(
   const params = buildRangeParams(filters);
   params.set('symbol', symbol.trim().toUpperCase());
   return requestJson<PerformanceAnalyticsResponse>('/performance', params);
+}
+
+export function getPostSignalPerformanceSummary(horizon = '15m'): Promise<PostSignalPerformanceSummaryResponse> {
+  const params = new URLSearchParams();
+  params.set('horizon', horizon);
+  return requestJson<PostSignalPerformanceSummaryResponse>('/performance/summary', params);
+}
+
+export function getPostSignalHistory(symbol?: string, limit = 10): Promise<PostSignalHistoryResponse> {
+  const params = new URLSearchParams();
+  if (symbol && symbol.trim().length > 0) {
+    params.set('symbol', symbol.trim().toUpperCase());
+  }
+  params.set('limit', String(limit));
+  params.set('offset', '0');
+  return requestJson<PostSignalHistoryResponse>('/performance/signal-history', params);
+}
+
+export function getPostSignalDetail(signalId: string): Promise<PostSignalSnapshotResponse> {
+  return requestJson<PostSignalSnapshotResponse>(`/performance/signal/${encodeURIComponent(signalId)}`);
 }
 
 export function getTradeQualityAnalytics(
@@ -173,6 +257,16 @@ export function getAdaptiveRecommendations(
   const params = buildRangeParams(filters);
   params.set('symbol', symbol.trim().toUpperCase());
   return requestJson<AdaptiveRecommendationResponse>('/performance/adaptive-recommendations', params);
+}
+
+export function getScannerValidationReport(): Promise<ScannerValidationReportResponse> {
+  return requestJson<ScannerValidationReportResponse>('/performance/scanner-validation-report');
+}
+
+export function evaluateScannerValidation(): Promise<ScannerValidationEvaluateResponse> {
+  return requestJson<ScannerValidationEvaluateResponse>('/performance/scanner-validation/evaluate', undefined, {
+    method: 'POST',
+  });
 }
 
 export function getPaperTradeReview(
@@ -347,13 +441,34 @@ export interface FuturesOpportunityFilters {
 
 export function getFuturesOpportunities(filters: FuturesOpportunityFilters): Promise<FuturesOpportunityScanResponse> {
   const params = new URLSearchParams({
-    limit: String(filters.maxSymbols),
+    max_symbols: String(filters.maxSymbols),
     min_opportunity_score: String(filters.minOpportunityScore),
     include_weak_evidence: filters.includeWeakEvidence ? 'true' : 'false',
     horizon: filters.horizon,
     include_avoid: filters.includeAvoid ? 'true' : 'false',
+    scan_timeout_seconds: '45',
   });
-  return requestJson<FuturesOpportunityScanResponse>('/bot/futures-opportunities', params);
+  return requestJson<FuturesOpportunityScanResponse>('/bot/futures-opportunities', params, {
+    timeoutMs: FUTURES_SCANNER_TIMEOUT_MS,
+  });
+}
+
+export function getFuturesLivePrices(symbols: string[]): Promise<FuturesLivePriceResponse> {
+  const normalized = Array.from(new Set(symbols.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean)));
+  const params = new URLSearchParams({ symbols: normalized.join(',') });
+  return requestJson<FuturesLivePriceResponse>('/bot/futures-opportunities/live-prices', params);
+}
+
+export function updateFuturesLiveSubscriptions(symbols: string[]): Promise<FuturesLiveSubscriptionResponse> {
+  const normalized = Array.from(new Set(symbols.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean))).slice(0, 100);
+  return requestJson<FuturesLiveSubscriptionResponse>(
+    '/bot/futures-opportunities/live-subscriptions',
+    undefined,
+    {
+      method: 'POST',
+      body: JSON.stringify({ symbols: normalized }),
+    },
+  );
 }
 
 export function getAISignal(symbol: string): Promise<AISignalSummary | null> {

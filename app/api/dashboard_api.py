@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from app.api.dependencies import DashboardDataAccess, get_dashboard_data_access
 from app.config import Settings, get_settings
+from app.data.heatmap_provider import get_heatmap_provider_selection, get_heatmap_snapshot
 from app.monitoring.adaptive_recommendations import (
     AdaptiveRecommendation,
     AdaptiveRecommendationReport,
@@ -40,6 +41,21 @@ from app.monitoring.profile_calibration import (
     build_profile_calibration_report,
     with_tuning_previews,
 )
+from app.monitoring.scanner_validation_report import (
+    SCANNER_VALIDATION_HORIZONS,
+    ScannerBaselineComparison,
+    ScannerValidationGroupPerformance,
+    ScannerValidationReport,
+    StopLossTakeProfitAnalysis,
+    build_scanner_validation_report,
+    evaluate_pending_scanner_snapshots,
+)
+from app.monitoring.performance_summary import (
+    PostSignalGroupSummary,
+    PostSignalPerformanceSummary,
+    build_post_signal_performance_summary,
+)
+from app.monitoring.signal_outcomes import evaluate_pending_signal_outcomes
 from app.monitoring.signal_validation import (
     EdgeReport,
     GroupPerformanceMetric,
@@ -76,6 +92,8 @@ from app.storage.models import (
     PnlSnapshotRecord,
     PositionSnapshotRecord,
     RunnerEventRecord,
+    SignalOutcomeRecord,
+    SignalOutcomeSnapshotRecord,
     TradeRecord,
 )
 
@@ -561,6 +579,257 @@ class AdaptiveRecommendationResponse(BaseModel):
     recommendations: list[AdaptiveRecommendationItemResponse]
 
 
+class ScannerValidationQueryParams(BaseModel):
+    """Filters for futures scanner paper-validation reports."""
+
+    start_date: date | None = None
+    end_date: date | None = None
+    horizon: str | None = None
+    direction: str | None = None
+    min_opportunity_score: int | None = Field(default=None, ge=0, le=100)
+    symbol: str | None = None
+
+    @model_validator(mode="after")
+    def validate_filters(self) -> "ScannerValidationQueryParams":
+        """Validate scanner-validation filters."""
+
+        if self.start_date is not None and self.end_date is not None and self.end_date < self.start_date:
+            raise ValueError("end_date must be greater than or equal to start_date")
+        if self.horizon is not None and self.horizon not in SCANNER_VALIDATION_HORIZONS:
+            raise ValueError("horizon must be one of 15m, 1h, 4h, 24h")
+        if self.direction is not None:
+            self.direction = self.direction.lower()
+            if self.direction not in {"long", "short", "wait", "avoid"}:
+                raise ValueError("direction must be one of long, short, wait, avoid")
+        if self.symbol is not None:
+            self.symbol = self.symbol.upper()
+        return self
+
+
+class ScannerValidationGroupPerformanceResponse(BaseModel):
+    """Serialized scanner-validation grouped performance."""
+
+    name: str
+    sample_size: int
+    win_rate: Decimal | None = None
+    average_net_return: Decimal | None = None
+    expectancy: Decimal | None = None
+
+
+class ScannerBaselineComparisonResponse(BaseModel):
+    """Serialized scanner-vs-random-baseline comparison."""
+
+    scanner_sample_size: int
+    random_baseline_sample_size: int
+    scanner_average_net_return: Decimal | None = None
+    random_baseline_average_net_return: Decimal | None = None
+    scanner_win_rate: Decimal | None = None
+    random_baseline_win_rate: Decimal | None = None
+    edge_vs_random: Decimal | None = None
+
+
+class StopLossTakeProfitAnalysisResponse(BaseModel):
+    """Serialized stop-loss/take-profit analysis."""
+
+    sample_size: int
+    take_profit_hit_rate: Decimal | None = None
+    stop_loss_hit_rate: Decimal | None = None
+    neither_hit_rate: Decimal | None = None
+    take_profit_first: int
+    stop_loss_first: int
+
+
+class ScannerValidationReportResponse(BaseModel):
+    """Futures scanner paper-validation report response."""
+
+    generated_at: datetime
+    total_snapshots: int
+    evaluated_snapshots: int
+    pending_snapshots: int
+    win_rate: Decimal | None = None
+    expectancy: Decimal | None = None
+    average_win: Decimal | None = None
+    average_loss: Decimal | None = None
+    average_net_return: Decimal | None = None
+    max_drawdown: Decimal | None = None
+    scanner_vs_random_baseline: ScannerBaselineComparisonResponse
+    opportunity_score_bucket_performance: list[ScannerValidationGroupPerformanceResponse]
+    direction_performance: list[ScannerValidationGroupPerformanceResponse]
+    horizon_performance: list[ScannerValidationGroupPerformanceResponse]
+    stop_loss_take_profit_analysis: StopLossTakeProfitAnalysisResponse
+    best_symbols: list[ScannerValidationGroupPerformanceResponse]
+    worst_symbols: list[ScannerValidationGroupPerformanceResponse]
+    best_regimes: list[ScannerValidationGroupPerformanceResponse]
+    weak_conditions: list[str]
+    conclusion: str
+    warnings: list[str]
+    paper_validation: bool = True
+    advisory_only: bool = True
+    live_trading_enabled: bool = False
+    real_futures_execution_enabled: bool = False
+
+
+class ScannerValidationEvaluateResponse(BaseModel):
+    """Manual scanner-validation evaluation response."""
+
+    evaluated_outcomes: int
+    idempotent: bool
+    message: str
+
+
+class PostSignalOutcomeResponse(BaseModel):
+    """Serialized fixed-horizon post-signal outcome."""
+
+    id: int | None = None
+    signal_id: str
+    horizon: str
+    future_price: Decimal | None = None
+    price_change_percent: Decimal | None = None
+    max_upside_percent: Decimal | None = None
+    max_downside_percent: Decimal | None = None
+    did_price_hit_tp: bool
+    did_price_hit_sl: bool
+    direction_correct: bool | None = None
+    volatility_range: Decimal | None = None
+    first_hit: str | None = None
+    time_to_hit_seconds: int | None = None
+    sweep_direction_actual: str
+    sweep_prediction_correct: bool | None = None
+    outcome_state: str
+    evaluated_at: datetime
+    base_signal_correct: bool | None = None
+    heatmap_signal_correct: bool | None = None
+    did_heatmap_improve_result: bool | None = None
+    did_heatmap_reduce_loss: bool | None = None
+    predicted_sweep_direction: str = "none"
+    actual_sweep_direction: str = "none"
+
+
+class PostSignalSnapshotResponse(BaseModel):
+    """Serialized generated signal snapshot with any evaluated outcomes."""
+
+    id: str
+    symbol: str
+    timestamp: datetime
+    source: str
+    signal_type: str
+    confidence: int
+    entry_price: Decimal | None = None
+    liquidity_bias: str | None = None
+    sweep_risk: str | None = None
+    nearest_liquidity_above: Decimal | None = None
+    nearest_liquidity_below: Decimal | None = None
+    funding_rate: Decimal | None = None
+    open_interest: Decimal | None = None
+    notes: str
+    heatmap_liquidity_above: Decimal | None = None
+    heatmap_liquidity_below: Decimal | None = None
+    heatmap_intensity_score: int | None = None
+    heatmap_bias: str | None = None
+    base_signal_type: str | None = None
+    heatmap_signal_type: str | None = None
+    base_confidence: int | None = None
+    heatmap_confidence: int | None = None
+    heatmap_alignment: str | None = None
+    heatmap_explanation: str | None = None
+    heatmap_provider: str | None = None
+    heatmap_data_quality: str | None = None
+    heatmap_is_real_data: bool | None = None
+    heatmap_provider_status: str | None = None
+    liquidation_pressure: str | None = None
+    liquidation_imbalance: Decimal | None = None
+    outcomes: list[PostSignalOutcomeResponse] = Field(default_factory=list)
+
+
+class PostSignalHistoryResponse(BaseModel):
+    """Paginated post-signal snapshot history."""
+
+    items: list[PostSignalSnapshotResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+class PostSignalGroupSummaryResponse(BaseModel):
+    """Serialized post-signal grouped summary metrics."""
+
+    name: str
+    total_signals: int
+    evaluated_signals: int
+    win_rate: Decimal | None = None
+    avg_return: Decimal | None = None
+    avg_max_upside: Decimal | None = None
+    avg_max_drawdown: Decimal | None = None
+    tp_hit_rate: Decimal | None = None
+    sl_hit_rate: Decimal | None = None
+
+
+class PostSignalPerformanceSummaryResponse(BaseModel):
+    """Post-signal outcome performance summary."""
+
+    generated_at: datetime
+    total_signals: int
+    evaluated_signals: int
+    win_rate: Decimal | None = None
+    avg_return: Decimal | None = None
+    avg_max_upside: Decimal | None = None
+    avg_max_drawdown: Decimal | None = None
+    tp_hit_rate: Decimal | None = None
+    sl_hit_rate: Decimal | None = None
+    base_win_rate: Decimal | None = None
+    heatmap_win_rate: Decimal | None = None
+    delta_win_rate: Decimal | None = None
+    base_avg_return: Decimal | None = None
+    heatmap_avg_return: Decimal | None = None
+    heatmap_accuracy_on_sweep_prediction: Decimal | None = None
+    heatmap_false_signal_rate: Decimal | None = None
+    heatmap_signal_count_by_data_quality: dict[str, int] = Field(default_factory=dict)
+    win_rate_by_heatmap_data_quality: dict[str, Decimal | None] = Field(default_factory=dict)
+    sweep_accuracy_by_data_quality: dict[str, Decimal | None] = Field(default_factory=dict)
+    avg_return_by_data_quality: dict[str, Decimal | None] = Field(default_factory=dict)
+    by_signal_type: list[PostSignalGroupSummaryResponse]
+    by_confidence_bucket: list[PostSignalGroupSummaryResponse]
+    by_liquidity_bias: list[PostSignalGroupSummaryResponse]
+    by_source: list[PostSignalGroupSummaryResponse]
+    paper_validation: bool = True
+    advisory_only: bool = True
+    live_trading_enabled: bool = False
+
+
+class HeatmapSnapshotResponse(BaseModel):
+    """Serialized normalized heatmap snapshot."""
+
+    symbol: str
+    provider: str
+    provider_status: str
+    timestamp: datetime
+    current_price: Decimal | None = None
+    nearest_liquidity_above: Decimal | None = None
+    nearest_liquidity_below: Decimal | None = None
+    liquidity_above_intensity: int
+    liquidity_below_intensity: int
+    heatmap_intensity_score: int
+    heatmap_bias: str
+    liquidation_pressure: str
+    liquidation_imbalance: Decimal | None = None
+    data_quality: str
+    is_real_data: bool
+    explanation: str
+
+
+class HeatmapStatusResponse(BaseModel):
+    """Heatmap provider diagnostic status."""
+
+    configured_provider: str
+    active_provider: str
+    provider_status: str
+    is_real_data: bool
+    data_quality: str
+    last_update_time: datetime | None = None
+    latest_snapshot: HeatmapSnapshotResponse
+    explanation: str
+
+
 class TradeQualityQueryParams(BaseModel):
     """Query parameters for symbol-scoped trade-quality analytics."""
 
@@ -995,6 +1264,166 @@ def _to_adaptive_recommendation_response(
             _to_adaptive_recommendation_item_response(item)
             for item in report.recommendations
         ],
+    )
+
+
+def _to_scanner_validation_group_response(
+    record: ScannerValidationGroupPerformance,
+) -> ScannerValidationGroupPerformanceResponse:
+    """Convert scanner-validation group performance into a response model."""
+
+    return ScannerValidationGroupPerformanceResponse(**asdict(record))
+
+
+def _to_scanner_baseline_response(record: ScannerBaselineComparison) -> ScannerBaselineComparisonResponse:
+    """Convert scanner baseline comparison into a response model."""
+
+    return ScannerBaselineComparisonResponse(**asdict(record))
+
+
+def _to_tp_sl_analysis_response(record: StopLossTakeProfitAnalysis) -> StopLossTakeProfitAnalysisResponse:
+    """Convert scanner TP/SL analysis into a response model."""
+
+    return StopLossTakeProfitAnalysisResponse(**asdict(record))
+
+
+def _to_scanner_validation_report_response(
+    report: ScannerValidationReport,
+) -> ScannerValidationReportResponse:
+    """Convert scanner validation analytics into an API response."""
+
+    return ScannerValidationReportResponse(
+        generated_at=report.generated_at,
+        total_snapshots=report.total_snapshots,
+        evaluated_snapshots=report.evaluated_snapshots,
+        pending_snapshots=report.pending_snapshots,
+        win_rate=report.win_rate,
+        expectancy=report.expectancy,
+        average_win=report.average_win,
+        average_loss=report.average_loss,
+        average_net_return=report.average_net_return,
+        max_drawdown=report.max_drawdown,
+        scanner_vs_random_baseline=_to_scanner_baseline_response(report.scanner_vs_random_baseline),
+        opportunity_score_bucket_performance=[
+            _to_scanner_validation_group_response(item)
+            for item in report.opportunity_score_bucket_performance
+        ],
+        direction_performance=[
+            _to_scanner_validation_group_response(item) for item in report.direction_performance
+        ],
+        horizon_performance=[
+            _to_scanner_validation_group_response(item) for item in report.horizon_performance
+        ],
+        stop_loss_take_profit_analysis=_to_tp_sl_analysis_response(report.stop_loss_take_profit_analysis),
+        best_symbols=[_to_scanner_validation_group_response(item) for item in report.best_symbols],
+        worst_symbols=[_to_scanner_validation_group_response(item) for item in report.worst_symbols],
+        best_regimes=[_to_scanner_validation_group_response(item) for item in report.best_regimes],
+        weak_conditions=report.weak_conditions,
+        conclusion=report.conclusion,
+        warnings=report.warnings,
+    )
+
+
+def _to_post_signal_outcome_response(record: SignalOutcomeRecord) -> PostSignalOutcomeResponse:
+    return PostSignalOutcomeResponse(**asdict(record))
+
+
+def _to_post_signal_snapshot_response(
+    snapshot: SignalOutcomeSnapshotRecord,
+    outcomes: list[SignalOutcomeRecord],
+) -> PostSignalSnapshotResponse:
+    return PostSignalSnapshotResponse(
+        id=snapshot.id,
+        symbol=snapshot.symbol,
+        timestamp=snapshot.timestamp,
+        source=snapshot.source,
+        signal_type=snapshot.signal_type,
+        confidence=snapshot.confidence,
+        entry_price=snapshot.entry_price,
+        liquidity_bias=snapshot.liquidity_bias,
+        sweep_risk=snapshot.sweep_risk,
+        nearest_liquidity_above=snapshot.nearest_liquidity_above,
+        nearest_liquidity_below=snapshot.nearest_liquidity_below,
+        funding_rate=snapshot.funding_rate,
+        open_interest=snapshot.open_interest,
+        notes=snapshot.notes,
+        heatmap_liquidity_above=snapshot.heatmap_liquidity_above,
+        heatmap_liquidity_below=snapshot.heatmap_liquidity_below,
+        heatmap_intensity_score=snapshot.heatmap_intensity_score,
+        heatmap_bias=snapshot.heatmap_bias,
+        base_signal_type=snapshot.base_signal_type,
+        heatmap_signal_type=snapshot.heatmap_signal_type,
+        base_confidence=snapshot.base_confidence,
+        heatmap_confidence=snapshot.heatmap_confidence,
+        heatmap_alignment=snapshot.heatmap_alignment,
+        heatmap_explanation=snapshot.heatmap_explanation,
+        heatmap_provider=snapshot.heatmap_provider,
+        heatmap_data_quality=snapshot.heatmap_data_quality,
+        heatmap_is_real_data=snapshot.heatmap_is_real_data,
+        heatmap_provider_status=snapshot.heatmap_provider_status,
+        liquidation_pressure=snapshot.liquidation_pressure,
+        liquidation_imbalance=snapshot.liquidation_imbalance,
+        outcomes=[_to_post_signal_outcome_response(outcome) for outcome in outcomes],
+    )
+
+
+def _to_post_signal_group_summary_response(record: PostSignalGroupSummary) -> PostSignalGroupSummaryResponse:
+    return PostSignalGroupSummaryResponse(**asdict(record))
+
+
+def _to_post_signal_performance_summary_response(
+    summary: PostSignalPerformanceSummary,
+) -> PostSignalPerformanceSummaryResponse:
+    return PostSignalPerformanceSummaryResponse(
+        generated_at=summary.generated_at,
+        total_signals=summary.total_signals,
+        evaluated_signals=summary.evaluated_signals,
+        win_rate=summary.win_rate,
+        avg_return=summary.avg_return,
+        avg_max_upside=summary.avg_max_upside,
+        avg_max_drawdown=summary.avg_max_drawdown,
+        tp_hit_rate=summary.tp_hit_rate,
+        sl_hit_rate=summary.sl_hit_rate,
+        base_win_rate=summary.base_win_rate,
+        heatmap_win_rate=summary.heatmap_win_rate,
+        delta_win_rate=summary.delta_win_rate,
+        base_avg_return=summary.base_avg_return,
+        heatmap_avg_return=summary.heatmap_avg_return,
+        heatmap_accuracy_on_sweep_prediction=summary.heatmap_accuracy_on_sweep_prediction,
+        heatmap_false_signal_rate=summary.heatmap_false_signal_rate,
+        heatmap_signal_count_by_data_quality=summary.heatmap_signal_count_by_data_quality,
+        win_rate_by_heatmap_data_quality=summary.win_rate_by_heatmap_data_quality,
+        sweep_accuracy_by_data_quality=summary.sweep_accuracy_by_data_quality,
+        avg_return_by_data_quality=summary.avg_return_by_data_quality,
+        by_signal_type=[_to_post_signal_group_summary_response(item) for item in summary.by_signal_type],
+        by_confidence_bucket=[
+            _to_post_signal_group_summary_response(item) for item in summary.by_confidence_bucket
+        ],
+        by_liquidity_bias=[
+            _to_post_signal_group_summary_response(item) for item in summary.by_liquidity_bias
+        ],
+        by_source=[_to_post_signal_group_summary_response(item) for item in summary.by_source],
+    )
+
+
+def _to_heatmap_snapshot_response(snapshot) -> HeatmapSnapshotResponse:
+    return HeatmapSnapshotResponse(
+        symbol=snapshot.symbol,
+        provider=snapshot.provider,
+        provider_status=snapshot.provider_status,
+        timestamp=snapshot.timestamp,
+        current_price=snapshot.current_price,
+        nearest_liquidity_above=snapshot.nearest_liquidity_above,
+        nearest_liquidity_below=snapshot.nearest_liquidity_below,
+        liquidity_above_intensity=snapshot.liquidity_above_intensity,
+        liquidity_below_intensity=snapshot.liquidity_below_intensity,
+        heatmap_intensity_score=snapshot.heatmap_intensity_score,
+        heatmap_bias=snapshot.heatmap_bias,
+        liquidation_pressure=snapshot.liquidation_pressure,
+        liquidation_imbalance=snapshot.liquidation_imbalance,
+        data_quality=snapshot.data_quality,
+        is_real_data=snapshot.is_real_data,
+        explanation=snapshot.explanation,
     )
 
 
@@ -1675,6 +2104,158 @@ def get_adaptive_recommendations(
             risk_grade=query.risk_grade,
         )
     )
+
+
+@router.get("/performance/scanner-validation-report", response_model=ScannerValidationReportResponse)
+def get_scanner_validation_report(
+    query: Annotated[ScannerValidationQueryParams, Depends()],
+    data_access: Annotated[DashboardDataAccess, Depends(get_dashboard_data_access)],
+) -> ScannerValidationReportResponse:
+    """Return paper-validation analytics for futures scanner snapshots."""
+
+    snapshots = data_access.repository.get_scanner_validation_snapshots(
+        symbol=query.symbol,
+        start_date=query.start_date,
+        end_date=query.end_date,
+        direction=query.direction,
+        min_opportunity_score=query.min_opportunity_score,
+    )
+    outcomes = data_access.repository.get_scanner_validation_outcomes(
+        snapshot_ids=[snapshot.id for snapshot in snapshots if snapshot.id is not None],
+        horizon=query.horizon,
+    )
+    return _to_scanner_validation_report_response(
+        build_scanner_validation_report(
+            snapshots=snapshots,
+            outcomes=outcomes,
+            start_date=query.start_date,
+            end_date=query.end_date,
+            horizon=query.horizon,
+            direction=query.direction,
+            min_opportunity_score=query.min_opportunity_score,
+            symbol=query.symbol,
+        )
+    )
+
+
+@router.get("/heatmap/snapshot/{symbol}", response_model=HeatmapSnapshotResponse)
+def get_heatmap_snapshot_endpoint(
+    symbol: str,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> HeatmapSnapshotResponse:
+    """Return the current normalized heatmap snapshot for a symbol."""
+
+    snapshot = get_heatmap_snapshot(symbol=symbol.upper(), settings=settings)
+    return _to_heatmap_snapshot_response(snapshot)
+
+
+@router.get("/heatmap/status", response_model=HeatmapStatusResponse)
+def get_heatmap_status(
+    settings: Annotated[Settings, Depends(get_settings)],
+    symbol: str = Query(default="BTCUSDT"),
+) -> HeatmapStatusResponse:
+    """Return heatmap provider status and data-quality labeling."""
+
+    selection = get_heatmap_provider_selection(settings)
+    snapshot = get_heatmap_snapshot(symbol=symbol.upper(), settings=settings)
+    return HeatmapStatusResponse(
+        configured_provider=selection.configured_provider,
+        active_provider=selection.active_provider,
+        provider_status=selection.provider_status if snapshot.provider_status == "fallback" else snapshot.provider_status,
+        is_real_data=snapshot.is_real_data,
+        data_quality=snapshot.data_quality,
+        last_update_time=snapshot.timestamp,
+        latest_snapshot=_to_heatmap_snapshot_response(snapshot),
+        explanation=f"{selection.explanation} {snapshot.explanation}",
+    )
+
+
+@router.post("/performance/scanner-validation/evaluate", response_model=ScannerValidationEvaluateResponse)
+def evaluate_scanner_validation(
+    data_access: Annotated[DashboardDataAccess, Depends(get_dashboard_data_access)],
+) -> ScannerValidationEvaluateResponse:
+    """Manually evaluate matured scanner-validation snapshots."""
+
+    evaluated = evaluate_pending_scanner_snapshots(repository=data_access.repository)
+    return ScannerValidationEvaluateResponse(
+        evaluated_outcomes=evaluated,
+        idempotent=True,
+        message="Pending scanner paper-validation outcomes evaluated where stored candles are available.",
+    )
+
+
+@router.get("/performance/summary", response_model=PostSignalPerformanceSummaryResponse)
+def get_post_signal_performance_summary(
+    data_access: Annotated[DashboardDataAccess, Depends(get_dashboard_data_access)],
+    horizon: str = Query(default="15m"),
+) -> PostSignalPerformanceSummaryResponse:
+    """Return aggregate post-signal outcome metrics."""
+
+    if horizon not in {"5m", "15m", "1h", "4h", "24h"}:
+        raise HTTPException(status_code=400, detail="horizon must be one of 5m, 15m, 1h, 4h, 24h")
+    evaluate_pending_signal_outcomes(repository=data_access.repository)
+    snapshots = data_access.repository.get_signal_outcome_snapshots()
+    outcomes = data_access.repository.get_signal_outcomes(signal_ids=[snapshot.id for snapshot in snapshots])
+    return _to_post_signal_performance_summary_response(
+        build_post_signal_performance_summary(
+            snapshots=snapshots,
+            outcomes=outcomes,
+            horizon=horizon,
+        )
+    )
+
+
+@router.get("/performance/signal-history", response_model=PostSignalHistoryResponse)
+def get_post_signal_history(
+    data_access: Annotated[DashboardDataAccess, Depends(get_dashboard_data_access)],
+    symbol: str | None = None,
+    source: str | None = None,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> PostSignalHistoryResponse:
+    """Return generated signal snapshots and evaluated outcomes."""
+
+    evaluate_pending_signal_outcomes(repository=data_access.repository)
+    normalized_symbol = symbol.strip().upper() if symbol else None
+    normalized_source = source.strip().lower() if source else None
+    total_items = data_access.repository.get_signal_outcome_snapshots(
+        symbol=normalized_symbol,
+        source=normalized_source,
+    )
+    snapshots = data_access.repository.get_signal_outcome_snapshots(
+        symbol=normalized_symbol,
+        source=normalized_source,
+        limit=limit,
+        offset=offset,
+    )
+    outcomes = data_access.repository.get_signal_outcomes(signal_ids=[snapshot.id for snapshot in snapshots])
+    outcomes_by_signal: dict[str, list[SignalOutcomeRecord]] = {}
+    for outcome in outcomes:
+        outcomes_by_signal.setdefault(outcome.signal_id, []).append(outcome)
+    return PostSignalHistoryResponse(
+        items=[
+            _to_post_signal_snapshot_response(snapshot, outcomes_by_signal.get(snapshot.id, []))
+            for snapshot in snapshots
+        ],
+        total=len(total_items),
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/performance/signal/{signal_id}", response_model=PostSignalSnapshotResponse)
+def get_post_signal_detail(
+    signal_id: str,
+    data_access: Annotated[DashboardDataAccess, Depends(get_dashboard_data_access)],
+) -> PostSignalSnapshotResponse:
+    """Return one generated signal snapshot with its outcomes."""
+
+    evaluate_pending_signal_outcomes(repository=data_access.repository)
+    snapshot = data_access.repository.get_signal_outcome_snapshot(signal_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="signal not found")
+    outcomes = data_access.repository.get_signal_outcomes(signal_ids=[snapshot.id])
+    return _to_post_signal_snapshot_response(snapshot, outcomes)
 
 
 @router.get("/performance", response_model=PerformanceAnalyticsResponse)

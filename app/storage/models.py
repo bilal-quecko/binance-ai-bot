@@ -233,6 +233,123 @@ class HistoricalCandleRecord:
 
 
 @dataclass(slots=True)
+class ScannerValidationSnapshotRecord:
+    """Persisted futures-paper scanner signal snapshot for outcome validation."""
+
+    id: int | None
+    scan_id: str
+    symbol: str
+    direction: str
+    price_at_scan: Decimal | None
+    opportunity_score: int
+    confidence: int
+    horizon: str
+    risk_grade: str
+    trend_score: int
+    momentum_score: int
+    volatility_quality_score: int
+    liquidity_score: int
+    risk_score: int
+    direction_score: int
+    validation_score: int | None
+    evidence_strength: str
+    stop_loss: Decimal | None
+    take_profit: Decimal | None
+    timestamp: datetime
+    rank_position: int
+    candidate_group: str
+    regime_label: str | None = None
+    data_source: str | None = None
+
+
+@dataclass(slots=True)
+class ScannerValidationOutcomeRecord:
+    """Persisted forward outcome for one scanner-validation horizon."""
+
+    id: int | None
+    snapshot_id: int
+    horizon: str
+    future_price: Decimal | None
+    gross_return_pct: Decimal | None
+    estimated_fee_pct: Decimal
+    estimated_slippage_pct: Decimal
+    net_return_pct: Decimal | None
+    direction_correct: bool | None
+    max_favorable_move_pct: Decimal | None
+    max_adverse_move_pct: Decimal | None
+    take_profit_hit: bool
+    stop_loss_hit: bool
+    first_exit: str | None
+    outcome_state: str
+    evaluated_at: datetime
+
+
+@dataclass(slots=True)
+class SignalOutcomeSnapshotRecord:
+    """Persisted generated signal snapshot for post-signal outcome tracking."""
+
+    id: str
+    symbol: str
+    timestamp: datetime
+    source: str
+    signal_type: str
+    confidence: int
+    entry_price: Decimal | None
+    liquidity_bias: str | None
+    sweep_risk: str | None
+    nearest_liquidity_above: Decimal | None
+    nearest_liquidity_below: Decimal | None
+    funding_rate: Decimal | None
+    open_interest: Decimal | None
+    notes: str
+    heatmap_liquidity_above: Decimal | None = None
+    heatmap_liquidity_below: Decimal | None = None
+    heatmap_intensity_score: int | None = None
+    heatmap_bias: str | None = None
+    base_signal_type: str | None = None
+    heatmap_signal_type: str | None = None
+    base_confidence: int | None = None
+    heatmap_confidence: int | None = None
+    heatmap_alignment: str | None = None
+    heatmap_explanation: str | None = None
+    heatmap_provider: str | None = None
+    heatmap_data_quality: str | None = None
+    heatmap_is_real_data: bool | None = None
+    heatmap_provider_status: str | None = None
+    liquidation_pressure: str | None = None
+    liquidation_imbalance: Decimal | None = None
+
+
+@dataclass(slots=True)
+class SignalOutcomeRecord:
+    """Persisted fixed-horizon outcome for one generated signal."""
+
+    id: int | None
+    signal_id: str
+    horizon: str
+    future_price: Decimal | None
+    price_change_percent: Decimal | None
+    max_upside_percent: Decimal | None
+    max_downside_percent: Decimal | None
+    did_price_hit_tp: bool
+    did_price_hit_sl: bool
+    direction_correct: bool | None
+    volatility_range: Decimal | None
+    first_hit: str | None
+    time_to_hit_seconds: int | None
+    sweep_direction_actual: str
+    sweep_prediction_correct: bool | None
+    outcome_state: str
+    evaluated_at: datetime
+    base_signal_correct: bool | None = None
+    heatmap_signal_correct: bool | None = None
+    did_heatmap_improve_result: bool | None = None
+    did_heatmap_reduce_loss: bool | None = None
+    predicted_sweep_direction: str = "none"
+    actual_sweep_direction: str = "none"
+
+
+@dataclass(slots=True)
 class RuntimeSessionRecord:
     """Persisted backend-owned runtime session state."""
 

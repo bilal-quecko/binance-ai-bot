@@ -2,11 +2,15 @@
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from typing import Any, Protocol
 
 import websockets
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class WebSocketReceiver(Protocol):
@@ -40,7 +44,7 @@ class BinanceWebSocketClient:
     def _build_stream_url(self, streams: Sequence[str]) -> str:
         """Build a Binance combined stream URL."""
 
-        normalized_streams = [stream.strip().lower() for stream in streams if stream.strip()]
+        normalized_streams = [stream.strip() for stream in streams if stream.strip()]
         if not normalized_streams:
             raise ValueError("At least one Binance websocket stream is required.")
 
@@ -64,14 +68,18 @@ class BinanceWebSocketClient:
 
         while True:
             try:
+                LOGGER.info("Connecting Binance websocket combined stream: %s", url)
                 async with self._connector(url) as websocket:
+                    LOGGER.info("Connected Binance websocket combined stream: %s", url)
                     backoff = self._reconnect_delay
                     while True:
                         raw_message = await websocket.recv()
+                        LOGGER.debug("Received Binance websocket message: %s", raw_message[:500])
                         payload = json.loads(raw_message)
                         yield payload.get("data", payload)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                LOGGER.warning("Binance websocket stream disconnected; reconnecting in %.2fs: %s", backoff, exc)
                 await self._sleep(backoff)
                 backoff = min(backoff * 2, self._max_reconnect_delay)

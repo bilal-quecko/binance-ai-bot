@@ -11,6 +11,22 @@ from typing import Literal
 from app.analysis.regime import RegimeAnalysisSnapshot
 from app.analysis.technical import TechnicalAnalysisSnapshot
 from app.market_data.candles import Candle
+from app.monitoring.crowd_positioning import CrowdPositioningSnapshot, NEUTRAL_CROWD_POSITIONING
+from app.monitoring.liquidity_bias import (
+    NEUTRAL_LIQUIDITY_BIAS,
+    LiquidityBiasInput,
+    LiquidityBiasSnapshot,
+    estimate_liquidity_bias,
+)
+from app.monitoring.liquidity_zones import (
+    NEUTRAL_LIQUIDITY_ZONES,
+    LiquidityZoneSnapshot,
+    estimate_liquidity_zones,
+)
+from app.monitoring.liquidation_intelligence import (
+    LiquidationIntelligenceSnapshot,
+    NEUTRAL_LIQUIDATION_INTELLIGENCE,
+)
 from app.monitoring.similar_setups import SimilarSetupReport
 from app.monitoring.trade_eligibility import TradeEligibilityResult
 
@@ -58,6 +74,42 @@ class FuturesPaperSignal:
     eligibility_status: str
     warnings: tuple[str, ...]
     timestamp: datetime
+    data_source: str = "binance_usdm_futures"
+    price_type: str = "futures_last_price"
+    liquidity_bias: str = "neutral"
+    liquidity_pressure: str = "low"
+    likely_liquidation_direction: str = "none"
+    trap_risk: str = "low"
+    liquidity_explanation: str = NEUTRAL_LIQUIDITY_BIAS.explanation
+    upside_liquidity_zone_level: Decimal | None = None
+    upside_liquidity_zone_strength: str = "low"
+    upside_liquidity_zone_reason: str = "No clear estimated liquidity zone."
+    downside_liquidity_zone_level: Decimal | None = None
+    downside_liquidity_zone_strength: str = "low"
+    downside_liquidity_zone_reason: str = "No clear estimated liquidity zone."
+    nearest_liquidity_target_direction: str = "none"
+    nearest_liquidity_target_level: Decimal | None = None
+    nearest_liquidity_target_distance_pct: Decimal | None = None
+    nearest_liquidity_target_strength: str = "low"
+    sweep_risk: str = "none"
+    trade_timing_adjustment: str = "wait_for_confirmation"
+    tp_sl_alignment: str = "needs_review"
+    liquidity_zone_explanation: str = NEUTRAL_LIQUIDITY_ZONES.explanation
+    liquidity_adjusted_note: str | None = None
+    crowd_side: str = "balanced"
+    crowd_strength: str = "low"
+    squeeze_risk: str = "low"
+    funding_rate: Decimal | None = None
+    open_interest: Decimal | None = None
+    oi_trend: str = "neutral"
+    liquidation_signal: str = "none"
+    liquidation_intensity: str = "low"
+    dominant_side: str = "balanced"
+    liquidation_explanation: str = NEUTRAL_LIQUIDATION_INTELLIGENCE.explanation
+    liquidation_volume_long: Decimal = Decimal("0")
+    liquidation_volume_short: Decimal = Decimal("0")
+    liquidation_imbalance_ratio: Decimal = Decimal("0")
+    liquidation_event_frequency: Decimal = Decimal("0")
 
 
 @dataclass(slots=True)
@@ -72,6 +124,10 @@ class FuturesOpportunityScanReport:
     warnings: list[str] = field(default_factory=list)
     scanned_count: int = 0
     failed_symbols: list[str] = field(default_factory=list)
+    futures_symbol_universe_source: str = "unavailable"
+    symbol_count: int = 0
+    last_successful_fetch_at: datetime | None = None
+    latest_error: str | None = None
 
 
 @dataclass(slots=True)
@@ -91,6 +147,13 @@ class FuturesSignalContext:
     blocker_reasons: Sequence[str] = ()
     warnings: Sequence[str] = ()
     spread_ratio_pct: Decimal | None = None
+    liquidity_bias: LiquidityBiasSnapshot | None = None
+    liquidity_zones: LiquidityZoneSnapshot | None = None
+    crowd_positioning: CrowdPositioningSnapshot | None = None
+    funding_rate: Decimal | None = None
+    open_interest: Decimal | None = None
+    oi_trend: str = "neutral"
+    liquidation_intelligence: LiquidationIntelligenceSnapshot | None = None
 
 
 class FuturesOpportunityScanner:
@@ -144,6 +207,7 @@ class FuturesOpportunityScanner:
 
         technical = context.technical_analysis
         regime = context.regime_analysis
+        liquidity = _liquidity_snapshot(context)
         market_scores = _market_scores(context.candles, context.higher_timeframe_candles)
         evidence_strength = _evidence_strength(context.similar_setup, context.trade_eligibility)
         validation_score = _validation_score(evidence_strength)
@@ -157,7 +221,16 @@ class FuturesOpportunityScanner:
             liquidity_score=market_scores.liquidity_score,
             risk_score=market_scores.risk_score,
         )
-        warnings = list(dict.fromkeys((*context.warnings, *_regime_warnings(regime), *_safety_warnings(risk_grade, regime_label))))
+        warnings = list(
+            dict.fromkeys(
+                (
+                    *context.warnings,
+                    *_regime_warnings(regime),
+                    *_safety_warnings(risk_grade, regime_label),
+                    *_liquidity_warnings(liquidity),
+                )
+            )
+        )
         eligibility_status = _eligibility_status(context.trade_eligibility)
         fee_impact = _estimated_fee_impact(context.spread_ratio_pct)
         long_score = _long_score(context, market_scores=market_scores)
@@ -172,10 +245,14 @@ class FuturesOpportunityScanner:
             risk_score=market_scores.risk_score,
             validation_score=validation_score,
         )
-        confidence = _confidence_from_scores(
-            opportunity_score=opportunity_score,
-            validation_score=validation_score,
-            risk_score=market_scores.risk_score,
+        confidence = _liquidity_adjusted_confidence(
+            direction=None,
+            liquidity=liquidity,
+            confidence=_confidence_from_scores(
+                opportunity_score=opportunity_score,
+                validation_score=validation_score,
+                risk_score=market_scores.risk_score,
+            ),
         )
 
         blocking_reason = _blocking_reason(
@@ -200,10 +277,16 @@ class FuturesOpportunityScanner:
                 fee_impact=fee_impact,
                 reason=blocking_reason,
                 warnings=tuple(warnings),
+                liquidity=liquidity,
                 timestamp=timestamp,
             )
 
         if opportunity_score >= 70 and long_score >= short_score + 10:
+            long_confidence = _liquidity_adjusted_confidence(
+                direction="long",
+                liquidity=liquidity,
+                confidence=confidence,
+            )
             return _build_signal(
                 context=context,
                 direction="long",
@@ -211,7 +294,7 @@ class FuturesOpportunityScanner:
                 opportunity_score=opportunity_score,
                 direction_score=long_score,
                 validation_score=validation_score,
-                confidence=confidence,
+                confidence=long_confidence,
                 evidence_strength=evidence_strength,
                 risk_grade=risk_grade,
                 current_price=current_price,
@@ -223,10 +306,16 @@ class FuturesOpportunityScanner:
                     momentum=market_scores.momentum,
                 ),
                 warnings=tuple(warnings),
+                liquidity=liquidity,
                 timestamp=timestamp,
             )
 
         if opportunity_score >= 70 and short_score >= long_score + 10:
+            short_confidence = _liquidity_adjusted_confidence(
+                direction="short",
+                liquidity=liquidity,
+                confidence=confidence,
+            )
             return _build_signal(
                 context=context,
                 direction="short",
@@ -234,7 +323,7 @@ class FuturesOpportunityScanner:
                 opportunity_score=opportunity_score,
                 direction_score=short_score,
                 validation_score=validation_score,
-                confidence=confidence,
+                confidence=short_confidence,
                 evidence_strength=evidence_strength,
                 risk_grade=risk_grade,
                 current_price=current_price,
@@ -246,6 +335,7 @@ class FuturesOpportunityScanner:
                     momentum=market_scores.momentum,
                 ),
                 warnings=tuple(warnings),
+                liquidity=liquidity,
                 timestamp=timestamp,
             )
 
@@ -266,6 +356,7 @@ class FuturesOpportunityScanner:
             fee_impact=fee_impact,
             reason=wait_reason,
             warnings=tuple(warnings),
+            liquidity=liquidity,
             timestamp=timestamp,
         )
 
@@ -343,9 +434,25 @@ def _build_signal(
     fee_impact: Decimal | None,
     reason: str,
     warnings: tuple[str, ...],
+    liquidity: LiquidityBiasSnapshot | None = None,
     timestamp: datetime,
 ) -> FuturesPaperSignal:
     stop_loss, take_profit = _risk_levels(direction=direction, candles=context.candles, current_price=current_price)
+    liquidity_snapshot = liquidity or _liquidity_snapshot(context)
+    regime_label = context.regime_analysis.regime_label if context.regime_analysis is not None else None
+    liquidity_zones = context.liquidity_zones or estimate_liquidity_zones(
+        symbol=context.symbol,
+        candles=context.candles,
+        current_price=current_price,
+        trade_direction=direction,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        liquidity_bias=liquidity_snapshot,
+        crowd_positioning=context.crowd_positioning,
+        regime_label=regime_label,
+    )
+    zone_note = _crowd_note(context.crowd_positioning) or _liquidity_zone_note(direction=direction, zones=liquidity_zones)
+    liquidation = context.liquidation_intelligence or NEUTRAL_LIQUIDATION_INTELLIGENCE
     return FuturesPaperSignal(
         symbol=context.symbol,
         direction=direction,
@@ -363,7 +470,7 @@ def _build_signal(
         momentum=scores.momentum,
         best_horizon=context.preferred_horizon or "15m",
         risk_grade=risk_grade,
-        regime=context.regime_analysis.regime_label if context.regime_analysis is not None else None,
+        regime=regime_label,
         current_price=current_price,
         reason=reason,
         invalidation_hint=context.invalidation_hint or _invalidation_hint(direction, stop_loss),
@@ -378,8 +485,42 @@ def _build_signal(
         ),
         similar_setup_summary=_similar_summary(context.similar_setup),
         eligibility_status=_eligibility_status(context.trade_eligibility),
-        warnings=warnings,
+        warnings=tuple(dict.fromkeys((*warnings, *_liquidity_zone_warnings(liquidity_zones)))),
         timestamp=timestamp,
+        liquidity_bias=liquidity_snapshot.liquidity_bias,
+        liquidity_pressure=liquidity_snapshot.liquidity_pressure,
+        likely_liquidation_direction=liquidity_snapshot.likely_liquidation_direction,
+        trap_risk=liquidity_snapshot.trap_risk,
+        liquidity_explanation=liquidity_snapshot.explanation,
+        upside_liquidity_zone_level=liquidity_zones.upside_liquidity_zone.level,
+        upside_liquidity_zone_strength=liquidity_zones.upside_liquidity_zone.strength,
+        upside_liquidity_zone_reason=liquidity_zones.upside_liquidity_zone.reason,
+        downside_liquidity_zone_level=liquidity_zones.downside_liquidity_zone.level,
+        downside_liquidity_zone_strength=liquidity_zones.downside_liquidity_zone.strength,
+        downside_liquidity_zone_reason=liquidity_zones.downside_liquidity_zone.reason,
+        nearest_liquidity_target_direction=liquidity_zones.nearest_liquidity_target.direction,
+        nearest_liquidity_target_level=liquidity_zones.nearest_liquidity_target.level,
+        nearest_liquidity_target_distance_pct=liquidity_zones.nearest_liquidity_target.distance_pct,
+        nearest_liquidity_target_strength=liquidity_zones.nearest_liquidity_target.strength,
+        sweep_risk=liquidity_zones.sweep_risk,
+        trade_timing_adjustment=liquidity_zones.trade_timing_adjustment,
+        tp_sl_alignment=liquidity_zones.tp_sl_alignment,
+        liquidity_zone_explanation=liquidity_zones.explanation,
+        liquidity_adjusted_note=zone_note,
+        crowd_side=(context.crowd_positioning or NEUTRAL_CROWD_POSITIONING).crowd_side,
+        crowd_strength=(context.crowd_positioning or NEUTRAL_CROWD_POSITIONING).crowd_strength,
+        squeeze_risk=(context.crowd_positioning or NEUTRAL_CROWD_POSITIONING).squeeze_risk,
+        funding_rate=context.funding_rate,
+        open_interest=context.open_interest,
+        oi_trend=context.oi_trend,
+        liquidation_signal=liquidation.liquidation_signal,
+        liquidation_intensity=liquidation.liquidation_intensity,
+        dominant_side=liquidation.dominant_side,
+        liquidation_explanation=liquidation.explanation,
+        liquidation_volume_long=liquidation.liquidation_volume_long,
+        liquidation_volume_short=liquidation.liquidation_volume_short,
+        liquidation_imbalance_ratio=liquidation.imbalance_ratio,
+        liquidation_event_frequency=liquidation.event_frequency,
     )
 
 
@@ -547,6 +688,84 @@ def _safety_warnings(risk_grade: FuturesRiskGrade, regime_label: str | None) -> 
     if regime_label in {"choppy", "low_liquidity"}:
         warnings.append("Directional futures-paper trades are avoided in choppy or low-liquidity regimes.")
     return tuple(warnings)
+
+
+def _liquidity_snapshot(context: FuturesSignalContext) -> LiquidityBiasSnapshot:
+    if context.liquidity_bias is not None:
+        return context.liquidity_bias
+    volatility_regime = (
+        context.technical_analysis.volatility_regime
+        if context.technical_analysis is not None
+        else None
+    )
+    return estimate_liquidity_bias(
+        LiquidityBiasInput(
+            symbol=context.symbol,
+            candles=context.candles,
+            funding_rate=context.funding_rate,
+            crowd_positioning=context.crowd_positioning,
+            volatility_regime=volatility_regime,
+        )
+    )
+
+
+def _liquidity_warnings(liquidity: LiquidityBiasSnapshot) -> tuple[str, ...]:
+    if liquidity.liquidity_pressure == "low" and liquidity.trap_risk == "low":
+        return ()
+    return (liquidity.explanation,)
+
+
+def _liquidity_zone_warnings(zones: LiquidityZoneSnapshot) -> tuple[str, ...]:
+    warnings: list[str] = []
+    if zones.trade_timing_adjustment == "wait_for_sweep":
+        warnings.append("Estimated liquidity sweep risk suggests waiting for confirmation.")
+    if zones.trade_timing_adjustment == "avoid_chop":
+        warnings.append("Estimated liquidity is concentrated on both sides in choppy structure.")
+    if zones.tp_sl_alignment == "stop_too_close_to_liquidity":
+        warnings.append("Suggested stop is close to an estimated liquidity zone.")
+    return tuple(warnings)
+
+
+def _liquidity_zone_note(*, direction: FuturesDirection, zones: LiquidityZoneSnapshot) -> str | None:
+    if direction in {"long", "short"} and zones.trade_timing_adjustment == "wait_for_sweep":
+        return "Estimated liquidity sweep risk may make this paper entry early."
+    if zones.trade_timing_adjustment == "avoid_chop":
+        return "Estimated two-sided liquidity suggests choppy sweep risk."
+    if direction in {"long", "short"} and zones.tp_sl_alignment == "stop_too_close_to_liquidity":
+        return "Suggested stop is close to estimated liquidity and may need review."
+    return None
+
+
+def _crowd_note(crowd: CrowdPositioningSnapshot | None) -> str | None:
+    if crowd is None or crowd.crowd_side == "balanced":
+        return None
+    if crowd.crowd_side == "long_crowded":
+        return "Crowd: Long heavy -> downside risk"
+    if crowd.crowd_side == "short_crowded":
+        return "Crowd: Short heavy -> squeeze risk"
+    return None
+
+
+def _liquidity_adjusted_confidence(
+    *,
+    direction: FuturesDirection | None,
+    liquidity: LiquidityBiasSnapshot,
+    confidence: int,
+) -> int:
+    adjustment = 0
+    if liquidity.liquidity_pressure == "high":
+        adjustment -= 3
+    if direction == "long":
+        if liquidity.trap_risk == "long_trap":
+            adjustment -= 8 if liquidity.liquidity_pressure == "high" else 4
+        elif liquidity.trap_risk == "short_trap":
+            adjustment += 4
+    if direction == "short":
+        if liquidity.trap_risk == "short_trap":
+            adjustment -= 8 if liquidity.liquidity_pressure == "high" else 4
+        elif liquidity.trap_risk == "long_trap":
+            adjustment += 4
+    return max(0, min(100, confidence + adjustment))
 
 
 def _estimated_fee_impact(spread_ratio_pct: Decimal | None) -> Decimal | None:

@@ -12,6 +12,7 @@ This project is a paper-mode signal intelligence workstation for Binance symbols
 - Manual paper buy and close flows are stable.
 - Signal validation, regime analysis, similar setup outcomes, trade eligibility, and adaptive recommendations exist.
 - A paper-only Futures Long/Short Opportunity Scanner is available for advisory ranking only.
+- The futures scanner can scan up to 100 symbols and includes a display-only paper leverage risk simulator.
 - LONG futures scanner candidates should render green, SHORT candidates red, and WAIT/AVOID candidates neutral.
 
 ## Safety Baseline
@@ -98,15 +99,16 @@ npm run build
 - Similar setup engine: compares current setups against stored historical outcomes when sample size is sufficient.
 - Trade eligibility gate: advisory evidence-based gate for paper automation consideration.
 - Adaptive recommendations: report-only threshold and rule suggestions from measured outcomes.
-- Paper futures scanner: advisory LONG/SHORT/WAIT/AVOID opportunity ranking without execution.
+- Paper futures scanner: advisory LONG/SHORT/WAIT/AVOID opportunity ranking without execution, with 20/50/100-symbol scan sizes, display-only leverage-risk simulation, and event-based liquidation intelligence fields.
+- Liquidation event intelligence: interprets recent Binance force-order events into cascade, exhaustion, sweep-confirmation, noise, and no-activity context. This uses observed liquidation events only; it does not fabricate predictive liquidation levels.
 
 ## Main UI
 
-The primary screen is designed for a selected symbol. It shows the current signal, confidence, risk grade, regime, eligibility, invalidation point, recommended action, and paper-mode safety labels. The operator should not need to read every advanced module to understand the current advisory view.
+The primary screen is designed as a premium dark trading dashboard for a selected symbol. It keeps top navigation, compact market sidebars, a central AI Trading Assistant decision card, chart context, key insight cards, and paper-mode safety labels visible without requiring the operator to read every advanced module.
 
 ## Advanced Details - Pro
 
-`Advanced Details - Pro` keeps the deeper modules available without cluttering the main V1 workflow. It contains detailed technical analysis, market sentiment, symbol sentiment, pattern analysis, AI advisory, fusion signal, signal validation, regime, similar setups, trade eligibility, adaptive recommendations, performance analytics, paper trade review, profile calibration, diagnostics, and related evidence panels.
+`Advanced Details - Pro` keeps the deeper modules available without cluttering the main V1 workflow. It contains detailed technical analysis, market sentiment, symbol sentiment, pattern analysis, AI advisory, fusion signal, liquidation-event intelligence, signal validation, regime, similar setups, trade eligibility, adaptive recommendations, performance analytics, paper trade review, profile calibration, diagnostics, and related evidence panels.
 
 Advanced details are for validation and due diligence. They must not bypass paper-only execution controls.
 
@@ -129,9 +131,9 @@ Advanced details are for validation and due diligence. They must not bypass pape
 
 ## Paper Trading Limitations
 
-Paper trading is a simulation. It does not fully model exchange latency, partial fills, liquidity shocks, downtime, liquidation, funding, or real order-book execution. Paper results are useful for validation, but they are not proof of live profitability.
+Paper trading is a simulation. It does not fully model exchange latency, partial fills, liquidity shocks, downtime, liquidation, funding, or real order-book execution. Binance force-order data is event-based and retrospective. Paper results are useful for validation, but they are not proof of live profitability.
 
-The futures scanner is also paper-only and advisory-only. It does not open persistent futures positions and does not place Binance futures orders.
+The futures scanner is also paper-only and advisory-only. Its leverage simulator estimates paper TP, SL, live return, fees/slippage, and risk labels for display only. It does not open persistent futures positions and does not place Binance futures orders.
 
 ## SQLite Troubleshooting
 

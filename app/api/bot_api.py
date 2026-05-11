@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 import json
 import logging
+import time
 from typing import Annotated, Literal
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -33,6 +36,13 @@ from app.bot import BotStatus, PaperBotRuntime, WorkstationState
 from app.bot.runtime import PersistenceState
 from app.config import Settings, get_settings
 from app.data.historical_candles import SupportedInterval, interval_to_timedelta, now_utc, parse_rest_kline
+from app.data.heatmap_provider import HeatmapSignalEnrichment, enrich_signal_with_heatmap
+from app.data.binance_liquidation_feed import get_global_liquidation_feed_service
+from app.data.binance_derivatives_data import (
+    BinanceDerivativesSnapshot,
+    fallback_derivatives_snapshot,
+    get_derivatives_snapshot,
+)
 from app.exchange.binance_rest import BinanceRestClient
 from app.data import MarketContextService
 from app.features.feature_store import FeatureEngine
@@ -71,12 +81,79 @@ from app.monitoring.futures_opportunity_scanner import (
     FuturesSignalContext,
     MIN_CANDLES_FOR_FUTURES_SIGNAL,
 )
+from app.monitoring.liquidity_bias import (
+    NEUTRAL_LIQUIDITY_BIAS,
+    LiquidityBiasInput,
+    LiquidityBiasSnapshot,
+    estimate_liquidity_bias,
+)
+from app.monitoring.crowd_positioning import (
+    CrowdPositioningSnapshot,
+    NEUTRAL_CROWD_POSITIONING,
+    crowd_positioning_from_derivatives,
+)
+from app.monitoring.liquidity_zones import (
+    NEUTRAL_LIQUIDITY_ZONES,
+    LiquidityZone,
+    LiquidityZoneSnapshot,
+    NearestLiquidityTarget,
+    estimate_liquidity_zones,
+    validate_liquidity_zones_with_liquidations,
+)
+from app.monitoring.liquidation_intelligence import (
+    LiquidationIntelligenceSnapshot,
+    NEUTRAL_LIQUIDATION_INTELLIGENCE,
+    interpret_liquidation_events,
+)
+from app.monitoring.scanner_validation_report import persist_scanner_validation_snapshots
+from app.monitoring.signal_outcomes import SignalSnapshotInput, persist_signal_snapshot
+from app.monitoring.futures_scanner_ws_heartbeat import (
+    FuturesScannerLivePrice,
+    FuturesScannerWebSocketHeartbeatService,
+    sanitize_scanner_symbols,
+)
 
 router = APIRouter()
 LOGGER = logging.getLogger(__name__)
 
 DataState = Literal["ready", "waiting_for_runtime", "waiting_for_history", "degraded_storage"]
 ChartTimeframe = Literal["1m", "5m", "15m", "1h"]
+FuturesSymbolUniverseSource = Literal["live", "cache", "fallback", "unavailable"]
+FUTURES_SYMBOL_UNIVERSE_CACHE_TTL = timedelta(minutes=20)
+FUTURES_SCANNER_FALLBACK_SYMBOLS = (
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "LTCUSDT",
+)
+
+
+@dataclass(slots=True)
+class FuturesSymbolUniverseCacheEntry:
+    """In-memory USD-M Futures universe cache entry."""
+
+    records: list[SpotSymbolRecord]
+    fetched_at: datetime
+    latest_error: str | None = None
+
+
+@dataclass(slots=True)
+class FuturesSymbolUniverseResult:
+    """Resolved USD-M Futures universe with diagnostics for the scanner response."""
+
+    records: list[SpotSymbolRecord]
+    source: FuturesSymbolUniverseSource
+    last_successful_fetch_at: datetime | None
+    latest_error: str | None = None
+
+
+_FUTURES_SYMBOL_UNIVERSE_CACHE: dict[str, FuturesSymbolUniverseCacheEntry] = {}
 
 
 @dataclass(slots=True)
@@ -89,7 +166,11 @@ class SignalAnalysisContext:
     technical_analysis: TechnicalAnalysisSnapshot | None
     market_sentiment: MarketSentimentSnapshot | None
     symbol_sentiment: SymbolSentimentSnapshot | None
+    liquidity_bias: LiquidityBiasSnapshot
     benchmark_candles: list[Candle]
+    crowd_positioning: CrowdPositioningSnapshot = NEUTRAL_CROWD_POSITIONING
+    derivatives_data: BinanceDerivativesSnapshot | None = None
+    liquidation_intelligence: LiquidationIntelligenceSnapshot = NEUTRAL_LIQUIDATION_INTELLIGENCE
 
 
 class PersistenceHealthResponse(BaseModel):
@@ -204,6 +285,23 @@ class SimilarSetupSummaryResponse(BaseModel):
     matched_attributes: list[str] = Field(default_factory=list)
 
 
+class LiquidityZoneResponse(BaseModel):
+    """Estimated liquidity zone, not an exact liquidation level."""
+
+    level: Decimal | None = None
+    strength: Literal["low", "medium", "high"] = "low"
+    reason: str = "No clear estimated liquidity zone."
+
+
+class NearestLiquidityTargetResponse(BaseModel):
+    """Nearest estimated liquidity target relative to current price."""
+
+    direction: Literal["up", "down", "none"] = "none"
+    level: Decimal | None = None
+    distance_pct: Decimal | None = None
+    strength: Literal["low", "medium", "high"] = "low"
+
+
 class TradingAssistantResponse(BaseModel):
     """Beginner-friendly symbol decision summary."""
 
@@ -221,6 +319,67 @@ class TradingAssistantResponse(BaseModel):
     data_state: DataState
     backfill_status: BackfillStatusResponse
     similar_setup: SimilarSetupSummaryResponse | None = None
+    liquidity_bias: Literal["bullish", "bearish", "neutral"] = "neutral"
+    liquidity_pressure: Literal["low", "medium", "high"] = "low"
+    likely_liquidation_direction: Literal["up", "down", "none"] = "none"
+    trap_risk: Literal["long_trap", "short_trap", "low"] = "low"
+    liquidity_explanation: str = NEUTRAL_LIQUIDITY_BIAS.explanation
+    upside_liquidity_zone: LiquidityZoneResponse = Field(default_factory=LiquidityZoneResponse)
+    downside_liquidity_zone: LiquidityZoneResponse = Field(default_factory=LiquidityZoneResponse)
+    nearest_liquidity_target: NearestLiquidityTargetResponse = Field(default_factory=NearestLiquidityTargetResponse)
+    sweep_risk: Literal["none", "upside_sweep", "downside_sweep", "both_sides"] = "none"
+    trade_timing_adjustment: Literal[
+        "enter_now",
+        "wait_for_sweep",
+        "wait_for_confirmation",
+        "avoid_chop",
+    ] = "wait_for_confirmation"
+    tp_sl_alignment: Literal[
+        "aligned",
+        "stop_too_close_to_liquidity",
+        "target_before_liquidity",
+        "target_after_liquidity",
+        "needs_review",
+    ] = "needs_review"
+    liquidity_zone_explanation: str = NEUTRAL_LIQUIDITY_ZONES.explanation
+    crowd_side: Literal["long_crowded", "short_crowded", "balanced"] = "balanced"
+    crowd_strength: Literal["low", "medium", "high"] = "low"
+    squeeze_risk: Literal["long_squeeze", "short_squeeze", "low"] = "low"
+    positioning_explanation: str = NEUTRAL_CROWD_POSITIONING.explanation
+    funding_rate: Decimal | None = None
+    open_interest: Decimal | None = None
+    oi_trend: Literal["rising", "falling", "neutral"] = "neutral"
+    heatmap_liquidity_above: Decimal | None = None
+    heatmap_liquidity_below: Decimal | None = None
+    heatmap_intensity_score: int | None = None
+    heatmap_bias: Literal["upside_squeeze", "downside_sweep", "neutral"] = "neutral"
+    base_signal_type: str = "WAIT"
+    heatmap_signal_type: str = "WAIT"
+    base_confidence: int = 0
+    heatmap_confidence: int = 0
+    heatmap_alignment: Literal["confirmed", "conflict", "neutral"] = "neutral"
+    heatmap_explanation: str = "Heatmap unavailable."
+    heatmap_provider: str = "mock"
+    heatmap_data_quality: str = "mock"
+    heatmap_is_real_data: bool = False
+    heatmap_provider_status: str = "available"
+    liquidation_pressure: Literal["low", "medium", "high"] = "low"
+    liquidation_imbalance: Decimal | None = None
+    liquidation_signal: Literal[
+        "none",
+        "cascade_down",
+        "cascade_up",
+        "exhaustion",
+        "sweep_confirmation",
+        "noise",
+    ] = "none"
+    liquidation_intensity: Literal["low", "medium", "high"] = "low"
+    dominant_side: Literal["longs_liquidated", "shorts_liquidated", "balanced"] = "balanced"
+    liquidation_explanation: str = NEUTRAL_LIQUIDATION_INTELLIGENCE.explanation
+    liquidation_volume_long: Decimal = Decimal("0")
+    liquidation_volume_short: Decimal = Decimal("0")
+    liquidation_imbalance_ratio: Decimal = Decimal("0")
+    liquidation_event_frequency: Decimal = Decimal("0")
 
 
 class TradeEligibilityResponse(BaseModel):
@@ -239,6 +398,37 @@ class TradeEligibilityResponse(BaseModel):
     regime_summary: str
     fee_slippage_summary: str
     warnings: list[str] = Field(default_factory=list)
+    liquidity_zone_summary: str = "No liquidity-zone estimate is available yet."
+    sweep_risk: Literal["none", "upside_sweep", "downside_sweep", "both_sides"] = "none"
+    trade_timing_adjustment: Literal[
+        "enter_now",
+        "wait_for_sweep",
+        "wait_for_confirmation",
+        "avoid_chop",
+    ] = "wait_for_confirmation"
+    tp_sl_alignment: Literal[
+        "aligned",
+        "stop_too_close_to_liquidity",
+        "target_before_liquidity",
+        "target_after_liquidity",
+        "needs_review",
+    ] = "needs_review"
+    crowd_side: Literal["long_crowded", "short_crowded", "balanced"] = "balanced"
+    crowd_strength: Literal["low", "medium", "high"] = "low"
+    squeeze_risk: Literal["long_squeeze", "short_squeeze", "low"] = "low"
+    funding_rate: Decimal | None = None
+    open_interest: Decimal | None = None
+    oi_trend: Literal["rising", "falling", "neutral"] = "neutral"
+    liquidation_signal: Literal[
+        "none",
+        "cascade_down",
+        "cascade_up",
+        "exhaustion",
+        "sweep_confirmation",
+        "noise",
+    ] = "none"
+    liquidation_intensity: Literal["low", "medium", "high"] = "low"
+    dominant_side: Literal["longs_liquidated", "shorts_liquidated", "balanced"] = "balanced"
     paper_only: bool = True
     advisory_only: bool = True
     live_trading_enabled: bool = False
@@ -281,6 +471,8 @@ class FuturesPaperSignalResponse(BaseModel):
     risk_grade: Literal["low", "medium", "high"]
     regime: str | None = None
     current_price: Decimal | None = None
+    data_source: Literal["binance_usdm_futures"] = "binance_usdm_futures"
+    price_type: Literal["mark_price", "futures_last_price"] = "futures_last_price"
     reason: str
     invalidation_hint: str | None = None
     suggested_entry_zone: str | None = None
@@ -293,6 +485,67 @@ class FuturesPaperSignalResponse(BaseModel):
     eligibility_status: str
     warnings: list[str] = Field(default_factory=list)
     timestamp: datetime
+    liquidity_bias: Literal["bullish", "bearish", "neutral"] = "neutral"
+    liquidity_pressure: Literal["low", "medium", "high"] = "low"
+    likely_liquidation_direction: Literal["up", "down", "none"] = "none"
+    trap_risk: Literal["long_trap", "short_trap", "low"] = "low"
+    liquidity_explanation: str = NEUTRAL_LIQUIDITY_BIAS.explanation
+    upside_liquidity_zone: LiquidityZoneResponse = Field(default_factory=LiquidityZoneResponse)
+    downside_liquidity_zone: LiquidityZoneResponse = Field(default_factory=LiquidityZoneResponse)
+    nearest_liquidity_target: NearestLiquidityTargetResponse = Field(default_factory=NearestLiquidityTargetResponse)
+    sweep_risk: Literal["none", "upside_sweep", "downside_sweep", "both_sides"] = "none"
+    trade_timing_adjustment: Literal[
+        "enter_now",
+        "wait_for_sweep",
+        "wait_for_confirmation",
+        "avoid_chop",
+    ] = "wait_for_confirmation"
+    tp_sl_alignment: Literal[
+        "aligned",
+        "stop_too_close_to_liquidity",
+        "target_before_liquidity",
+        "target_after_liquidity",
+        "needs_review",
+    ] = "needs_review"
+    liquidity_zone_explanation: str = NEUTRAL_LIQUIDITY_ZONES.explanation
+    liquidity_adjusted_note: str | None = None
+    crowd_side: Literal["long_crowded", "short_crowded", "balanced"] = "balanced"
+    crowd_strength: Literal["low", "medium", "high"] = "low"
+    squeeze_risk: Literal["long_squeeze", "short_squeeze", "low"] = "low"
+    funding_rate: Decimal | None = None
+    open_interest: Decimal | None = None
+    oi_trend: Literal["rising", "falling", "neutral"] = "neutral"
+    heatmap_liquidity_above: Decimal | None = None
+    heatmap_liquidity_below: Decimal | None = None
+    heatmap_intensity_score: int | None = None
+    heatmap_bias: Literal["upside_squeeze", "downside_sweep", "neutral"] = "neutral"
+    base_signal_type: str = "WAIT"
+    heatmap_signal_type: str = "WAIT"
+    base_confidence: int = 0
+    heatmap_confidence: int = 0
+    heatmap_alignment: Literal["confirmed", "conflict", "neutral"] = "neutral"
+    heatmap_explanation: str = "Heatmap unavailable."
+    heatmap_provider: str = "mock"
+    heatmap_data_quality: str = "mock"
+    heatmap_is_real_data: bool = False
+    heatmap_provider_status: str = "available"
+    liquidation_pressure: Literal["low", "medium", "high"] = "low"
+    liquidation_imbalance: Decimal | None = None
+    liquidation_signal: Literal[
+        "none",
+        "cascade_down",
+        "cascade_up",
+        "exhaustion",
+        "sweep_confirmation",
+        "noise",
+    ] = "none"
+    liquidation_intensity: Literal["low", "medium", "high"] = "low"
+    dominant_side: Literal["longs_liquidated", "shorts_liquidated", "balanced"] = "balanced"
+    liquidation_explanation: str = NEUTRAL_LIQUIDATION_INTELLIGENCE.explanation
+    liquidation_volume_long: Decimal = Decimal("0")
+    liquidation_volume_short: Decimal = Decimal("0")
+    liquidation_imbalance_ratio: Decimal = Decimal("0")
+    liquidation_event_frequency: Decimal = Decimal("0")
 
 
 class FuturesOpportunityScanResponse(BaseModel):
@@ -311,6 +564,45 @@ class FuturesOpportunityScanResponse(BaseModel):
     live_futures_trading_enabled: bool = False
     real_orders_enabled: bool = False
     max_leverage_suggestion: str = "3x paper-only"
+    futures_symbol_universe_source: Literal["live", "cache", "fallback", "unavailable"] = "unavailable"
+    symbol_count: int = 0
+    last_successful_fetch_at: datetime | None = None
+    latest_error: str | None = None
+
+
+class FuturesLivePriceItemResponse(BaseModel):
+    """Lightweight live price heartbeat for a scanner symbol."""
+
+    symbol: str
+    live_price: Decimal | None = None
+    updated_at: datetime
+    source: Literal["websocket", "rest", "cache", "unavailable"]
+    data_source: Literal["binance_usdm_futures"] = "binance_usdm_futures"
+    price_type: Literal["mark_price", "futures_last_price"] = "mark_price"
+    stale: bool = False
+    warning: str | None = None
+
+
+class FuturesLivePriceResponse(BaseModel):
+    """Live price heartbeat response for visible futures scanner candidates."""
+
+    items: list[FuturesLivePriceItemResponse]
+    warnings: list[str] = Field(default_factory=list)
+
+
+class FuturesLiveSubscriptionRequest(BaseModel):
+    """Visible scanner symbols for websocket heartbeat subscriptions."""
+
+    symbols: list[str] = Field(default_factory=list)
+
+
+class FuturesLiveSubscriptionResponse(BaseModel):
+    """WebSocket heartbeat subscription state."""
+
+    symbols: list[str] = Field(default_factory=list)
+    count: int
+    websocket_enabled: bool
+    warning: str | None = None
 
 
 class TopOfBookResponse(BaseModel):
@@ -758,6 +1050,17 @@ def _build_signal_analysis_context(
         benchmark_symbol="BTCUSDT" if benchmark_candles else None,
         benchmark_closes=[candle.close for candle in benchmark_candles[-24:]],
     )
+    liquidity_bias = estimate_liquidity_bias(
+        LiquidityBiasInput(
+            symbol=symbol,
+            candles=candles,
+            volatility_regime=(
+                technical_analysis.volatility_regime
+                if technical_analysis is not None and technical_analysis.data_state == "ready"
+                else None
+            ),
+        )
+    )
     return SignalAnalysisContext(
         symbol=symbol,
         candles=candles,
@@ -765,8 +1068,78 @@ def _build_signal_analysis_context(
         technical_analysis=technical_analysis,
         market_sentiment=market_sentiment,
         symbol_sentiment=symbol_sentiment,
+        liquidity_bias=liquidity_bias,
         benchmark_candles=benchmark_candles,
     )
+
+
+async def _load_crowd_positioning(
+    *,
+    settings: Settings,
+    symbol: str,
+) -> tuple[BinanceDerivativesSnapshot, CrowdPositioningSnapshot]:
+    """Load Binance funding/OI crowd-positioning inputs with safe fallback."""
+
+    if not settings.binance_derivatives_data_enabled:
+        derivatives = fallback_derivatives_snapshot(symbol)
+        return derivatives, crowd_positioning_from_derivatives(derivatives)
+    derivatives = await get_derivatives_snapshot(symbol, settings=settings)
+    crowd = crowd_positioning_from_derivatives(derivatives)
+    return derivatives, crowd
+
+
+def _apply_crowd_positioning_to_context(
+    *,
+    context: SignalAnalysisContext,
+    crowd: CrowdPositioningSnapshot,
+    derivatives: BinanceDerivativesSnapshot,
+) -> SignalAnalysisContext:
+    """Update context liquidity bias with derivatives-based crowd positioning."""
+
+    volatility_regime = (
+        context.technical_analysis.volatility_regime
+        if context.technical_analysis is not None and context.technical_analysis.data_state == "ready"
+        else None
+    )
+    context.crowd_positioning = crowd
+    context.derivatives_data = derivatives
+    context.liquidity_bias = estimate_liquidity_bias(
+        LiquidityBiasInput(
+            symbol=context.symbol,
+            candles=context.candles,
+            funding_rate=derivatives.funding_rate,
+            open_interest_change_pct=derivatives.oi_change_1h or derivatives.oi_change_24h,
+            volatility_regime=volatility_regime,
+            crowd_positioning=crowd,
+        )
+    )
+    return context
+
+
+def _load_liquidation_intelligence(
+    *,
+    symbol: str,
+    candles: list[Candle],
+    liquidity_zones: LiquidityZoneSnapshot | None = None,
+    crowd_positioning: CrowdPositioningSnapshot | None = None,
+) -> LiquidationIntelligenceSnapshot:
+    """Interpret recent Binance force-order events when the feed is available."""
+
+    service = get_global_liquidation_feed_service()
+    if service is None:
+        return NEUTRAL_LIQUIDATION_INTELLIGENCE
+    try:
+        events = service.recent_events(symbol, lookback_minutes=5)
+        return interpret_liquidation_events(
+            symbol=symbol,
+            events=events,
+            candles=candles,
+            liquidity_zones=liquidity_zones,
+            crowd_positioning=crowd_positioning,
+        )
+    except Exception:
+        LOGGER.exception("Failed to interpret liquidation events for %s.", symbol)
+        return NEUTRAL_LIQUIDATION_INTELLIGENCE
 
 
 def _safe_technical_analysis(
@@ -1396,6 +1769,14 @@ def get_rest_client(request: Request) -> BinanceRestClient:
     if hasattr(request.app.state, "rest_client"):
         return request.app.state.rest_client
     return BinanceRestClient(get_settings())
+
+
+def get_futures_scanner_heartbeat_service(request: Request) -> FuturesScannerWebSocketHeartbeatService | None:
+    """Return the shared futures scanner WebSocket heartbeat service when available."""
+
+    if hasattr(request.app.state, "futures_scanner_heartbeat_service"):
+        return request.app.state.futures_scanner_heartbeat_service
+    return None
 
 
 def get_settings_dependency() -> Settings:
@@ -2122,6 +2503,32 @@ def _risk_label(value: str | None) -> Literal["low", "medium", "high"]:
     return "high"
 
 
+def _build_heatmap_enrichment(
+    *,
+    symbol: str,
+    price: Decimal | None,
+    base_signal_type: str,
+    base_confidence: int,
+) -> HeatmapSignalEnrichment:
+    """Build heatmap metadata without affecting the base signal decision."""
+
+    try:
+        return enrich_signal_with_heatmap(
+            symbol=symbol,
+            price=price,
+            base_signal_type=base_signal_type,
+            base_confidence=base_confidence,
+        )
+    except Exception:
+        LOGGER.exception("Failed to enrich %s signal with liquidation heatmap metadata.", symbol)
+        return enrich_signal_with_heatmap(
+            symbol=symbol,
+            price=None,
+            base_signal_type=base_signal_type,
+            base_confidence=base_confidence,
+        )
+
+
 def _build_trading_assistant_response(
     *,
     symbol: str,
@@ -2130,6 +2537,11 @@ def _build_trading_assistant_response(
     technical_analysis: TechnicalAnalysisResponse | None,
     workstation: WorkstationResponse | None,
     similar_setup: SimilarSetupReport | None = None,
+    liquidity_bias: LiquidityBiasSnapshot | None = None,
+    crowd_positioning: CrowdPositioningSnapshot | None = None,
+    derivatives_data: BinanceDerivativesSnapshot | None = None,
+    candles: list[Candle] | None = None,
+    regime_label: str | None = None,
 ) -> TradingAssistantResponse:
     """Build a beginner-friendly trading summary without changing execution logic."""
 
@@ -2173,11 +2585,11 @@ def _build_trading_assistant_response(
     suggested_entry_zone: str | None = None
     suggested_stop_loss: Decimal | None = None
     suggested_take_profit: Decimal | None = None
+    current_price = workstation.last_price if workstation is not None else None
+    atr = workstation.feature.atr if workstation is not None and workstation.feature is not None else None
     if technical_analysis is not None and technical_analysis.data_state == "ready" and decision == "buy":
-        current_price = workstation.last_price if workstation is not None else None
         nearest_support = technical_analysis.support_levels[-1] if technical_analysis.support_levels else None
         nearest_resistance = technical_analysis.resistance_levels[0] if technical_analysis.resistance_levels else None
-        atr = workstation.feature.atr if workstation is not None and workstation.feature is not None else None
         if nearest_support is not None and current_price is not None:
             suggested_entry_zone = f"{nearest_support} - {current_price}"
         elif current_price is not None:
@@ -2194,6 +2606,83 @@ def _build_trading_assistant_response(
     best_timeframe: Literal["5m", "15m", "1h", "unknown"] = "unknown"
     if fusion_signal.preferred_horizon in {"5m", "15m", "1h"}:
         best_timeframe = fusion_signal.preferred_horizon
+
+    liquidity = liquidity_bias or NEUTRAL_LIQUIDITY_BIAS
+    crowd = crowd_positioning or NEUTRAL_CROWD_POSITIONING
+    derivatives = derivatives_data or fallback_derivatives_snapshot(symbol)
+    confidence_score = _liquidity_adjusted_assistant_confidence(
+        confidence=confidence_score,
+        decision=decision,
+        liquidity=liquidity,
+    )
+    confidence_score = _crowd_adjusted_assistant_confidence(
+        confidence=confidence_score,
+        decision=decision,
+        crowd=crowd,
+    )
+    if decision == "buy" and crowd.crowd_side == "long_crowded" and crowd.crowd_strength == "high":
+        decision = "wait"
+        why_not_trade = "Binance funding and open interest show crowded longs with downside squeeze risk."
+        simple_reason = f"{simple_reason} Crowd: long heavy downside risk."
+    if decision == "buy" and liquidity.trap_risk == "long_trap" and liquidity.liquidity_pressure == "high":
+        decision = "wait"
+        why_not_trade = "Estimated liquidity positioning shows high downside sweep risk against a fresh long entry."
+        simple_reason = f"{simple_reason} Liquidity: high downside sweep risk."
+    liquidity_zones = estimate_liquidity_zones(
+        symbol=symbol,
+        candles=candles or (),
+        current_price=current_price,
+        trade_direction=_assistant_liquidity_zone_direction(decision=decision, fusion_signal=fusion_signal.final_signal),
+        stop_loss=suggested_stop_loss,
+        take_profit=suggested_take_profit,
+        liquidity_bias=liquidity,
+        crowd_positioning=crowd,
+        regime_label=regime_label,
+        atr=atr,
+    )
+    liquidation_intelligence = _load_liquidation_intelligence(
+        symbol=symbol,
+        candles=candles or (),
+        liquidity_zones=liquidity_zones,
+        crowd_positioning=crowd,
+    )
+    liquidity_zones = validate_liquidity_zones_with_liquidations(
+        zones=liquidity_zones,
+        liquidation_signal=liquidation_intelligence.liquidation_signal,
+        dominant_side=liquidation_intelligence.dominant_side,
+    )
+    if decision == "buy" and liquidity_zones.trade_timing_adjustment == "wait_for_sweep":
+        decision = "wait"
+        confidence_score = max(0, confidence_score - 6)
+        why_not_trade = "Estimated liquidity zones show sweep risk against this entry; waiting for the sweep or confirmation is safer in paper mode."
+        simple_reason = f"{simple_reason} Liquidity: downside sweep risk."
+    elif decision == "buy" and liquidity_zones.trade_timing_adjustment == "avoid_chop":
+        decision = "wait"
+        confidence_score = max(0, confidence_score - 8)
+        why_not_trade = "Estimated liquidity is concentrated on both sides in a choppy structure."
+        simple_reason = f"{simple_reason} Liquidity: choppy both-side risk."
+    confidence_score = _liquidation_adjusted_assistant_confidence(
+        confidence=confidence_score,
+        decision=decision,
+        liquidation=liquidation_intelligence,
+    )
+    if decision == "buy" and liquidation_intelligence.liquidation_signal == "cascade_down":
+        decision = "wait"
+        why_not_trade = "Recent Binance force-order events show downside liquidation cascade risk."
+        simple_reason = f"{simple_reason} Liquidation: downside cascade risk."
+    elif decision == "sell_exit" and liquidation_intelligence.liquidation_signal == "cascade_up":
+        decision = "wait"
+        why_not_trade = "Recent Binance force-order events show upside short-squeeze pressure."
+        simple_reason = f"{simple_reason} Liquidation: upside squeeze risk."
+    elif liquidation_intelligence.liquidation_signal == "exhaustion":
+        simple_reason = f"{simple_reason} Liquidation: exhaustion risk."
+
+    heatmap = _build_heatmap_enrichment(
+        symbol=symbol,
+        price=current_price,
+        base_signal_type=_assistant_signal_type(decision),
+        base_confidence=confidence_score,
+    )
 
     return TradingAssistantResponse(
         symbol=symbol,
@@ -2214,7 +2703,123 @@ def _build_trading_assistant_response(
         ),
         backfill_status=_to_backfill_status_response(backfill_status),
         similar_setup=_to_similar_setup_summary_response(similar_setup),
+        liquidity_bias=liquidity.liquidity_bias,
+        liquidity_pressure=liquidity.liquidity_pressure,
+        likely_liquidation_direction=liquidity.likely_liquidation_direction,
+        trap_risk=liquidity.trap_risk,
+        liquidity_explanation=liquidity.explanation,
+        upside_liquidity_zone=_to_liquidity_zone_response(liquidity_zones.upside_liquidity_zone),
+        downside_liquidity_zone=_to_liquidity_zone_response(liquidity_zones.downside_liquidity_zone),
+        nearest_liquidity_target=_to_nearest_liquidity_target_response(liquidity_zones.nearest_liquidity_target),
+        sweep_risk=liquidity_zones.sweep_risk,
+        trade_timing_adjustment=liquidity_zones.trade_timing_adjustment,
+        tp_sl_alignment=liquidity_zones.tp_sl_alignment,
+        liquidity_zone_explanation=liquidity_zones.explanation,
+        crowd_side=crowd.crowd_side,
+        crowd_strength=crowd.crowd_strength,
+        squeeze_risk=crowd.squeeze_risk,
+        positioning_explanation=crowd.explanation,
+        funding_rate=derivatives.funding_rate,
+        open_interest=derivatives.open_interest,
+        oi_trend=derivatives.oi_trend,
+        heatmap_liquidity_above=heatmap.heatmap_liquidity_above,
+        heatmap_liquidity_below=heatmap.heatmap_liquidity_below,
+        heatmap_intensity_score=heatmap.heatmap_intensity_score,
+        heatmap_bias=heatmap.heatmap_bias,
+        base_signal_type=heatmap.base_signal_type,
+        heatmap_signal_type=heatmap.heatmap_signal_type,
+        base_confidence=heatmap.base_confidence,
+        heatmap_confidence=heatmap.heatmap_confidence,
+        heatmap_alignment=heatmap.heatmap_alignment,
+        heatmap_explanation=heatmap.heatmap_explanation,
+        heatmap_provider=heatmap.heatmap_provider,
+        heatmap_data_quality=heatmap.heatmap_data_quality,
+        heatmap_is_real_data=heatmap.heatmap_is_real_data,
+        heatmap_provider_status=heatmap.heatmap_provider_status,
+        liquidation_pressure=heatmap.liquidation_pressure,
+        liquidation_imbalance=heatmap.liquidation_imbalance,
+        liquidation_signal=liquidation_intelligence.liquidation_signal,
+        liquidation_intensity=liquidation_intelligence.liquidation_intensity,
+        dominant_side=liquidation_intelligence.dominant_side,
+        liquidation_explanation=liquidation_intelligence.explanation,
+        liquidation_volume_long=liquidation_intelligence.liquidation_volume_long,
+        liquidation_volume_short=liquidation_intelligence.liquidation_volume_short,
+        liquidation_imbalance_ratio=liquidation_intelligence.imbalance_ratio,
+        liquidation_event_frequency=liquidation_intelligence.event_frequency,
     )
+
+
+def _assistant_liquidity_zone_direction(*, decision: str, fusion_signal: str) -> Literal["long", "short", "wait", "avoid", "buy", "sell_exit", "none"]:
+    if decision == "buy":
+        return "buy"
+    if decision == "sell_exit":
+        return "sell_exit"
+    if fusion_signal == "short":
+        return "short"
+    if decision == "avoid":
+        return "avoid"
+    if decision == "wait":
+        return "wait"
+    return "none"
+
+
+def _liquidity_adjusted_assistant_confidence(
+    *,
+    confidence: int,
+    decision: str,
+    liquidity: LiquidityBiasSnapshot,
+) -> int:
+    adjustment = 0
+    if liquidity.liquidity_pressure == "high":
+        adjustment -= 3
+    if decision == "buy":
+        if liquidity.trap_risk == "long_trap":
+            adjustment -= 10 if liquidity.liquidity_pressure == "high" else 5
+        elif liquidity.trap_risk == "short_trap":
+            adjustment += 4
+    return max(0, min(100, confidence + adjustment))
+
+
+def _crowd_adjusted_assistant_confidence(
+    *,
+    confidence: int,
+    decision: str,
+    crowd: CrowdPositioningSnapshot,
+) -> int:
+    adjustment = 0
+    if crowd.crowd_strength == "high":
+        if decision == "buy" and crowd.crowd_side == "long_crowded":
+            adjustment -= 6
+        elif decision == "buy" and crowd.crowd_side == "short_crowded":
+            adjustment += 3
+    elif crowd.crowd_strength == "medium":
+        if decision == "buy" and crowd.crowd_side == "long_crowded":
+            adjustment -= 3
+        elif decision == "buy" and crowd.crowd_side == "short_crowded":
+            adjustment += 2
+    return max(0, min(100, confidence + adjustment))
+
+
+def _liquidation_adjusted_assistant_confidence(
+    *,
+    confidence: int,
+    decision: str,
+    liquidation: LiquidationIntelligenceSnapshot,
+) -> int:
+    adjustment = 0
+    if decision == "buy":
+        if liquidation.liquidation_signal == "cascade_up":
+            adjustment += 4
+        elif liquidation.liquidation_signal == "cascade_down":
+            adjustment -= 10
+    elif decision == "sell_exit":
+        if liquidation.liquidation_signal == "cascade_down":
+            adjustment += 3
+        elif liquidation.liquidation_signal == "cascade_up":
+            adjustment -= 8
+    if liquidation.liquidation_signal == "exhaustion":
+        adjustment -= 5
+    return max(0, min(100, confidence + adjustment))
 
 
 def _to_similar_setup_summary_response(report: SimilarSetupReport | None) -> SimilarSetupSummaryResponse | None:
@@ -2243,6 +2848,27 @@ def _to_similar_setup_summary_response(report: SimilarSetupReport | None) -> Sim
     )
 
 
+def _to_liquidity_zone_response(zone: LiquidityZone | None) -> LiquidityZoneResponse:
+    if zone is None:
+        return LiquidityZoneResponse()
+    return LiquidityZoneResponse(
+        level=zone.level,
+        strength=zone.strength,
+        reason=zone.reason,
+    )
+
+
+def _to_nearest_liquidity_target_response(target: NearestLiquidityTarget | None) -> NearestLiquidityTargetResponse:
+    if target is None:
+        return NearestLiquidityTargetResponse()
+    return NearestLiquidityTargetResponse(
+        direction=target.direction,
+        level=target.level,
+        distance_pct=target.distance_pct,
+        strength=target.strength,
+    )
+
+
 def _to_trade_eligibility_response(
     *,
     symbol: str,
@@ -2264,6 +2890,19 @@ def _to_trade_eligibility_response(
         regime_summary=result.regime_summary,
         fee_slippage_summary=result.fee_slippage_summary,
         warnings=result.warnings,
+        liquidity_zone_summary=result.liquidity_zone_summary,
+        sweep_risk=result.sweep_risk,
+        trade_timing_adjustment=result.trade_timing_adjustment,
+        tp_sl_alignment=result.tp_sl_alignment,
+        crowd_side=result.crowd_side,
+        crowd_strength=result.crowd_strength,
+        squeeze_risk=result.squeeze_risk,
+        funding_rate=result.funding_rate,
+        open_interest=result.open_interest,
+        oi_trend=result.oi_trend,
+        liquidation_signal=result.liquidation_signal,
+        liquidation_intensity=result.liquidation_intensity,
+        dominant_side=result.dominant_side,
     )
 
 
@@ -2630,6 +3269,12 @@ def _opportunity_from_candles(
 def _to_futures_signal_response(signal: FuturesPaperSignal) -> FuturesPaperSignalResponse:
     """Convert a paper futures scanner signal into an API response."""
 
+    heatmap = _build_heatmap_enrichment(
+        symbol=signal.symbol,
+        price=signal.current_price,
+        base_signal_type=_scanner_signal_type(signal.direction),
+        base_confidence=signal.confidence,
+    )
     return FuturesPaperSignalResponse(
         symbol=signal.symbol,
         direction=signal.direction,
@@ -2649,6 +3294,8 @@ def _to_futures_signal_response(signal: FuturesPaperSignal) -> FuturesPaperSigna
         risk_grade=signal.risk_grade,
         regime=signal.regime,
         current_price=signal.current_price,
+        data_source="binance_usdm_futures",
+        price_type=signal.price_type,
         reason=signal.reason,
         invalidation_hint=signal.invalidation_hint,
         suggested_entry_zone=signal.suggested_entry_zone,
@@ -2661,6 +3308,62 @@ def _to_futures_signal_response(signal: FuturesPaperSignal) -> FuturesPaperSigna
         eligibility_status=signal.eligibility_status,
         warnings=list(signal.warnings),
         timestamp=signal.timestamp,
+        liquidity_bias=signal.liquidity_bias,
+        liquidity_pressure=signal.liquidity_pressure,
+        likely_liquidation_direction=signal.likely_liquidation_direction,
+        trap_risk=signal.trap_risk,
+        liquidity_explanation=signal.liquidity_explanation,
+        upside_liquidity_zone=LiquidityZoneResponse(
+            level=signal.upside_liquidity_zone_level,
+            strength=signal.upside_liquidity_zone_strength,
+            reason=signal.upside_liquidity_zone_reason,
+        ),
+        downside_liquidity_zone=LiquidityZoneResponse(
+            level=signal.downside_liquidity_zone_level,
+            strength=signal.downside_liquidity_zone_strength,
+            reason=signal.downside_liquidity_zone_reason,
+        ),
+        nearest_liquidity_target=NearestLiquidityTargetResponse(
+            direction=signal.nearest_liquidity_target_direction,
+            level=signal.nearest_liquidity_target_level,
+            distance_pct=signal.nearest_liquidity_target_distance_pct,
+            strength=signal.nearest_liquidity_target_strength,
+        ),
+        sweep_risk=signal.sweep_risk,
+        trade_timing_adjustment=signal.trade_timing_adjustment,
+        tp_sl_alignment=signal.tp_sl_alignment,
+        liquidity_zone_explanation=signal.liquidity_zone_explanation,
+        liquidity_adjusted_note=signal.liquidity_adjusted_note,
+        crowd_side=signal.crowd_side,
+        crowd_strength=signal.crowd_strength,
+        squeeze_risk=signal.squeeze_risk,
+        funding_rate=signal.funding_rate,
+        open_interest=signal.open_interest,
+        oi_trend=signal.oi_trend,
+        heatmap_liquidity_above=heatmap.heatmap_liquidity_above,
+        heatmap_liquidity_below=heatmap.heatmap_liquidity_below,
+        heatmap_intensity_score=heatmap.heatmap_intensity_score,
+        heatmap_bias=heatmap.heatmap_bias,
+        base_signal_type=heatmap.base_signal_type,
+        heatmap_signal_type=heatmap.heatmap_signal_type,
+        base_confidence=heatmap.base_confidence,
+        heatmap_confidence=heatmap.heatmap_confidence,
+        heatmap_alignment=heatmap.heatmap_alignment,
+        heatmap_explanation=heatmap.heatmap_explanation,
+        heatmap_provider=heatmap.heatmap_provider,
+        heatmap_data_quality=heatmap.heatmap_data_quality,
+        heatmap_is_real_data=heatmap.heatmap_is_real_data,
+        heatmap_provider_status=heatmap.heatmap_provider_status,
+        liquidation_pressure=heatmap.liquidation_pressure,
+        liquidation_imbalance=heatmap.liquidation_imbalance,
+        liquidation_signal=signal.liquidation_signal,
+        liquidation_intensity=signal.liquidation_intensity,
+        dominant_side=signal.dominant_side,
+        liquidation_explanation=signal.liquidation_explanation,
+        liquidation_volume_long=signal.liquidation_volume_long,
+        liquidation_volume_short=signal.liquidation_volume_short,
+        liquidation_imbalance_ratio=signal.liquidation_imbalance_ratio,
+        liquidation_event_frequency=signal.liquidation_event_frequency,
     )
 
 
@@ -2676,6 +3379,10 @@ def _to_futures_scan_response(report: FuturesOpportunityScanReport) -> FuturesOp
         warnings=report.warnings,
         scanned_count=report.scanned_count,
         failed_symbols=report.failed_symbols,
+        futures_symbol_universe_source=report.futures_symbol_universe_source,  # type: ignore[arg-type]
+        symbol_count=report.symbol_count,
+        last_successful_fetch_at=report.last_successful_fetch_at,
+        latest_error=report.latest_error,
     )
 
 
@@ -2772,6 +3479,11 @@ def _build_futures_paper_signal_for_symbol(
         fusion_signal=fusion_response,
         technical_analysis=technical_response,
         workstation=workstation,
+        liquidity_bias=context.liquidity_bias,
+        crowd_positioning=context.crowd_positioning,
+        derivatives_data=context.derivatives_data,
+        candles=context.candles,
+        regime_label=regime_analysis.regime_label if regime_analysis is not None else None,
     )
     current_snapshot = _build_signal_validation_snapshot_record(
         symbol=symbol,
@@ -2792,6 +3504,27 @@ def _build_futures_paper_signal_for_symbol(
         horizon=fusion_response.preferred_horizon,
     )
     blocker_reasons = current_snapshot.blocker_reasons if current_snapshot is not None else ()
+    liquidity_zones = _estimate_assistant_liquidity_zones(
+        symbol=symbol,
+        candles=context.candles,
+        workstation=workstation,
+        assistant=assistant,
+        fusion_signal=fusion_response,
+        liquidity_bias=context.liquidity_bias,
+        regime_analysis=regime_analysis,
+        crowd_positioning=context.crowd_positioning,
+    )
+    liquidation_intelligence = _load_liquidation_intelligence(
+        symbol=symbol,
+        candles=context.candles,
+        liquidity_zones=liquidity_zones,
+        crowd_positioning=context.crowd_positioning,
+    )
+    liquidity_zones = validate_liquidity_zones_with_liquidations(
+        zones=liquidity_zones,
+        liquidation_signal=liquidation_intelligence.liquidation_signal,
+        dominant_side=liquidation_intelligence.dominant_side,
+    )
     eligibility = evaluate_trade_eligibility(
         TradeEligibilityInput(
             symbol=symbol,
@@ -2809,6 +3542,13 @@ def _build_futures_paper_signal_for_symbol(
             regime_avoid_conditions=regime_analysis.avoid_conditions if regime_analysis is not None else (),
             similar_setup=similar_setup,
             signal_validation=validation_report,
+            liquidity_bias=context.liquidity_bias,
+            liquidity_zones=liquidity_zones,
+            crowd_positioning=context.crowd_positioning,
+            funding_rate=context.derivatives_data.funding_rate if context.derivatives_data is not None else None,
+            open_interest=context.derivatives_data.open_interest if context.derivatives_data is not None else None,
+            oi_trend=context.derivatives_data.oi_trend if context.derivatives_data is not None else "neutral",
+            liquidation_intelligence=liquidation_intelligence,
         )
     )
     return scanner.analyze_symbol(
@@ -2825,6 +3565,13 @@ def _build_futures_paper_signal_for_symbol(
             blocker_reasons=blocker_reasons,
             warnings=tuple(fusion_response.warnings),
             spread_ratio_pct=_spread_ratio_pct(runtime=runtime, symbol=symbol),
+            liquidity_bias=context.liquidity_bias,
+            liquidity_zones=liquidity_zones,
+            crowd_positioning=context.crowd_positioning,
+            funding_rate=context.derivatives_data.funding_rate if context.derivatives_data is not None else None,
+            open_interest=context.derivatives_data.open_interest if context.derivatives_data is not None else None,
+            oi_trend=context.derivatives_data.oi_trend if context.derivatives_data is not None else "neutral",
+            liquidation_intelligence=liquidation_intelligence,
         )
     )
 
@@ -2840,6 +3587,159 @@ def _spread_ratio_pct(*, runtime: PaperBotRuntime, symbol: str) -> Decimal | Non
     )
 
 
+def _estimate_assistant_liquidity_zones(
+    *,
+    symbol: str,
+    candles: list[Candle],
+    workstation: WorkstationResponse | None,
+    assistant: TradingAssistantResponse,
+    fusion_signal: FusionSignalResponse,
+    liquidity_bias: LiquidityBiasSnapshot,
+    regime_analysis: RegimeAnalysisSnapshot | None,
+    crowd_positioning: CrowdPositioningSnapshot | None = None,
+) -> LiquidityZoneSnapshot:
+    current_price = workstation.last_price if workstation is not None else (candles[-1].close if candles else None)
+    atr = workstation.feature.atr if workstation is not None and workstation.feature is not None else None
+    return estimate_liquidity_zones(
+        symbol=symbol,
+        candles=candles,
+        current_price=current_price,
+        trade_direction=_assistant_liquidity_zone_direction(
+            decision=assistant.decision,
+            fusion_signal=fusion_signal.final_signal,
+        ),
+        stop_loss=assistant.suggested_stop_loss,
+        take_profit=assistant.suggested_take_profit,
+        liquidity_bias=liquidity_bias,
+        crowd_positioning=crowd_positioning,
+        regime_label=regime_analysis.regime_label if regime_analysis is not None else None,
+        atr=atr,
+    )
+
+
+def _persist_assistant_outcome_snapshot(
+    *,
+    repository: StorageRepository,
+    symbol: str,
+    assistant: TradingAssistantResponse,
+    current_price: Decimal | None,
+) -> None:
+    try:
+        persist_signal_snapshot(
+            repository=repository,
+            payload=SignalSnapshotInput(
+                symbol=symbol,
+                source="assistant",
+                signal_type=_assistant_signal_type(assistant.decision),
+                confidence=assistant.confidence_score,
+                entry_price=current_price,
+                liquidity_bias=assistant.liquidity_bias,
+                sweep_risk=assistant.sweep_risk,
+                nearest_liquidity_above=(
+                    assistant.nearest_liquidity_target.level
+                    if assistant.nearest_liquidity_target.direction == "up"
+                    else assistant.upside_liquidity_zone.level
+                ),
+                nearest_liquidity_below=(
+                    assistant.nearest_liquidity_target.level
+                    if assistant.nearest_liquidity_target.direction == "down"
+                    else assistant.downside_liquidity_zone.level
+                ),
+                funding_rate=assistant.funding_rate,
+                open_interest=assistant.open_interest,
+                notes=assistant.simple_reason,
+            ),
+        )
+    except Exception:
+        LOGGER.exception("Failed to persist post-signal assistant snapshot for %s.", symbol)
+
+
+def _persist_eligibility_outcome_snapshot(
+    *,
+    repository: StorageRepository,
+    symbol: str,
+    assistant: TradingAssistantResponse,
+    eligibility: TradeEligibilityResponse,
+    current_price: Decimal | None,
+) -> None:
+    try:
+        persist_signal_snapshot(
+            repository=repository,
+            payload=SignalSnapshotInput(
+                symbol=symbol,
+                source="eligibility",
+                signal_type=_eligibility_signal_type(eligibility.status, assistant.decision),
+                confidence=assistant.confidence_score,
+                entry_price=current_price,
+                liquidity_bias=assistant.liquidity_bias,
+                sweep_risk=eligibility.sweep_risk,
+                nearest_liquidity_above=assistant.upside_liquidity_zone.level,
+                nearest_liquidity_below=assistant.downside_liquidity_zone.level,
+                funding_rate=assistant.funding_rate,
+                open_interest=assistant.open_interest,
+                notes=eligibility.reason,
+            ),
+        )
+    except Exception:
+        LOGGER.exception("Failed to persist post-signal eligibility snapshot for %s.", symbol)
+
+
+def _persist_scanner_outcome_snapshots(
+    *,
+    repository: StorageRepository,
+    report: FuturesOpportunityScanReport,
+) -> None:
+    for signal in report.long_candidates + report.short_candidates + report.neutral_candidates:
+        try:
+            persist_signal_snapshot(
+                repository=repository,
+                payload=SignalSnapshotInput(
+                    symbol=signal.symbol,
+                    source="scanner",
+                    signal_type=_scanner_signal_type(signal.direction),
+                    confidence=signal.confidence,
+                    entry_price=signal.current_price,
+                    liquidity_bias=signal.liquidity_bias,
+                    sweep_risk=signal.sweep_risk,
+                    nearest_liquidity_above=signal.upside_liquidity_zone_level,
+                    nearest_liquidity_below=signal.downside_liquidity_zone_level,
+                    funding_rate=signal.funding_rate,
+                    open_interest=signal.open_interest,
+                    notes=signal.reason,
+                ),
+            )
+        except Exception:
+            LOGGER.exception("Failed to persist post-signal scanner snapshot for %s.", signal.symbol)
+
+
+def _assistant_signal_type(decision: str) -> str:
+    if decision == "buy":
+        return "BUY"
+    if decision == "sell_exit":
+        return "SELL"
+    if decision == "avoid":
+        return "AVOID"
+    return "WAIT"
+
+
+def _eligibility_signal_type(status: str, assistant_decision: str) -> str:
+    if status == "eligible":
+        return _assistant_signal_type(assistant_decision)
+    if status == "not_eligible":
+        return "AVOID"
+    return "WAIT"
+
+
+def _scanner_signal_type(direction: str) -> str:
+    if direction == "long":
+        return "BUY"
+    if direction == "short":
+        return "SELL"
+    if direction == "avoid":
+        return "AVOID"
+    return "WAIT"
+
+
 async def _build_market_wide_futures_signal_for_symbol(
     *,
     scanner: FuturesOpportunityScanner,
@@ -2847,15 +3747,19 @@ async def _build_market_wide_futures_signal_for_symbol(
     horizon: str,
     repository: StorageRepository,
     rest_client: BinanceRestClient,
+    settings: Settings,
+    candle_cache: dict[tuple[str, SupportedInterval], list[Candle]] | None = None,
 ) -> FuturesPaperSignal:
     """Build one scanner signal from fresh/stored market-wide OHLCV data."""
 
+    started_at = time.perf_counter()
     candles_15m = await _load_or_fetch_futures_scan_candles(
         repository=repository,
         rest_client=rest_client,
         symbol=symbol,
         interval="15m",
         lookback_days=7,
+        candle_cache=candle_cache,
     )
     candles_1h = await _load_or_fetch_futures_scan_candles(
         repository=repository,
@@ -2863,6 +3767,7 @@ async def _build_market_wide_futures_signal_for_symbol(
         symbol=symbol,
         interval="1h",
         lookback_days=7,
+        candle_cache=candle_cache,
     )
     technical_analysis: TechnicalAnalysisSnapshot | None = None
     if len(candles_15m) >= 24:
@@ -2876,8 +3781,44 @@ async def _build_market_wide_futures_signal_for_symbol(
         except Exception:
             LOGGER.exception("Failed to build futures scanner technical analysis for %s.", symbol)
             technical_analysis = None
+    derivatives_data, crowd_positioning = await _load_crowd_positioning(
+        settings=settings,
+        symbol=symbol,
+    )
+    liquidity_bias = estimate_liquidity_bias(
+        LiquidityBiasInput(
+            symbol=symbol,
+            candles=candles_15m,
+            funding_rate=derivatives_data.funding_rate,
+            open_interest_change_pct=derivatives_data.oi_change_1h or derivatives_data.oi_change_24h,
+            crowd_positioning=crowd_positioning,
+            volatility_regime=(
+                technical_analysis.volatility_regime
+                if technical_analysis is not None and technical_analysis.data_state == "ready"
+                else None
+            ),
+        )
+    )
+    preliminary_liquidity_zones = estimate_liquidity_zones(
+        symbol=symbol,
+        candles=candles_15m,
+        current_price=candles_15m[-1].close if candles_15m else None,
+        liquidity_bias=liquidity_bias,
+        crowd_positioning=crowd_positioning,
+    )
+    liquidation_intelligence = _load_liquidation_intelligence(
+        symbol=symbol,
+        candles=candles_15m,
+        liquidity_zones=preliminary_liquidity_zones,
+        crowd_positioning=crowd_positioning,
+    )
+    preliminary_liquidity_zones = validate_liquidity_zones_with_liquidations(
+        zones=preliminary_liquidity_zones,
+        liquidation_signal=liquidation_intelligence.liquidation_signal,
+        dominant_side=liquidation_intelligence.dominant_side,
+    )
 
-    return scanner.analyze_symbol(
+    signal = scanner.analyze_symbol(
         FuturesSignalContext(
             symbol=symbol,
             candles=candles_15m,
@@ -2888,8 +3829,17 @@ async def _build_market_wide_futures_signal_for_symbol(
             trade_eligibility=None,
             preferred_horizon=horizon,
             warnings=(),
+            liquidity_bias=liquidity_bias,
+            liquidity_zones=preliminary_liquidity_zones,
+            crowd_positioning=crowd_positioning,
+            funding_rate=derivatives_data.funding_rate,
+            open_interest=derivatives_data.open_interest,
+            oi_trend=derivatives_data.oi_trend,
+            liquidation_intelligence=liquidation_intelligence,
         )
     )
+    LOGGER.debug("Futures scanner per-symbol analysis for %s completed in %.3fs.", symbol, time.perf_counter() - started_at)
+    return signal
 
 
 async def _load_or_fetch_futures_scan_candles(
@@ -2899,30 +3849,53 @@ async def _load_or_fetch_futures_scan_candles(
     symbol: str,
     interval: SupportedInterval,
     lookback_days: int,
+    candle_cache: dict[tuple[str, SupportedInterval], list[Candle]] | None = None,
 ) -> list[Candle]:
-    """Load recent scanner candles, fetching from Binance when local data is stale."""
+    """Load recent USD-M Futures scanner candles, fetching from Binance when local data is stale."""
+
+    cache_key = (symbol.upper(), interval)
+    if candle_cache is not None and cache_key in candle_cache:
+        return candle_cache[cache_key]
 
     end_time = now_utc()
     start_time = end_time - timedelta(days=lookback_days)
+    cache_started_at = time.perf_counter()
     stored = [
         _historical_record_to_candle(record)
-        for record in repository.get_historical_candles(
+        for record in repository.get_futures_historical_candles(
             symbol=symbol,
             interval=interval,
             start_time=start_time,
             end_time=end_time,
         )
     ]
+    LOGGER.debug(
+        "Futures scanner candle cache read for %s %s returned %d rows in %.3fs.",
+        symbol,
+        interval,
+        len(stored),
+        time.perf_counter() - cache_started_at,
+    )
     if len(stored) >= MIN_CANDLES_FOR_FUTURES_SIGNAL and not _futures_scan_candles_stale(stored, interval):
+        if candle_cache is not None:
+            candle_cache[cache_key] = stored
         return stored
 
     expected_limit = int(timedelta(days=lookback_days) / interval_to_timedelta(interval)) + 4
-    rows = await rest_client.get_klines(
+    fetch_started_at = time.perf_counter()
+    rows = await rest_client.get_futures_klines(
         symbol=symbol,
         interval=interval,
         start_time_ms=int(start_time.timestamp() * 1000),
         end_time_ms=int(end_time.timestamp() * 1000),
         limit=min(1000, max(MIN_CANDLES_FOR_FUTURES_SIGNAL, expected_limit)),
+    )
+    LOGGER.debug(
+        "Futures scanner Binance USD-M candle fetch for %s %s returned %d rows in %.3fs.",
+        symbol,
+        interval,
+        len(rows),
+        time.perf_counter() - fetch_started_at,
     )
     fetched = [
         parse_rest_kline(symbol, interval, row)
@@ -2930,8 +3903,12 @@ async def _load_or_fetch_futures_scan_candles(
         if len(row) >= 9 and int(row[6]) < int(now_utc().timestamp() * 1000)
     ]
     if fetched:
-        repository.upsert_historical_candles(fetched, source="futures_scanner_rest")
+        repository.upsert_futures_historical_candles(fetched, source="binance_usdm_futures")
+        if candle_cache is not None:
+            candle_cache[cache_key] = fetched
         return fetched
+    if candle_cache is not None:
+        candle_cache[cache_key] = stored
     return stored
 
 
@@ -2964,6 +3941,164 @@ def _normalize_futures_scanner_horizon(horizon: str) -> str:
     if normalized in {"15m", "1h"}:
         return normalized
     return normalize_horizon(normalized)
+
+
+async def _load_futures_symbol_universe(
+    *,
+    rest_client: BinanceRestClient,
+    quote_asset: str,
+    limit: int,
+) -> FuturesSymbolUniverseResult:
+    """Return active USD-M Futures symbols ranked by futures market activity with cache/fallback diagnostics."""
+
+    started_at = time.perf_counter()
+    normalized_quote = quote_asset.upper()
+    cache_key = normalized_quote
+    cached = _FUTURES_SYMBOL_UNIVERSE_CACHE.get(cache_key)
+    if cached is not None and now_utc() - cached.fetched_at <= FUTURES_SYMBOL_UNIVERSE_CACHE_TTL:
+        LOGGER.debug(
+            "Futures scanner using cached USD-M symbol universe for %s (%d symbols).",
+            normalized_quote,
+            len(cached.records),
+        )
+        return FuturesSymbolUniverseResult(
+            records=cached.records[:limit],
+            source="cache",
+            last_successful_fetch_at=cached.fetched_at,
+            latest_error=cached.latest_error,
+        )
+
+    try:
+        exchange_info = await rest_client.get_futures_exchange_info()
+        symbols = _parse_futures_exchange_info_symbols(exchange_info, quote_asset=normalized_quote)
+        if not symbols:
+            raise ValueError(f"No active Binance USD-M Futures symbols found for quote asset {normalized_quote}.")
+
+        ranked = await _rank_futures_symbols_by_volume(
+            rest_client=rest_client,
+            symbols=symbols,
+        )
+        fetched_at = now_utc()
+        _FUTURES_SYMBOL_UNIVERSE_CACHE[cache_key] = FuturesSymbolUniverseCacheEntry(
+            records=ranked,
+            fetched_at=fetched_at,
+        )
+        LOGGER.info(
+            "Futures scanner USD-M symbol universe loaded live %d/%d symbols in %.3fs.",
+            min(len(ranked), limit),
+            len(ranked),
+            time.perf_counter() - started_at,
+        )
+        return FuturesSymbolUniverseResult(
+            records=ranked[:limit],
+            source="live",
+            last_successful_fetch_at=fetched_at,
+        )
+    except Exception as exc:
+        latest_error = f"{type(exc).__name__}: {exc}"
+        LOGGER.warning(
+            "Futures scanner symbol universe load failed; phase=symbol_universe endpoint=/fapi/v1/exchangeInfo exception_type=%s error=%s",
+            type(exc).__name__,
+            exc,
+        )
+        if cached is not None and cached.records:
+            cached.latest_error = latest_error
+            return FuturesSymbolUniverseResult(
+                records=cached.records[:limit],
+                source="cache",
+                last_successful_fetch_at=cached.fetched_at,
+                latest_error=latest_error,
+            )
+        fallback = _manual_futures_symbol_fallback(normalized_quote)[:limit]
+        if fallback:
+            return FuturesSymbolUniverseResult(
+                records=fallback,
+                source="fallback",
+                last_successful_fetch_at=None,
+                latest_error=latest_error,
+            )
+        return FuturesSymbolUniverseResult(
+            records=[],
+            source="unavailable",
+            last_successful_fetch_at=None,
+            latest_error=latest_error,
+        )
+
+
+def _parse_futures_exchange_info_symbols(
+    exchange_info: dict[str, object],
+    *,
+    quote_asset: str,
+) -> list[SpotSymbolRecord]:
+    symbols: list[SpotSymbolRecord] = []
+    raw_symbols = exchange_info.get("symbols", [])
+    if not isinstance(raw_symbols, list):
+        raise ValueError("Binance USD-M Futures exchangeInfo response did not include a symbol list.")
+    for raw_symbol in raw_symbols:
+        if not isinstance(raw_symbol, dict):
+            continue
+        symbol = str(raw_symbol.get("symbol", "")).upper()
+        quote = str(raw_symbol.get("quoteAsset", "")).upper()
+        status = str(raw_symbol.get("status", "")).upper()
+        contract_type = str(raw_symbol.get("contractType", "")).upper()
+        if not symbol or quote != quote_asset or status != "TRADING":
+            continue
+        if contract_type and contract_type != "PERPETUAL":
+            continue
+        symbols.append(
+            SpotSymbolRecord(
+                symbol=symbol,
+                base_asset=str(raw_symbol.get("baseAsset", "")).upper(),
+                quote_asset=quote,
+                status=status,
+            )
+        )
+    return symbols
+
+
+async def _rank_futures_symbols_by_volume(
+    *,
+    rest_client: BinanceRestClient,
+    symbols: list[SpotSymbolRecord],
+) -> list[SpotSymbolRecord]:
+    ranked = sorted(symbols, key=lambda item: item.symbol)
+    try:
+        tickers = await rest_client.get_futures_ticker_24h()
+    except Exception:
+        LOGGER.warning(
+            "Failed to rank USD-M Futures symbols by ticker volume; phase=symbol_universe endpoint=/fapi/v1/ticker/24hr",
+            exc_info=True,
+        )
+        return ranked
+
+    symbol_lookup = {record.symbol: record for record in symbols}
+    ranked_pairs: list[tuple[Decimal, SpotSymbolRecord]] = []
+    for ticker in tickers:
+        symbol = str(ticker.get("symbol", "")).upper()
+        if symbol not in symbol_lookup:
+            continue
+        try:
+            quote_volume = Decimal(str(ticker.get("quoteVolume", "0")))
+        except Exception:
+            quote_volume = Decimal("0")
+        ranked_pairs.append((quote_volume, symbol_lookup[symbol]))
+    if not ranked_pairs:
+        return ranked
+    return [record for _, record in sorted(ranked_pairs, key=lambda item: (-item[0], item[1].symbol))]
+
+
+def _manual_futures_symbol_fallback(quote_asset: str) -> list[SpotSymbolRecord]:
+    if quote_asset != "USDT":
+        return []
+    return [
+        SpotSymbolRecord(
+            symbol=symbol,
+            base_asset=symbol.removesuffix("USDT"),
+            quote_asset="USDT",
+            status="TRADING",
+        )
+        for symbol in FUTURES_SCANNER_FALLBACK_SYMBOLS
+    ]
 
 
 def _to_ai_outcome_evaluation_response(
@@ -3766,6 +4901,15 @@ async def get_trading_assistant(
             symbol=normalized_symbol,
             sentiment_service=sentiment_service,
         )
+        derivatives_data, crowd_positioning = await _load_crowd_positioning(
+            settings=settings,
+            symbol=normalized_symbol,
+        )
+        _apply_crowd_positioning_to_context(
+            context=context,
+            crowd=crowd_positioning,
+            derivatives=derivatives_data,
+        )
         technical_analysis, _ = _safe_technical_analysis(
             runtime,
             repository,
@@ -3819,6 +4963,11 @@ async def get_trading_assistant(
             fusion_signal=fusion_response,
             technical_analysis=technical_response,
             workstation=workstation,
+            liquidity_bias=context.liquidity_bias,
+            crowd_positioning=context.crowd_positioning,
+            derivatives_data=context.derivatives_data,
+            candles=context.candles,
+            regime_label=regime_analysis.regime_label if regime_analysis is not None else None,
         )
         current_snapshot = _persist_signal_validation_snapshot(
             repository=repository,
@@ -3836,6 +4985,12 @@ async def get_trading_assistant(
         )
         assistant = assistant.model_copy(
             update={"similar_setup": _to_similar_setup_summary_response(similar_setup)}
+        )
+        _persist_assistant_outcome_snapshot(
+            repository=repository,
+            symbol=normalized_symbol,
+            assistant=assistant,
+            current_price=workstation.last_price,
         )
         return assistant
     finally:
@@ -3883,6 +5038,15 @@ async def get_trade_eligibility(
             repository=repository,
             symbol=normalized_symbol,
             sentiment_service=sentiment_service,
+        )
+        derivatives_data, crowd_positioning = await _load_crowd_positioning(
+            settings=settings,
+            symbol=normalized_symbol,
+        )
+        _apply_crowd_positioning_to_context(
+            context=context,
+            crowd=crowd_positioning,
+            derivatives=derivatives_data,
         )
         technical_analysis, _ = _safe_technical_analysis(
             runtime,
@@ -3942,6 +5106,11 @@ async def get_trade_eligibility(
             fusion_signal=fusion_response,
             technical_analysis=technical_response,
             workstation=workstation,
+            liquidity_bias=context.liquidity_bias,
+            crowd_positioning=context.crowd_positioning,
+            derivatives_data=context.derivatives_data,
+            candles=context.candles,
+            regime_label=regime_analysis.regime_label if regime_analysis is not None else None,
         )
         current_snapshot = _build_signal_validation_snapshot_record(
             symbol=normalized_symbol,
@@ -3962,6 +5131,27 @@ async def get_trade_eligibility(
             horizon=preferred_horizon,
         )
         blocker_reasons = current_snapshot.blocker_reasons if current_snapshot is not None else ()
+        liquidity_zones = _estimate_assistant_liquidity_zones(
+            symbol=normalized_symbol,
+            candles=context.candles,
+            workstation=workstation,
+            assistant=assistant,
+            fusion_signal=fusion_response,
+            liquidity_bias=context.liquidity_bias,
+            regime_analysis=regime_analysis,
+            crowd_positioning=context.crowd_positioning,
+        )
+        liquidation_intelligence = _load_liquidation_intelligence(
+            symbol=normalized_symbol,
+            candles=context.candles,
+            liquidity_zones=liquidity_zones,
+            crowd_positioning=context.crowd_positioning,
+        )
+        liquidity_zones = validate_liquidity_zones_with_liquidations(
+            zones=liquidity_zones,
+            liquidation_signal=liquidation_intelligence.liquidation_signal,
+            dominant_side=liquidation_intelligence.dominant_side,
+        )
         result = evaluate_trade_eligibility(
             TradeEligibilityInput(
                 symbol=normalized_symbol,
@@ -3983,9 +5173,24 @@ async def get_trade_eligibility(
                 ),
                 similar_setup=similar_setup,
                 signal_validation=validation_report,
+                liquidity_bias=context.liquidity_bias,
+                liquidity_zones=liquidity_zones,
+                crowd_positioning=context.crowd_positioning,
+                funding_rate=context.derivatives_data.funding_rate if context.derivatives_data is not None else None,
+                open_interest=context.derivatives_data.open_interest if context.derivatives_data is not None else None,
+                oi_trend=context.derivatives_data.oi_trend if context.derivatives_data is not None else "neutral",
+                liquidation_intelligence=liquidation_intelligence,
             )
         )
-        return _to_trade_eligibility_response(symbol=normalized_symbol, result=result)
+        response = _to_trade_eligibility_response(symbol=normalized_symbol, result=result)
+        _persist_eligibility_outcome_snapshot(
+            repository=repository,
+            symbol=normalized_symbol,
+            assistant=assistant,
+            eligibility=response,
+            current_price=workstation.last_price,
+        )
+        return response
     finally:
         repository.close()
 
@@ -4035,61 +5240,351 @@ async def get_opportunities(
 @router.get("/bot/futures-opportunities", response_model=FuturesOpportunityScanResponse)
 async def get_futures_opportunities(
     quote_asset: str = "USDT",
-    limit: Annotated[int, Query(ge=1, le=50)] = 20,
+    limit: Annotated[int | None, Query(ge=1)] = None,
+    max_symbols: Annotated[int | None, Query(ge=1)] = None,
+    concurrency: Annotated[int, Query(ge=1, le=10)] = 5,
+    symbol_timeout_seconds: Annotated[float, Query(ge=1, le=8)] = 7.0,
+    scan_timeout_seconds: Annotated[float, Query(ge=5, le=90)] = 45.0,
     horizon: str = Query(default="7d"),
     min_opportunity_score: Annotated[int, Query(ge=0, le=100)] = 0,
     min_confidence: Annotated[int, Query(ge=0, le=100)] = 0,
     include_weak_evidence: bool = True,
     include_avoid: bool = True,
     settings: Annotated[Settings, Depends(get_settings_dependency)] = None,
-    symbol_service: Annotated[SpotSymbolService, Depends(get_symbol_service)] = None,
     rest_client: Annotated[BinanceRestClient, Depends(get_rest_client)] = None,
 ) -> FuturesOpportunityScanResponse:
     """Scan symbols for paper-only futures long/short opportunities."""
 
+    scan_id = uuid4().hex
     normalized_quote = quote_asset.strip().upper() or "USDT"
+    scan_limit = min(max_symbols if max_symbols is not None else limit if limit is not None else 50, 100)
     try:
         normalized_horizon = _normalize_futures_scanner_horizon(horizon)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     scanner = FuturesOpportunityScanner()
-    candidates = await symbol_service.search_symbols(query="", limit=limit)
-    candidates = [record for record in candidates if record.quote_asset.upper() == normalized_quote][:limit]
+    total_started_at = time.perf_counter()
+    universe = await _load_futures_symbol_universe(
+        rest_client=rest_client,
+        quote_asset=normalized_quote,
+        limit=scan_limit,
+    )
+    candidates = universe.records
+    if universe.source == "unavailable" or not candidates:
+        latest_error = universe.latest_error or "No USD-M Futures symbol universe is available."
+        LOGGER.warning(
+            "Futures scanner degraded; scan_id=%s phase=symbol_universe endpoint=/fapi/v1/exchangeInfo exception_type=Unavailable error=%s",
+            scan_id,
+            latest_error,
+        )
+        return FuturesOpportunityScanResponse(
+            generated_at=datetime.now(tz=UTC),
+            scan_state="degraded",
+            warnings=["USD-M Futures symbol universe is unavailable; scanner results are temporarily degraded."],
+            scanned_count=0,
+            failed_symbols=[],
+            futures_symbol_universe_source=universe.source,
+            symbol_count=0,
+            last_successful_fetch_at=universe.last_successful_fetch_at,
+            latest_error=latest_error,
+        )
+    universe_warnings: list[str] = []
+    if universe.source == "cache":
+        universe_warnings.append("Using cached USD-M Futures symbol universe because live Binance exchangeInfo is unavailable or recently cached.")
+    elif universe.source == "fallback":
+        universe_warnings.append("Using manual major USD-M Futures fallback symbols because Binance exchangeInfo is unavailable.")
+
     repository = StorageRepository(settings.database_url)
     signals: list[FuturesPaperSignal] = []
     failed_symbols: list[str] = []
-    try:
-        for record in candidates:
+    candle_cache: dict[tuple[str, SupportedInterval], list[Candle]] = {}
+    semaphore = asyncio.Semaphore(concurrency)
+    current_threshold = max(min_opportunity_score, min_confidence)
+
+    async def scan_symbol(record: SpotSymbolRecord) -> FuturesPaperSignal | None:
+        async with semaphore:
+            symbol_started_at = time.perf_counter()
             try:
-                signal = await _build_market_wide_futures_signal_for_symbol(
-                    scanner=scanner,
-                    symbol=record.symbol,
-                    horizon=normalized_horizon,
-                    repository=repository,
-                    rest_client=rest_client,
+                signal = await asyncio.wait_for(
+                    _build_market_wide_futures_signal_for_symbol(
+                        scanner=scanner,
+                        symbol=record.symbol,
+                        horizon=normalized_horizon,
+                        repository=repository,
+                        rest_client=rest_client,
+                        settings=settings,
+                        candle_cache=candle_cache,
+                    ),
+                    timeout=symbol_timeout_seconds,
                 )
-                current_threshold = max(min_opportunity_score, min_confidence)
-                weak_validation = signal.evidence_strength in {"insufficient", "unvalidated", "weak"}
-                if signal.direction in {"long", "short"}:
-                    if signal.opportunity_score < current_threshold:
-                        continue
-                    if weak_validation and not include_weak_evidence:
-                        continue
-                    signals.append(signal)
-                elif signal.direction == "wait" or include_avoid:
-                    signals.append(signal)
-            except Exception:
-                LOGGER.exception("Failed to scan paper futures opportunity for %s.", record.symbol)
+            except asyncio.TimeoutError:
+                LOGGER.warning(
+                    "Timed out futures-paper scan; scan_id=%s phase=symbol_scan symbol=%s endpoint=/fapi/v1/klines exception_type=TimeoutError timeout_seconds=%.1f",
+                    scan_id,
+                    record.symbol,
+                    symbol_timeout_seconds,
+                )
                 failed_symbols.append(record.symbol)
+                return None
+            except Exception:
+                LOGGER.exception(
+                    "Failed to scan paper futures opportunity; scan_id=%s phase=symbol_scan symbol=%s endpoint=/fapi/v1/klines",
+                    scan_id,
+                    record.symbol,
+                )
+                failed_symbols.append(record.symbol)
+                return None
+            finally:
+                LOGGER.debug(
+                    "Futures scanner symbol %s finished in %.3fs.",
+                    record.symbol,
+                    time.perf_counter() - symbol_started_at,
+                )
+
+            weak_validation = signal.evidence_strength in {"insufficient", "unvalidated", "weak"}
+            if signal.direction in {"long", "short"}:
+                if signal.opportunity_score < current_threshold:
+                    return None
+                if weak_validation and not include_weak_evidence:
+                    return None
+                return signal
+            if signal.direction == "wait" or include_avoid:
+                return signal
+            return None
+
+    try:
+        scan_started_at = time.perf_counter()
+        if candidates:
+            task_by_symbol = {
+                asyncio.create_task(scan_symbol(record), name=f"futures-scan-{record.symbol}"): record.symbol
+                for record in candidates
+            }
+            done, pending = await asyncio.wait(task_by_symbol.keys(), timeout=scan_timeout_seconds)
+            for task in pending:
+                symbol = task_by_symbol[task]
+                task.cancel()
+                failed_symbols.append(symbol)
+                LOGGER.warning(
+                    "Futures scanner request timed out; scan_id=%s phase=scan_timeout symbol=%s endpoint=/bot/futures-opportunities exception_type=TimeoutError timeout_seconds=%.1f",
+                    scan_id,
+                    symbol,
+                    scan_timeout_seconds,
+                )
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                result = task.result()
+                if result is not None:
+                    signals.append(result)
+        LOGGER.info(
+            "Futures scanner analyzed %d/%d symbols in %.3fs with concurrency=%d scan_id=%s.",
+            len(signals),
+            len(candidates),
+            time.perf_counter() - scan_started_at,
+            concurrency,
+            scan_id,
+        )
         report = scanner.build_report(
             signals=signals,
             failed_symbols=failed_symbols,
             include_avoid=include_avoid,
         )
+        report.warnings.extend(universe_warnings)
+        report.futures_symbol_universe_source = universe.source
+        report.symbol_count = len(candidates)
+        report.last_successful_fetch_at = universe.last_successful_fetch_at
+        report.latest_error = universe.latest_error
+        if universe.source in {"cache", "fallback"} and report.scan_state == "ready":
+            report.scan_state = "partial"
+        if pending:
+            report.scan_state = "partial" if signals else "degraded"
+            report.warnings.append("Scanner request timed out before all symbols completed; partial results are shown.")
+        try:
+            persist_scanner_validation_snapshots(repository=repository, report=report)
+        except Exception:
+            LOGGER.exception("Failed to persist futures scanner validation snapshots.")
+            report.warnings.append(
+                "Scanner validation snapshot persistence failed; this scan will not be included in paper validation reports."
+            )
+        _persist_scanner_outcome_snapshots(repository=repository, report=report)
+        LOGGER.info("Futures scanner total scan time %.3fs scan_id=%s.", time.perf_counter() - total_started_at, scan_id)
         return _to_futures_scan_response(report)
     finally:
         repository.close()
+
+
+@router.get("/bot/futures-opportunities/live-prices", response_model=FuturesLivePriceResponse)
+async def get_futures_opportunity_live_prices(
+    symbols: Annotated[str, Query(min_length=1)],
+    rest_client: Annotated[BinanceRestClient, Depends(get_rest_client)] = None,
+    heartbeat_service: Annotated[
+        FuturesScannerWebSocketHeartbeatService | None,
+        Depends(get_futures_scanner_heartbeat_service),
+    ] = None,
+) -> FuturesLivePriceResponse:
+    """Return lightweight live prices for visible futures-paper scanner cards."""
+
+    requested = list(sanitize_scanner_symbols(symbols.split(","), max_symbols=100))
+    if not requested:
+        raise HTTPException(status_code=400, detail="symbols must include at least one symbol")
+
+    updated_at = datetime.now(tz=UTC)
+    cached = heartbeat_service.latest_prices(requested, now=updated_at) if heartbeat_service is not None else {}
+    fresh_websocket = {
+        symbol: item
+        for symbol, item in cached.items()
+        if item.source == "websocket" and not item.stale and item.live_price is not None
+    }
+    rest_symbols = [symbol for symbol in requested if symbol not in fresh_websocket]
+    rest_prices: dict[str, tuple[Decimal, Literal["mark_price", "futures_last_price"]]] = {}
+    warnings: list[str] = []
+    try:
+        rows = await rest_client.get_futures_mark_prices(rest_symbols) if rest_symbols else []
+    except Exception:
+        LOGGER.exception("Failed to fetch USD-M Futures mark prices for scanner heartbeat.")
+        try:
+            rows = await rest_client.get_futures_ticker_prices(rest_symbols) if rest_symbols else []
+        except Exception:
+            LOGGER.exception("Failed to fetch USD-M Futures last prices for scanner heartbeat.")
+            rows = []
+            warnings.append("Futures REST price fallback is temporarily unavailable; stale WebSocket cache may be shown.")
+        else:
+            rest_prices = _futures_price_map(rows, price_key="price", price_type="futures_last_price")
+    else:
+        rest_prices = _futures_price_map(rows, price_key="markPrice", price_type="mark_price")
+        missing_symbols = [symbol for symbol in rest_symbols if symbol not in rest_prices]
+        if missing_symbols:
+            try:
+                ticker_rows = await rest_client.get_futures_ticker_prices(missing_symbols)
+            except Exception:
+                LOGGER.exception("Failed to fetch missing USD-M Futures last prices for scanner heartbeat.")
+            else:
+                rest_prices.update(
+                    _futures_price_map(ticker_rows, price_key="price", price_type="futures_last_price")
+                )
+
+    return FuturesLivePriceResponse(
+        items=[
+            _to_futures_live_price_response(
+                symbol=symbol,
+                cached=cached.get(symbol),
+                rest_price=rest_prices.get(symbol),
+                fallback_updated_at=updated_at,
+            )
+            for symbol in requested
+        ],
+        warnings=warnings,
+    )
+
+
+def _futures_price_map(
+    rows: list[dict],
+    *,
+    price_key: str,
+    price_type: Literal["mark_price", "futures_last_price"],
+) -> dict[str, tuple[Decimal, Literal["mark_price", "futures_last_price"]]]:
+    price_by_symbol: dict[str, tuple[Decimal, Literal["mark_price", "futures_last_price"]]] = {}
+    for row in rows:
+        symbol = str(row.get("symbol", "")).upper()
+        raw_price = row.get(price_key)
+        if symbol and raw_price is not None:
+            try:
+                price_by_symbol[symbol] = (Decimal(str(raw_price)), price_type)
+            except Exception:
+                LOGGER.warning("Ignoring invalid USD-M Futures price for %s: %s", symbol, raw_price)
+    return price_by_symbol
+
+
+def _to_futures_live_price_response(
+    *,
+    symbol: str,
+    cached: FuturesScannerLivePrice | None,
+    rest_price: tuple[Decimal, Literal["mark_price", "futures_last_price"]] | None,
+    fallback_updated_at: datetime,
+) -> FuturesLivePriceItemResponse:
+    if cached is not None and cached.source == "websocket" and not cached.stale and cached.live_price is not None:
+        return FuturesLivePriceItemResponse(
+            symbol=symbol,
+            live_price=cached.live_price,
+            updated_at=cached.updated_at,
+            source="websocket",
+            data_source=cached.data_source,
+            price_type=cached.price_type,
+            stale=False,
+            warning=None,
+        )
+    if rest_price is not None:
+        price, price_type = rest_price
+        return FuturesLivePriceItemResponse(
+            symbol=symbol,
+            live_price=price,
+            updated_at=fallback_updated_at,
+            source="rest",
+            data_source="binance_usdm_futures",
+            price_type=price_type,
+            stale=False,
+            warning=None,
+        )
+    if cached is not None and cached.live_price is not None:
+        return FuturesLivePriceItemResponse(
+            symbol=symbol,
+            live_price=cached.live_price,
+            updated_at=cached.updated_at,
+            source="cache",
+            data_source=cached.data_source,
+            price_type=cached.price_type,
+            stale=True,
+            warning=cached.warning or "Cached WebSocket price is stale and REST fallback did not return a price.",
+        )
+    return FuturesLivePriceItemResponse(
+        symbol=symbol,
+        live_price=None,
+        updated_at=cached.updated_at if cached is not None else fallback_updated_at,
+        source="unavailable",
+        data_source="binance_usdm_futures",
+        price_type=cached.price_type if cached is not None else "mark_price",
+        stale=True,
+        warning=(
+            cached.warning if cached is not None and cached.warning else "Live price heartbeat is temporarily unavailable."
+        ),
+    )
+
+
+@router.post("/bot/futures-opportunities/live-subscriptions", response_model=FuturesLiveSubscriptionResponse)
+async def update_futures_opportunity_live_subscriptions(
+    payload: FuturesLiveSubscriptionRequest,
+    heartbeat_service: Annotated[
+        FuturesScannerWebSocketHeartbeatService | None,
+        Depends(get_futures_scanner_heartbeat_service),
+    ] = None,
+) -> FuturesLiveSubscriptionResponse:
+    """Subscribe the scanner heartbeat to currently visible paper scanner symbols."""
+
+    if heartbeat_service is None:
+        sanitized = list(sanitize_scanner_symbols(payload.symbols, max_symbols=100))
+        return FuturesLiveSubscriptionResponse(
+            symbols=sanitized,
+            count=len(sanitized),
+            websocket_enabled=False,
+            warning="WebSocket heartbeat service is unavailable; REST live price fallback remains active.",
+        )
+    try:
+        subscribed = await heartbeat_service.update_subscriptions(payload.symbols)
+    except Exception:
+        LOGGER.exception("Failed to update futures scanner websocket subscriptions.")
+        return FuturesLiveSubscriptionResponse(
+            symbols=[],
+            count=0,
+            websocket_enabled=False,
+            warning="WebSocket heartbeat subscription update failed; REST live price fallback remains active.",
+        )
+    return FuturesLiveSubscriptionResponse(
+        symbols=list(subscribed),
+        count=len(subscribed),
+        websocket_enabled=True,
+        warning=None,
+    )
 
 
 @router.get("/bot/ai-signal", response_model=AISignalResponse | None)

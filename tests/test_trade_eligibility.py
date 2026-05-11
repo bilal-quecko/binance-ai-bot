@@ -16,6 +16,10 @@ from app.main import app
 from app.market_data.candles import Candle
 from app.monitoring.signal_validation import HorizonQualityMetric, SignalValidationReport
 from app.monitoring.similar_setups import SimilarSetupHorizonMetric, SimilarSetupReport
+from app.monitoring.crowd_positioning import CrowdPositioningSnapshot
+from app.monitoring.liquidation_intelligence import LiquidationIntelligenceSnapshot
+from app.monitoring.liquidity_bias import LiquidityBiasSnapshot
+from app.monitoring.liquidity_zones import LiquidityZone, LiquidityZoneSnapshot, NearestLiquidityTarget
 from app.monitoring.trade_eligibility import TradeEligibilityInput, evaluate_trade_eligibility
 from app.storage import StorageRepository
 from app.storage.models import SignalValidationSnapshotRecord
@@ -129,6 +133,31 @@ def test_trade_eligibility_watch_only_for_mixed_evidence() -> None:
     assert result.minimum_confidence_threshold == 75
 
 
+def test_trade_eligibility_marks_strong_same_side_crowd_watch_only() -> None:
+    result = evaluate_trade_eligibility(
+        _eligibility_input(
+            crowd_positioning=CrowdPositioningSnapshot(
+                crowd_side="long_crowded",
+                crowd_strength="high",
+                positioning_confidence="high",
+                squeeze_risk="long_squeeze",
+                explanation="Crowded longs.",
+            ),
+            funding_rate=Decimal("0.00035"),
+            open_interest=Decimal("12345.67"),
+            oi_trend="rising",
+        )
+    )
+
+    assert result.status == "watch_only"
+    assert result.crowd_side == "long_crowded"
+    assert result.squeeze_risk == "long_squeeze"
+    assert result.funding_rate == Decimal("0.00035")
+    assert result.open_interest == Decimal("12345.67")
+    assert result.oi_trend == "rising"
+    assert any("Crowded longs" in warning for warning in result.warnings)
+
+
 def test_trade_eligibility_blocks_bad_risk_regime_and_blockers() -> None:
     blocked = evaluate_trade_eligibility(
         _eligibility_input(blocker_reasons=("Expected edge below costs.",))
@@ -164,6 +193,86 @@ def test_trade_eligibility_returns_insufficient_data_for_small_samples() -> None
     assert result.status == "insufficient_data"
     assert result.evidence_strength == "insufficient"
     assert "not enough measured signal history" in result.reason.lower()
+
+
+def test_trade_eligibility_uses_liquidity_trap_as_watch_only_adjustment() -> None:
+    result = evaluate_trade_eligibility(
+        _eligibility_input(
+            liquidity_bias=LiquidityBiasSnapshot(
+                liquidity_bias="bearish",
+                liquidity_pressure="high",
+                likely_liquidation_direction="down",
+                trap_risk="long_trap",
+                explanation="Liquidity estimate: crowded longs.",
+            )
+        )
+    )
+
+    assert result.status == "watch_only"
+    assert "liquidity" in result.reason.lower()
+    assert "long liquidation trap risk" in result.conditions_to_avoid
+
+
+def test_trade_eligibility_uses_stop_too_close_to_liquidity_as_watch_only() -> None:
+    zones = LiquidityZoneSnapshot(
+        upside_liquidity_zone=LiquidityZone(Decimal("104"), "medium", "Estimated upside zone."),
+        downside_liquidity_zone=LiquidityZone(Decimal("98"), "high", "Estimated downside zone."),
+        nearest_liquidity_target=NearestLiquidityTarget("down", Decimal("98"), Decimal("0.5000"), "high"),
+        sweep_risk="none",
+        trade_timing_adjustment="enter_now",
+        tp_sl_alignment="stop_too_close_to_liquidity",
+        explanation="Estimated liquidity zone is close to the proposed stop.",
+    )
+    result = evaluate_trade_eligibility(_eligibility_input(liquidity_zones=zones))
+
+    assert result.status == "watch_only"
+    assert result.tp_sl_alignment == "stop_too_close_to_liquidity"
+    assert "stop too close to estimated liquidity" in result.conditions_to_avoid
+
+
+def test_trade_eligibility_blocks_choppy_two_sided_liquidity() -> None:
+    zones = LiquidityZoneSnapshot(
+        upside_liquidity_zone=LiquidityZone(Decimal("102"), "high", "Estimated upside zone."),
+        downside_liquidity_zone=LiquidityZone(Decimal("98"), "high", "Estimated downside zone."),
+        nearest_liquidity_target=NearestLiquidityTarget("up", Decimal("102"), Decimal("2.0000"), "high"),
+        sweep_risk="both_sides",
+        trade_timing_adjustment="avoid_chop",
+        tp_sl_alignment="needs_review",
+        explanation="Estimated liquidity is concentrated on both sides.",
+    )
+    result = evaluate_trade_eligibility(_eligibility_input(liquidity_zones=zones))
+
+    assert result.status == "not_eligible"
+    assert result.trade_timing_adjustment == "avoid_chop"
+    assert "choppy both-side liquidity" in result.conditions_to_avoid
+
+
+def test_sweep_confirmation_improves_liquidity_zone_eligibility() -> None:
+    zones = LiquidityZoneSnapshot(
+        upside_liquidity_zone=LiquidityZone(Decimal("102"), "medium", "Estimated upside zone."),
+        downside_liquidity_zone=LiquidityZone(Decimal("98"), "high", "Estimated downside zone."),
+        nearest_liquidity_target=NearestLiquidityTarget("down", Decimal("98"), Decimal("0.4000"), "high"),
+        sweep_risk="downside_sweep",
+        trade_timing_adjustment="wait_for_sweep",
+        tp_sl_alignment="needs_review",
+        explanation="Estimated downside sweep risk.",
+    )
+    liquidation = LiquidationIntelligenceSnapshot(
+        liquidation_signal="sweep_confirmation",
+        liquidation_intensity="high",
+        dominant_side="longs_liquidated",
+        interpretation_confidence="high",
+        explanation="Liquidations validated the sweep.",
+    )
+
+    result = evaluate_trade_eligibility(
+        _eligibility_input(confidence=68, liquidity_zones=zones, liquidation_intelligence=liquidation)
+    )
+
+    assert result.status == "eligible"
+    assert result.minimum_confidence_threshold == 67
+    assert "wait for liquidity sweep" not in result.conditions_to_avoid
+    assert result.liquidation_signal == "sweep_confirmation"
 
 
 def _db_path() -> Path:

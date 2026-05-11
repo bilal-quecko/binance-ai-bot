@@ -1,7 +1,10 @@
-"""Binance Spot REST client."""
+"""Binance Spot and USD-M Futures REST client."""
 
 from collections.abc import Callable, Mapping
 from decimal import Decimal
+import asyncio
+import json
+import logging
 import time
 from typing import Any
 from urllib.parse import urlencode
@@ -13,6 +16,8 @@ from app.exchange.auth import sign_query
 from app.exchange.filters import parse_symbol_filters
 from app.exchange.models import AccountBalance, AccountInfo, ExchangeInfo, ExchangeSymbol
 
+LOGGER = logging.getLogger(__name__)
+
 
 def _serialize_param_value(value: Any) -> str:
     """Serialize a request parameter for Binance query strings."""
@@ -23,7 +28,7 @@ def _serialize_param_value(value: Any) -> str:
 
 
 class BinanceRestClient:
-    """Async Binance Spot REST client with signed request support."""
+    """Async Binance REST client with signed Spot support and read-only USD-M Futures market data."""
 
     def __init__(
         self,
@@ -38,6 +43,11 @@ class BinanceRestClient:
         )
         self._owns_client = client is None
         self._time_provider = time_provider or self._default_timestamp_ms
+
+    def _futures_url(self, path: str) -> str:
+        """Return an absolute USD-M Futures URL for requests that must not use Spot endpoints."""
+
+        return f"{self.settings.binance_futures_base_url.rstrip('/')}{path}"
 
     @staticmethod
     def _default_timestamp_ms() -> int:
@@ -59,6 +69,7 @@ class BinanceRestClient:
         params: Mapping[str, Any] | None = None,
         signed: bool = False,
         recv_window: int = 5_000,
+        timeout: float | None = None,
     ) -> Any:
         """Send a Binance REST request and return the decoded JSON payload."""
 
@@ -74,9 +85,61 @@ class BinanceRestClient:
             request_params["signature"] = sign_query(query_string, self.settings.binance_api_secret)
             headers["X-MBX-APIKEY"] = self.settings.binance_api_key
 
-        response = await self._client.request(method=method, url=path, params=request_params, headers=headers)
+        request_kwargs: dict[str, Any] = {
+            "method": method,
+            "url": path,
+            "params": request_params,
+            "headers": headers,
+        }
+        if timeout is not None:
+            request_kwargs["timeout"] = timeout
+        response = await self._client.request(**request_kwargs)
         response.raise_for_status()
         return response.json()
+
+    async def _futures_market_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        endpoint: str,
+        timeout: float = 6.0,
+        retries: int = 2,
+    ) -> Any:
+        """Request USD-M Futures market data with bounded timeout and small transient retry."""
+
+        for attempt in range(retries + 1):
+            try:
+                return await self._request(
+                    method,
+                    self._futures_url(path),
+                    params=params,
+                    timeout=timeout,
+                )
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code
+                transient = status_code == 429 or 500 <= status_code < 600
+                if not transient or attempt >= retries:
+                    LOGGER.warning(
+                        "Binance USD-M request failed; phase=futures_rest endpoint=%s exception_type=%s status_code=%s attempt=%d",
+                        endpoint,
+                        type(exc).__name__,
+                        status_code,
+                        attempt + 1,
+                    )
+                    raise
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                if attempt >= retries:
+                    LOGGER.warning(
+                        "Binance USD-M request failed; phase=futures_rest endpoint=%s exception_type=%s attempt=%d",
+                        endpoint,
+                        type(exc).__name__,
+                        attempt + 1,
+                    )
+                    raise
+            await asyncio.sleep(0.2 * (attempt + 1))
+        raise RuntimeError(f"Binance USD-M request failed after retry budget for {endpoint}.")
 
     async def get_exchange_info(self) -> ExchangeInfo:
         """Fetch and normalize Binance Spot exchange metadata."""
@@ -119,6 +182,98 @@ class BinanceRestClient:
             raise ValueError("Expected Binance 24h ticker response to be a list.")
         return [item for item in payload if isinstance(item, dict)]
 
+    async def get_ticker_prices(self, symbols: list[str]) -> list[dict[str, Any]]:
+        """Fetch latest ticker prices for one or more Spot symbols."""
+
+        normalized_symbols = [symbol.strip().upper() for symbol in symbols if symbol.strip()]
+        if not normalized_symbols:
+            return []
+        if len(normalized_symbols) == 1:
+            payload = await self._request(
+                "GET",
+                "/api/v3/ticker/price",
+                params={"symbol": normalized_symbols[0]},
+            )
+            if not isinstance(payload, dict):
+                raise ValueError("Expected Binance ticker price response to be an object.")
+            return [payload]
+        payload = await self._request(
+            "GET",
+            "/api/v3/ticker/price",
+            params={"symbols": json.dumps(normalized_symbols)},
+        )
+        if not isinstance(payload, list):
+            raise ValueError("Expected Binance ticker price response to be a list.")
+        return [item for item in payload if isinstance(item, dict)]
+
+    async def get_futures_exchange_info(self) -> dict[str, Any]:
+        """Fetch Binance USD-M Futures exchange metadata."""
+
+        payload = await self._futures_market_request("GET", "/fapi/v1/exchangeInfo", endpoint="/fapi/v1/exchangeInfo")
+        if not isinstance(payload, dict):
+            raise ValueError("Expected Binance USD-M Futures exchange info response to be an object.")
+        return payload
+
+    async def get_futures_ticker_24h(self) -> list[dict[str, Any]]:
+        """Fetch 24-hour ticker statistics for all USD-M Futures symbols."""
+
+        payload = await self._futures_market_request("GET", "/fapi/v1/ticker/24hr", endpoint="/fapi/v1/ticker/24hr")
+        if not isinstance(payload, list):
+            raise ValueError("Expected Binance USD-M Futures 24h ticker response to be a list.")
+        return [item for item in payload if isinstance(item, dict)]
+
+    async def get_futures_ticker_prices(self, symbols: list[str]) -> list[dict[str, Any]]:
+        """Fetch latest USD-M Futures last prices for one or more symbols."""
+
+        normalized_symbols = [symbol.strip().upper() for symbol in symbols if symbol.strip()]
+        if not normalized_symbols:
+            return []
+        if len(normalized_symbols) == 1:
+            payload = await self._futures_market_request(
+                "GET",
+                "/fapi/v1/ticker/price",
+                params={"symbol": normalized_symbols[0]},
+                endpoint="/fapi/v1/ticker/price",
+            )
+            if not isinstance(payload, dict):
+                raise ValueError("Expected Binance USD-M Futures ticker price response to be an object.")
+            return [payload]
+        payload = await self._futures_market_request("GET", "/fapi/v1/ticker/price", endpoint="/fapi/v1/ticker/price")
+        if not isinstance(payload, list):
+            raise ValueError("Expected Binance USD-M Futures ticker price response to be a list.")
+        requested = set(normalized_symbols)
+        return [
+            item
+            for item in payload
+            if isinstance(item, dict) and str(item.get("symbol", "")).upper() in requested
+        ]
+
+    async def get_futures_mark_prices(self, symbols: list[str]) -> list[dict[str, Any]]:
+        """Fetch USD-M Futures mark prices for display safety."""
+
+        normalized_symbols = [symbol.strip().upper() for symbol in symbols if symbol.strip()]
+        if not normalized_symbols:
+            return []
+        if len(normalized_symbols) == 1:
+            payload = await self._futures_market_request(
+                "GET",
+                "/fapi/v1/premiumIndex",
+                params={"symbol": normalized_symbols[0]},
+                endpoint="/fapi/v1/premiumIndex",
+            )
+            if not isinstance(payload, dict):
+                raise ValueError("Expected Binance USD-M Futures premium index response to be an object.")
+            return [payload]
+        payload = await self._futures_market_request("GET", "/fapi/v1/premiumIndex", endpoint="/fapi/v1/premiumIndex")
+        if not isinstance(payload, list):
+            raise ValueError("Expected Binance USD-M Futures premium index response to be a list.")
+        requested = set(normalized_symbols)
+        return [
+            item
+            for item in payload
+            if isinstance(item, dict) and str(item.get("symbol", "")).upper() in requested
+        ]
+
     async def get_klines(
         self,
         *,
@@ -142,6 +297,36 @@ class BinanceRestClient:
         payload = await self._request("GET", "/api/v3/klines", params=params)
         if not isinstance(payload, list):
             raise ValueError("Expected Binance klines response to be a list.")
+        return [row for row in payload if isinstance(row, list)]
+
+    async def get_futures_klines(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 1_000,
+    ) -> list[list[Any]]:
+        """Fetch Binance USD-M Futures klines for one symbol and interval."""
+
+        params: dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "limit": min(max(limit, 1), 1_500),
+        }
+        if start_time_ms is not None:
+            params["startTime"] = start_time_ms
+        if end_time_ms is not None:
+            params["endTime"] = end_time_ms
+        payload = await self._futures_market_request(
+            "GET",
+            "/fapi/v1/klines",
+            params=params,
+            endpoint="/fapi/v1/klines",
+        )
+        if not isinstance(payload, list):
+            raise ValueError("Expected Binance USD-M Futures klines response to be a list.")
         return [row for row in payload if isinstance(row, list)]
 
     async def get_account_info(self) -> AccountInfo:

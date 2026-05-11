@@ -1,17 +1,23 @@
+import asyncio
+import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
+from fastapi.testclient import TestClient
+
 from app.analysis.symbol_sentiment import SymbolSentimentSnapshot
 from app.analysis.technical import TechnicalAnalysisSnapshot, TimeframeTechnicalSummary
 from app.analysis.pattern_summary import PatternAnalysisSnapshot
 from app.ai.models import AIFeatureVector, AISignalSnapshot
-from fastapi.testclient import TestClient
 
 from app.api.bot_api import (
+    _FUTURES_SYMBOL_UNIVERSE_CACHE,
     get_backfill_service,
     get_bot_runtime,
+    get_futures_scanner_heartbeat_service,
     get_rest_client,
     get_settings_dependency,
     get_symbol_sentiment_service,
@@ -25,6 +31,7 @@ from app.main import app
 from app.market_data.candles import Candle
 from app.market_data.models import MarketSnapshot
 from app.market_data.orderbook import TopOfBook
+from app.monitoring.futures_scanner_ws_heartbeat import FuturesScannerLivePrice, sanitize_scanner_symbols
 from app.paper.models import Position
 from app.runner.models import ManualTradeResult, TradeReadiness
 from app.sentiment.models import SentimentComponent
@@ -33,6 +40,11 @@ from app.strategies.models import StrategySignal
 
 
 class FakeSymbolService:
+    def __init__(self, *, count: int = 2) -> None:
+        self.count = count
+        self.last_limit: int | None = None
+        self.last_query: str | None = None
+
     async def search_symbols(self, *, query: str = '', limit: int = 20):
         self.last_query = query
         self.last_limit = limit
@@ -40,6 +52,15 @@ class FakeSymbolService:
             SpotSymbolRecord(symbol='BTCUSDT', base_asset='BTC', quote_asset='USDT', status='TRADING'),
             SpotSymbolRecord(symbol='ETHUSDT', base_asset='ETH', quote_asset='USDT', status='TRADING'),
         ]
+        for index in range(3, self.count + 1):
+            records.append(
+                SpotSymbolRecord(
+                    symbol=f'SYM{index:03d}USDT',
+                    base_asset=f'SYM{index:03d}',
+                    quote_asset='USDT',
+                    status='TRADING',
+                )
+            )
         if not query:
             return records[:limit]
         return [record for record in records if query.upper() in record.symbol][:limit]
@@ -75,6 +96,13 @@ class FakeSymbolSentimentService:
         )
 
 
+@pytest.fixture(autouse=True)
+def clear_futures_symbol_universe_cache():
+    _FUTURES_SYMBOL_UNIVERSE_CACHE.clear()
+    yield
+    _FUTURES_SYMBOL_UNIVERSE_CACHE.clear()
+
+
 class FakeBackfillService:
     def __init__(self) -> None:
         self.ensure_calls = 0
@@ -102,11 +130,74 @@ class FakeBackfillService:
 
 
 class FakeFuturesRestClient:
-    def __init__(self, *, failing_symbols: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        failing_symbols: set[str] | None = None,
+        ticker_fails: bool = False,
+        exchange_info_fails: bool = False,
+        count: int = 2,
+    ) -> None:
         self.failing_symbols = failing_symbols or set()
+        self.ticker_fails = ticker_fails
+        self.exchange_info_fails = exchange_info_fails
+        self.count = count
         self.calls: list[tuple[str, str]] = []
 
+    async def get_futures_exchange_info(self):
+        if self.exchange_info_fails:
+            raise TimeoutError('exchangeInfo unavailable')
+        symbols = [
+            {
+                'symbol': 'BTCUSDT',
+                'baseAsset': 'BTC',
+                'quoteAsset': 'USDT',
+                'status': 'TRADING',
+                'contractType': 'PERPETUAL',
+            },
+            {
+                'symbol': 'ETHUSDT',
+                'baseAsset': 'ETH',
+                'quoteAsset': 'USDT',
+                'status': 'TRADING',
+                'contractType': 'PERPETUAL',
+            },
+        ]
+        for index in range(3, self.count + 1):
+            symbols.append(
+                {
+                    'symbol': f'SYM{index:03d}USDT',
+                    'baseAsset': f'SYM{index:03d}',
+                    'quoteAsset': 'USDT',
+                    'status': 'TRADING',
+                    'contractType': 'PERPETUAL',
+                }
+            )
+        return {
+            'symbols': symbols[: self.count]
+        }
+
+    async def get_futures_ticker_24h(self):
+        rows = [
+            {'symbol': 'BTCUSDT', 'quoteVolume': '2000000'},
+            {'symbol': 'ETHUSDT', 'quoteVolume': '1000000'},
+        ]
+        for index in range(3, self.count + 1):
+            rows.append({'symbol': f'SYM{index:03d}USDT', 'quoteVolume': str(1000000 - index)})
+        return rows[: self.count]
+
     async def get_klines(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 1000,
+    ):
+        raise AssertionError('Spot klines must not be used by the futures scanner')
+
+    async def get_futures_klines(
         self,
         *,
         symbol: str,
@@ -147,6 +238,82 @@ class FakeFuturesRestClient:
                 '0',
             ])
         return rows[:limit]
+
+    async def get_ticker_prices(self, symbols: list[str]):
+        raise AssertionError('Spot ticker prices must not be used by the futures scanner')
+
+    async def get_futures_ticker_prices(self, symbols: list[str]):
+        if self.ticker_fails:
+            raise RuntimeError('ticker unavailable')
+        prices = {
+            'BTCUSDT': Decimal('123.45'),
+            'ETHUSDT': Decimal('234.56'),
+        }
+        return [
+            {'symbol': symbol.upper(), 'price': str(prices[symbol.upper()])}
+            for symbol in symbols
+            if symbol.upper() in prices
+        ]
+
+    async def get_futures_mark_prices(self, symbols: list[str]):
+        if self.ticker_fails:
+            raise RuntimeError('mark price unavailable')
+        prices = {
+            'BTCUSDT': Decimal('123.45'),
+            'ETHUSDT': Decimal('234.56'),
+        }
+        return [
+            {'symbol': symbol.upper(), 'markPrice': str(prices[symbol.upper()])}
+            for symbol in symbols
+            if symbol.upper() in prices
+        ]
+
+
+class FailingFuturesRestClient(FakeFuturesRestClient):
+    async def get_futures_klines(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 1000,
+    ):
+        raise RuntimeError('klines unavailable')
+
+
+class SlowFuturesRestClient(FakeFuturesRestClient):
+    async def get_futures_klines(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 1000,
+    ):
+        if symbol == 'ETHUSDT':
+            await asyncio.sleep(2)
+        return await super().get_futures_klines(
+            symbol=symbol,
+            interval=interval,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+            limit=limit,
+        )
+
+
+class FakeFuturesHeartbeatService:
+    def __init__(self, prices: dict[str, FuturesScannerLivePrice] | None = None) -> None:
+        self.prices = prices or {}
+        self.subscribed: tuple[str, ...] = ()
+
+    def latest_prices(self, symbols, *, now=None):
+        return {symbol: self.prices[symbol] for symbol in symbols if symbol in self.prices}
+
+    async def update_subscriptions(self, symbols):
+        self.subscribed = sanitize_scanner_symbols(symbols, max_symbols=100)
+        return self.subscribed
 
 
 class FakeRuntime:
@@ -1861,6 +2028,20 @@ def test_backfill_status_and_trading_assistant_endpoints_use_stored_history() ->
     assert assistant_response.json()['symbol'] == 'BTCUSDT'
     assert assistant_response.json()['backfill_status']['status'] == 'ready'
     assert assistant_response.json()['decision'] in {'buy', 'wait', 'avoid', 'sell_exit'}
+    assert {
+        'liquidity_bias',
+        'liquidity_pressure',
+        'likely_liquidation_direction',
+        'trap_risk',
+        'liquidity_explanation',
+        'upside_liquidity_zone',
+        'downside_liquidity_zone',
+        'nearest_liquidity_target',
+        'sweep_risk',
+        'trade_timing_adjustment',
+        'tp_sl_alignment',
+        'liquidity_zone_explanation',
+    } <= set(assistant_response.json())
     assert fake_backfill_service.ensure_calls == 0
     assert fake_backfill_service.status_calls >= 2
 
@@ -1955,6 +2136,7 @@ def test_futures_opportunities_response_shape_and_safety_flags() -> None:
 
     try:
         response = client.get('/bot/futures-opportunities', params={'limit': 2, 'include_avoid': 'true'})
+        live_response = client.get('/bot/futures-opportunities/live-prices', params={'symbols': 'BTCUSDT'})
     finally:
         app.dependency_overrides.clear()
 
@@ -1978,10 +2160,38 @@ def test_futures_opportunities_response_shape_and_safety_flags() -> None:
         'momentum',
         'leverage_suggestion',
         'liquidation_safety_note',
+        'liquidity_bias',
+        'liquidity_pressure',
+        'likely_liquidation_direction',
+        'trap_risk',
+        'liquidity_explanation',
+        'upside_liquidity_zone',
+        'downside_liquidity_zone',
+        'nearest_liquidity_target',
+        'sweep_risk',
+        'trade_timing_adjustment',
+        'tp_sl_alignment',
+        'liquidity_zone_explanation',
+        'liquidity_adjusted_note',
+        'data_source',
+        'price_type',
     } <= set(candidates[0])
+    assert candidates[0]['data_source'] == 'binance_usdm_futures'
+    assert candidates[0]['price_type'] == 'futures_last_price'
     assert body['long_candidates']
     assert body['short_candidates']
     assert body['long_candidates'][0]['evidence_strength'] == 'unvalidated'
+    assert live_response.status_code == 200
+    assert live_response.json()['items'][0]['live_price'] == '123.45'
+    repository = StorageRepository(settings.database_url)
+    try:
+        snapshots = repository.get_scanner_validation_snapshots()
+    finally:
+        repository.close()
+    assert snapshots
+    assert {'top_long', 'top_short', 'random_baseline'} <= {snapshot.candidate_group for snapshot in snapshots}
+    assert all(snapshot.price_at_scan != Decimal('123.45') for snapshot in snapshots if snapshot.price_at_scan is not None)
+    assert all(snapshot.data_source == 'binance_usdm_futures' for snapshot in snapshots)
 
 
 def test_futures_opportunities_returns_partial_when_symbol_scan_fails() -> None:
@@ -2031,3 +2241,324 @@ def test_futures_opportunities_returns_partial_when_symbol_scan_fails() -> None:
     assert body['failed_symbols'] == ['ETHUSDT']
     assert body['live_futures_trading_enabled'] is False
     assert body['real_orders_enabled'] is False
+
+
+def test_futures_opportunities_reports_live_symbol_universe_success() -> None:
+    settings = Settings(DATABASE_URL=f"sqlite:///{_db_path()}")
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: FakeFuturesRestClient()
+    client = TestClient(app)
+
+    try:
+        response = client.get('/bot/futures-opportunities', params={'limit': 1, 'include_avoid': 'true'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['futures_symbol_universe_source'] == 'live'
+    assert body['symbol_count'] == 1
+    assert body['last_successful_fetch_at'] is not None
+    assert body['latest_error'] is None
+
+
+def test_futures_opportunities_uses_cached_symbol_universe_when_exchange_info_fails() -> None:
+    settings = Settings(DATABASE_URL=f"sqlite:///{_db_path()}")
+    first_client = FakeFuturesRestClient()
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: first_client
+    client = TestClient(app)
+
+    try:
+        first_response = client.get('/bot/futures-opportunities', params={'limit': 1, 'include_avoid': 'true'})
+        _FUTURES_SYMBOL_UNIVERSE_CACHE['USDT'].fetched_at -= timedelta(minutes=30)
+        app.dependency_overrides[get_rest_client] = lambda: FakeFuturesRestClient(exchange_info_fails=True)
+        second_response = client.get('/bot/futures-opportunities', params={'limit': 1, 'include_avoid': 'true'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    body = second_response.json()
+    assert body['futures_symbol_universe_source'] == 'cache'
+    assert body['last_successful_fetch_at'] is not None
+    assert body['latest_error']
+
+
+def test_futures_opportunities_uses_manual_fallback_when_exchange_info_fails_without_cache() -> None:
+    settings = Settings(DATABASE_URL=f"sqlite:///{_db_path()}")
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: FakeFuturesRestClient(exchange_info_fails=True)
+    client = TestClient(app)
+
+    try:
+        response = client.get('/bot/futures-opportunities', params={'limit': 2, 'include_avoid': 'true'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['futures_symbol_universe_source'] == 'fallback'
+    assert body['symbol_count'] == 2
+    assert body['scan_state'] in {'partial', 'degraded'}
+    assert any('fallback symbols' in warning for warning in body['warnings'])
+    assert body['latest_error']
+
+
+def test_futures_opportunities_returns_degraded_when_exchange_info_fails_without_cache_or_fallback() -> None:
+    settings = Settings(DATABASE_URL=f"sqlite:///{_db_path()}")
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: FakeFuturesRestClient(exchange_info_fails=True)
+    client = TestClient(app)
+
+    try:
+        response = client.get('/bot/futures-opportunities', params={'quote_asset': 'BTC', 'limit': 2})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['scan_state'] == 'degraded'
+    assert body['futures_symbol_universe_source'] == 'unavailable'
+    assert body['symbol_count'] == 0
+    assert body['latest_error']
+
+
+def test_futures_opportunities_skips_slow_symbols_after_timeout() -> None:
+    settings = Settings(DATABASE_URL=f"sqlite:///{_db_path()}")
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: SlowFuturesRestClient()
+    client = TestClient(app)
+    started_at = time.perf_counter()
+
+    try:
+        response = client.get(
+            '/bot/futures-opportunities',
+            params={'limit': 2, 'symbol_timeout_seconds': 1, 'include_avoid': 'true'},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert time.perf_counter() - started_at < 5
+    body = response.json()
+    assert body['scan_state'] == 'partial'
+    assert 'ETHUSDT' in body['failed_symbols']
+    assert body['long_candidates'] or body['short_candidates'] or body['neutral_candidates']
+
+
+def test_futures_opportunities_uses_cached_usdm_futures_candles() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    repository = StorageRepository(settings.database_url)
+    generated_at = datetime.now(tz=UTC)
+    futures_candles = []
+    for interval, count, step_minutes in (('15m', 120, 15), ('1h', 60, 60)):
+        base_time = generated_at - timedelta(minutes=step_minutes * (count + 1))
+        for index in range(count):
+            open_price = Decimal('100') + (Decimal(index) * Decimal('0.2'))
+            close_price = open_price + Decimal('0.1')
+            open_time = base_time + timedelta(minutes=step_minutes * index)
+            futures_candles.append(
+                Candle(
+                    symbol='BTCUSDT',
+                    timeframe=interval,
+                    open=open_price,
+                    high=close_price + Decimal('0.2'),
+                    low=open_price - Decimal('0.1'),
+                    close=close_price,
+                    volume=Decimal('100'),
+                    quote_volume=Decimal('1000000'),
+                    open_time=open_time,
+                    close_time=open_time + timedelta(minutes=step_minutes, seconds=-1),
+                    event_time=open_time + timedelta(minutes=step_minutes, seconds=-1),
+                    trade_count=100,
+                    is_closed=True,
+                )
+            )
+    repository.upsert_futures_historical_candles(futures_candles, source='binance_usdm_futures')
+    repository.close()
+
+    rest_client = FakeFuturesRestClient()
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: rest_client
+    client = TestClient(app)
+
+    try:
+        response = client.get('/bot/futures-opportunities', params={'limit': 1, 'include_avoid': 'true'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()['scanned_count'] == 1
+    assert rest_client.calls == []
+
+
+def test_futures_opportunities_accepts_100_max_symbols() -> None:
+    settings = Settings(DATABASE_URL=f"sqlite:///{_db_path()}")
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: FailingFuturesRestClient(count=100)
+    client = TestClient(app)
+
+    try:
+        response = client.get('/bot/futures-opportunities', params={'max_symbols': 100})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert len(response.json()['failed_symbols']) == 100
+
+
+def test_futures_opportunities_caps_max_symbols_above_100() -> None:
+    settings = Settings(DATABASE_URL=f"sqlite:///{_db_path()}")
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: FailingFuturesRestClient(count=120)
+    client = TestClient(app)
+
+    try:
+        response = client.get('/bot/futures-opportunities', params={'max_symbols': 150})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert len(response.json()['failed_symbols']) == 100
+
+
+def test_futures_opportunity_live_prices_response_shape() -> None:
+    app.dependency_overrides[get_rest_client] = lambda: FakeFuturesRestClient()
+    app.dependency_overrides[get_futures_scanner_heartbeat_service] = lambda: None
+    client = TestClient(app)
+
+    try:
+        response = client.get('/bot/futures-opportunities/live-prices', params={'symbols': 'BTCUSDT,ETHUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['warnings'] == []
+    assert len(body['items']) == 2
+    first = body['items'][0]
+    assert {'symbol', 'live_price', 'updated_at', 'source', 'data_source', 'price_type', 'stale', 'warning'} <= set(first)
+    assert first['symbol'] == 'BTCUSDT'
+    assert first['live_price'] == '123.45'
+    assert first['source'] == 'rest'
+    assert first['data_source'] == 'binance_usdm_futures'
+    assert first['price_type'] == 'mark_price'
+    assert first['stale'] is False
+
+
+def test_futures_opportunity_live_prices_returns_stale_warning_when_rest_fails() -> None:
+    app.dependency_overrides[get_rest_client] = lambda: FakeFuturesRestClient(ticker_fails=True)
+    app.dependency_overrides[get_futures_scanner_heartbeat_service] = lambda: None
+    client = TestClient(app)
+
+    try:
+        response = client.get('/bot/futures-opportunities/live-prices', params={'symbols': 'BTCUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['items'][0]['symbol'] == 'BTCUSDT'
+    assert body['items'][0]['live_price'] is None
+    assert body['items'][0]['source'] == 'unavailable'
+    assert body['items'][0]['stale'] is True
+    assert body['items'][0]['warning'] == 'Live price heartbeat is temporarily unavailable.'
+    assert body['warnings']
+
+
+def test_futures_opportunity_live_prices_prefers_websocket_cache_over_rest() -> None:
+    cached_at = datetime(2024, 3, 9, 16, 0, tzinfo=UTC)
+    heartbeat = FakeFuturesHeartbeatService(
+        {
+            'BTCUSDT': FuturesScannerLivePrice(
+                symbol='BTCUSDT',
+                live_price=Decimal('999.99'),
+                updated_at=cached_at,
+                source='websocket',
+                stale=False,
+            )
+        }
+    )
+    app.dependency_overrides[get_rest_client] = lambda: FakeFuturesRestClient()
+    app.dependency_overrides[get_futures_scanner_heartbeat_service] = lambda: heartbeat
+    client = TestClient(app)
+
+    try:
+        response = client.get('/bot/futures-opportunities/live-prices', params={'symbols': 'BTCUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    item = response.json()['items'][0]
+    assert item['live_price'] == '999.99'
+    assert item['source'] == 'websocket'
+    assert item['data_source'] == 'binance_usdm_futures'
+    assert item['price_type'] == 'mark_price'
+    assert item['stale'] is False
+
+
+def test_futures_opportunity_live_prices_falls_back_to_rest_when_websocket_stale() -> None:
+    cached_at = datetime(2024, 3, 9, 16, 0, tzinfo=UTC)
+    heartbeat = FakeFuturesHeartbeatService(
+        {
+            'BTCUSDT': FuturesScannerLivePrice(
+                symbol='BTCUSDT',
+                live_price=Decimal('999.99'),
+                updated_at=cached_at,
+                source='cache',
+                stale=True,
+                warning='WebSocket price is stale.',
+            )
+        }
+    )
+    app.dependency_overrides[get_rest_client] = lambda: FakeFuturesRestClient()
+    app.dependency_overrides[get_futures_scanner_heartbeat_service] = lambda: heartbeat
+    client = TestClient(app)
+
+    try:
+        response = client.get('/bot/futures-opportunities/live-prices', params={'symbols': 'BTCUSDT'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    item = response.json()['items'][0]
+    assert item['live_price'] == '123.45'
+    assert item['source'] == 'rest'
+    assert item['stale'] is False
+
+
+def test_futures_opportunity_live_subscriptions_sanitize_symbols() -> None:
+    heartbeat = FakeFuturesHeartbeatService()
+    app.dependency_overrides[get_futures_scanner_heartbeat_service] = lambda: heartbeat
+    client = TestClient(app)
+
+    try:
+        response = client.post(
+            '/bot/futures-opportunities/live-subscriptions',
+            json={'symbols': ['btcusdt', 'bad/usdt', 'ETHUSDT', 'btcusdt', '']},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()['symbols'] == ['BTCUSDT', 'ETHUSDT']
+    assert response.json()['count'] == 2
+    assert response.json()['websocket_enabled'] is True
+
+
+def test_futures_opportunity_live_subscriptions_empty_list_is_safe() -> None:
+    heartbeat = FakeFuturesHeartbeatService()
+    app.dependency_overrides[get_futures_scanner_heartbeat_service] = lambda: heartbeat
+    client = TestClient(app)
+
+    try:
+        response = client.post('/bot/futures-opportunities/live-subscriptions', json={'symbols': []})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()['symbols'] == []
+    assert response.json()['count'] == 0
+    assert response.json()['websocket_enabled'] is True

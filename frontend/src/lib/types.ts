@@ -1,4 +1,6 @@
 ﻿export type DecimalString = string;
+export type LiquidationSignal = 'none' | 'cascade_down' | 'cascade_up' | 'exhaustion' | 'sweep_confirmation' | 'noise';
+export type DominantLiquidationSide = 'longs_liquidated' | 'shorts_liquidated' | 'balanced';
 export type RangePreset = '1D' | '7D' | '30D' | 'ALL';
 export type AutoRefreshIntervalSeconds = 0 | 5 | 10 | 30;
 export type WorkstationDataState = 'ready' | 'waiting_for_runtime' | 'waiting_for_history' | 'degraded_storage';
@@ -100,6 +102,19 @@ export interface SimilarSetupResponse {
   matched_attributes: string[];
 }
 
+export interface LiquidityZoneResponse {
+  level: DecimalString | null;
+  strength: 'low' | 'medium' | 'high';
+  reason: string;
+}
+
+export interface NearestLiquidityTargetResponse {
+  direction: 'up' | 'down' | 'none';
+  level: DecimalString | null;
+  distance_pct: DecimalString | null;
+  strength: 'low' | 'medium' | 'high';
+}
+
 export interface TradingAssistantResponse {
   symbol: string;
   decision: 'buy' | 'sell_exit' | 'wait' | 'avoid';
@@ -115,6 +130,49 @@ export interface TradingAssistantResponse {
   data_state: WorkstationDataState;
   backfill_status: BackfillStatusResponse;
   similar_setup: SimilarSetupResponse | null;
+  liquidity_bias: 'bullish' | 'bearish' | 'neutral';
+  liquidity_pressure: 'low' | 'medium' | 'high';
+  likely_liquidation_direction: 'up' | 'down' | 'none';
+  trap_risk: 'long_trap' | 'short_trap' | 'low';
+  liquidity_explanation: string;
+  upside_liquidity_zone: LiquidityZoneResponse;
+  downside_liquidity_zone: LiquidityZoneResponse;
+  nearest_liquidity_target: NearestLiquidityTargetResponse;
+  sweep_risk: 'none' | 'upside_sweep' | 'downside_sweep' | 'both_sides';
+  trade_timing_adjustment: 'enter_now' | 'wait_for_sweep' | 'wait_for_confirmation' | 'avoid_chop';
+  tp_sl_alignment: 'aligned' | 'stop_too_close_to_liquidity' | 'target_before_liquidity' | 'target_after_liquidity' | 'needs_review';
+  liquidity_zone_explanation: string;
+  crowd_side: 'long_crowded' | 'short_crowded' | 'balanced';
+  crowd_strength: 'low' | 'medium' | 'high';
+  squeeze_risk: 'long_squeeze' | 'short_squeeze' | 'low';
+  positioning_explanation: string;
+  funding_rate: DecimalString | null;
+  open_interest: DecimalString | null;
+  oi_trend: 'rising' | 'falling' | 'neutral';
+  heatmap_liquidity_above: DecimalString | null;
+  heatmap_liquidity_below: DecimalString | null;
+  heatmap_intensity_score: number | null;
+  heatmap_bias: 'upside_squeeze' | 'downside_sweep' | 'neutral';
+  base_signal_type: string;
+  heatmap_signal_type: string;
+  base_confidence: number;
+  heatmap_confidence: number;
+  heatmap_alignment: 'confirmed' | 'conflict' | 'neutral';
+  heatmap_explanation: string;
+  heatmap_provider: string;
+  heatmap_data_quality: string;
+  heatmap_is_real_data: boolean;
+  heatmap_provider_status: string;
+  liquidation_pressure: 'low' | 'medium' | 'high';
+  liquidation_imbalance: DecimalString | null;
+  liquidation_signal: LiquidationSignal;
+  liquidation_intensity: 'low' | 'medium' | 'high';
+  dominant_side: DominantLiquidationSide;
+  liquidation_explanation: string;
+  liquidation_volume_long: DecimalString;
+  liquidation_volume_short: DecimalString;
+  liquidation_imbalance_ratio: DecimalString;
+  liquidation_event_frequency: DecimalString;
 }
 
 export interface TradeEligibilityResponse {
@@ -131,6 +189,16 @@ export interface TradeEligibilityResponse {
   regime_summary: string;
   fee_slippage_summary: string;
   warnings: string[];
+  liquidity_zone_summary: string;
+  sweep_risk: 'none' | 'upside_sweep' | 'downside_sweep' | 'both_sides';
+  trade_timing_adjustment: 'enter_now' | 'wait_for_sweep' | 'wait_for_confirmation' | 'avoid_chop';
+  tp_sl_alignment: 'aligned' | 'stop_too_close_to_liquidity' | 'target_before_liquidity' | 'target_after_liquidity' | 'needs_review';
+  crowd_side: 'long_crowded' | 'short_crowded' | 'balanced';
+  crowd_strength: 'low' | 'medium' | 'high';
+  squeeze_risk: 'long_squeeze' | 'short_squeeze' | 'low';
+  liquidation_signal: LiquidationSignal;
+  liquidation_intensity: 'low' | 'medium' | 'high';
+  dominant_side: DominantLiquidationSide;
   paper_only: boolean;
   advisory_only: boolean;
   live_trading_enabled: boolean;
@@ -169,6 +237,8 @@ export interface FuturesPaperSignalResponse {
   risk_grade: 'low' | 'medium' | 'high';
   regime: string | null;
   current_price: DecimalString | null;
+  data_source: 'binance_usdm_futures';
+  price_type: 'mark_price' | 'futures_last_price';
   reason: string;
   invalidation_hint: string | null;
   suggested_entry_zone: string | null;
@@ -181,6 +251,49 @@ export interface FuturesPaperSignalResponse {
   eligibility_status: string;
   warnings: string[];
   timestamp: string;
+  liquidity_bias: 'bullish' | 'bearish' | 'neutral';
+  liquidity_pressure: 'low' | 'medium' | 'high';
+  likely_liquidation_direction: 'up' | 'down' | 'none';
+  trap_risk: 'long_trap' | 'short_trap' | 'low';
+  liquidity_explanation: string;
+  upside_liquidity_zone: LiquidityZoneResponse;
+  downside_liquidity_zone: LiquidityZoneResponse;
+  nearest_liquidity_target: NearestLiquidityTargetResponse;
+  sweep_risk: 'none' | 'upside_sweep' | 'downside_sweep' | 'both_sides';
+  trade_timing_adjustment: 'enter_now' | 'wait_for_sweep' | 'wait_for_confirmation' | 'avoid_chop';
+  tp_sl_alignment: 'aligned' | 'stop_too_close_to_liquidity' | 'target_before_liquidity' | 'target_after_liquidity' | 'needs_review';
+  liquidity_zone_explanation: string;
+  liquidity_adjusted_note: string | null;
+  crowd_side: 'long_crowded' | 'short_crowded' | 'balanced';
+  crowd_strength: 'low' | 'medium' | 'high';
+  squeeze_risk: 'long_squeeze' | 'short_squeeze' | 'low';
+  funding_rate: DecimalString | null;
+  open_interest: DecimalString | null;
+  oi_trend: 'rising' | 'falling' | 'neutral';
+  heatmap_liquidity_above: DecimalString | null;
+  heatmap_liquidity_below: DecimalString | null;
+  heatmap_intensity_score: number | null;
+  heatmap_bias: 'upside_squeeze' | 'downside_sweep' | 'neutral';
+  base_signal_type: string;
+  heatmap_signal_type: string;
+  base_confidence: number;
+  heatmap_confidence: number;
+  heatmap_alignment: 'confirmed' | 'conflict' | 'neutral';
+  heatmap_explanation: string;
+  heatmap_provider: string;
+  heatmap_data_quality: string;
+  heatmap_is_real_data: boolean;
+  heatmap_provider_status: string;
+  liquidation_pressure: 'low' | 'medium' | 'high';
+  liquidation_imbalance: DecimalString | null;
+  liquidation_signal: LiquidationSignal;
+  liquidation_intensity: 'low' | 'medium' | 'high';
+  dominant_side: DominantLiquidationSide;
+  liquidation_explanation: string;
+  liquidation_volume_long: DecimalString;
+  liquidation_volume_short: DecimalString;
+  liquidation_imbalance_ratio: DecimalString;
+  liquidation_event_frequency: DecimalString;
 }
 
 export interface FuturesOpportunityScanResponse {
@@ -197,6 +310,203 @@ export interface FuturesOpportunityScanResponse {
   live_futures_trading_enabled: boolean;
   real_orders_enabled: boolean;
   max_leverage_suggestion: string;
+  futures_symbol_universe_source: 'live' | 'cache' | 'fallback' | 'unavailable';
+  symbol_count: number;
+  last_successful_fetch_at: string | null;
+  latest_error: string | null;
+}
+
+export interface FuturesLivePriceItemResponse {
+  symbol: string;
+  live_price: DecimalString | null;
+  updated_at: string;
+  source: 'websocket' | 'rest' | 'cache' | 'unavailable';
+  data_source: 'binance_usdm_futures';
+  price_type: 'mark_price' | 'futures_last_price';
+  stale: boolean;
+  warning: string | null;
+}
+
+export interface FuturesLivePriceResponse {
+  items: FuturesLivePriceItemResponse[];
+  warnings: string[];
+}
+
+export interface FuturesLiveSubscriptionResponse {
+  symbols: string[];
+  count: number;
+  websocket_enabled: boolean;
+  warning: string | null;
+}
+
+export interface ScannerValidationGroupPerformance {
+  name: string;
+  sample_size: number;
+  win_rate: DecimalString | null;
+  average_net_return: DecimalString | null;
+  expectancy: DecimalString | null;
+}
+
+export interface ScannerBaselineComparison {
+  scanner_sample_size: number;
+  random_baseline_sample_size: number;
+  scanner_average_net_return: DecimalString | null;
+  random_baseline_average_net_return: DecimalString | null;
+  scanner_win_rate: DecimalString | null;
+  random_baseline_win_rate: DecimalString | null;
+  edge_vs_random: DecimalString | null;
+}
+
+export interface StopLossTakeProfitAnalysis {
+  sample_size: number;
+  take_profit_hit_rate: DecimalString | null;
+  stop_loss_hit_rate: DecimalString | null;
+  neither_hit_rate: DecimalString | null;
+  take_profit_first: number;
+  stop_loss_first: number;
+}
+
+export interface ScannerValidationReportResponse {
+  generated_at: string;
+  total_snapshots: number;
+  evaluated_snapshots: number;
+  pending_snapshots: number;
+  win_rate: DecimalString | null;
+  expectancy: DecimalString | null;
+  average_win: DecimalString | null;
+  average_loss: DecimalString | null;
+  average_net_return: DecimalString | null;
+  max_drawdown: DecimalString | null;
+  scanner_vs_random_baseline: ScannerBaselineComparison;
+  opportunity_score_bucket_performance: ScannerValidationGroupPerformance[];
+  direction_performance: ScannerValidationGroupPerformance[];
+  horizon_performance: ScannerValidationGroupPerformance[];
+  stop_loss_take_profit_analysis: StopLossTakeProfitAnalysis;
+  best_symbols: ScannerValidationGroupPerformance[];
+  worst_symbols: ScannerValidationGroupPerformance[];
+  best_regimes: ScannerValidationGroupPerformance[];
+  weak_conditions: string[];
+  conclusion: 'insufficient_data' | 'weak' | 'mixed' | 'promising' | 'strong';
+  warnings: string[];
+  paper_validation: boolean;
+  advisory_only: boolean;
+  live_trading_enabled: boolean;
+  real_futures_execution_enabled: boolean;
+}
+
+export interface PostSignalOutcomeResponse {
+  id: number | null;
+  signal_id: string;
+  horizon: string;
+  future_price: DecimalString | null;
+  price_change_percent: DecimalString | null;
+  max_upside_percent: DecimalString | null;
+  max_downside_percent: DecimalString | null;
+  did_price_hit_tp: boolean;
+  did_price_hit_sl: boolean;
+  direction_correct: boolean | null;
+  volatility_range: DecimalString | null;
+  first_hit: string | null;
+  time_to_hit_seconds: number | null;
+  sweep_direction_actual: string;
+  sweep_prediction_correct: boolean | null;
+  outcome_state: string;
+  evaluated_at: string;
+  base_signal_correct: boolean | null;
+  heatmap_signal_correct: boolean | null;
+  did_heatmap_improve_result: boolean | null;
+  did_heatmap_reduce_loss: boolean | null;
+  predicted_sweep_direction: string;
+  actual_sweep_direction: string;
+}
+
+export interface PostSignalSnapshotResponse {
+  id: string;
+  symbol: string;
+  timestamp: string;
+  source: 'scanner' | 'assistant' | 'eligibility' | string;
+  signal_type: 'BUY' | 'SELL' | 'WAIT' | 'AVOID' | string;
+  confidence: number;
+  entry_price: DecimalString | null;
+  liquidity_bias: string | null;
+  sweep_risk: string | null;
+  nearest_liquidity_above: DecimalString | null;
+  nearest_liquidity_below: DecimalString | null;
+  funding_rate: DecimalString | null;
+  open_interest: DecimalString | null;
+  notes: string;
+  heatmap_liquidity_above: DecimalString | null;
+  heatmap_liquidity_below: DecimalString | null;
+  heatmap_intensity_score: number | null;
+  heatmap_bias: string | null;
+  base_signal_type: string | null;
+  heatmap_signal_type: string | null;
+  base_confidence: number | null;
+  heatmap_confidence: number | null;
+  heatmap_alignment: string | null;
+  heatmap_explanation: string | null;
+  heatmap_provider: string | null;
+  heatmap_data_quality: string | null;
+  heatmap_is_real_data: boolean | null;
+  heatmap_provider_status: string | null;
+  liquidation_pressure: string | null;
+  liquidation_imbalance: DecimalString | null;
+  outcomes: PostSignalOutcomeResponse[];
+}
+
+export interface PostSignalHistoryResponse {
+  items: PostSignalSnapshotResponse[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface PostSignalGroupSummaryResponse {
+  name: string;
+  total_signals: number;
+  evaluated_signals: number;
+  win_rate: DecimalString | null;
+  avg_return: DecimalString | null;
+  avg_max_upside: DecimalString | null;
+  avg_max_drawdown: DecimalString | null;
+  tp_hit_rate: DecimalString | null;
+  sl_hit_rate: DecimalString | null;
+}
+
+export interface PostSignalPerformanceSummaryResponse {
+  generated_at: string;
+  total_signals: number;
+  evaluated_signals: number;
+  win_rate: DecimalString | null;
+  avg_return: DecimalString | null;
+  avg_max_upside: DecimalString | null;
+  avg_max_drawdown: DecimalString | null;
+  tp_hit_rate: DecimalString | null;
+  sl_hit_rate: DecimalString | null;
+  base_win_rate: DecimalString | null;
+  heatmap_win_rate: DecimalString | null;
+  delta_win_rate: DecimalString | null;
+  base_avg_return: DecimalString | null;
+  heatmap_avg_return: DecimalString | null;
+  heatmap_accuracy_on_sweep_prediction: DecimalString | null;
+  heatmap_false_signal_rate: DecimalString | null;
+  heatmap_signal_count_by_data_quality: Record<string, number>;
+  win_rate_by_heatmap_data_quality: Record<string, DecimalString | null>;
+  sweep_accuracy_by_data_quality: Record<string, DecimalString | null>;
+  avg_return_by_data_quality: Record<string, DecimalString | null>;
+  by_signal_type: PostSignalGroupSummaryResponse[];
+  by_confidence_bucket: PostSignalGroupSummaryResponse[];
+  by_liquidity_bias: PostSignalGroupSummaryResponse[];
+  by_source: PostSignalGroupSummaryResponse[];
+  paper_validation: boolean;
+  advisory_only: boolean;
+  live_trading_enabled: boolean;
+}
+
+export interface ScannerValidationEvaluateResponse {
+  evaluated_outcomes: number;
+  idempotent: boolean;
+  message: string;
 }
 
 export interface TopOfBookSummary {

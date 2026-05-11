@@ -97,11 +97,13 @@ Status: Completed
 Status: Current product direction and implemented paper scanner
 
 - Paper-only scanner ranks Binance quote-asset symbols as LONG, SHORT, WAIT, or AVOID.
+- Scanner supports 20, 50, and 100-symbol market coverage for paper opportunity discovery.
+- Scanner cards include display-only leverage-risk simulation for paper TP/SL/live return estimates.
 - LONG candidates should render green.
 - SHORT candidates should render red.
 - WAIT and AVOID candidates should render neutral/default.
 - Scanner output is advisory only.
-- No real futures execution, no live leverage, and no Binance futures orders are allowed in this phase.
+- No real futures execution, no live leverage or margin execution, and no Binance futures orders are allowed in this phase.
 
 ## Next Suggested Phases
 
@@ -134,6 +136,7 @@ Required before implementation:
 - Proven paper results over meaningful samples.
 - Futures paper mode with persistent hypothetical long/short outcomes.
 - Funding-rate and liquidation-risk context.
+- Event-based liquidation intelligence that separates observed cascades, exhaustion, and sweep confirmations from predictive heatmap claims.
 - Leverage and margin-aware risk engine.
 - Stronger controls than spot paper trading.
 - Explicit user request and separate design review.

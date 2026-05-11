@@ -84,6 +84,7 @@ Detailed modules belong inside `Advanced Details - Pro` unless the user explicit
 - SHORT candidates should be visually red.
 - WAIT and AVOID candidates should use neutral/default colors.
 - Leverage guidance must remain conservative, explicitly paper-only, and liquidation-risk-aware.
+- Leverage simulation is display-only and must not change scanner scoring, ranking, validation snapshots, or execution behavior.
 - Real futures execution belongs to a later phase after strong validation.
 
 ## Data Source Rules

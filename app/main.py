@@ -14,8 +14,14 @@ from app.bot import PaperBotRuntime
 from app.config import get_settings
 from app.exchange.binance_rest import BinanceRestClient
 from app.exchange.binance_ws import BinanceWebSocketClient
+from app.data.binance_liquidation_feed import (
+    BinanceLiquidationFeedService,
+    set_global_liquidation_feed_service,
+)
 from app.exchange.symbol_service import SpotSymbolService
+from app.monitoring.futures_scanner_ws_heartbeat import FuturesScannerWebSocketHeartbeatService
 from app.monitoring.logging import configure_logging
+from app.monitoring.signal_outcomes import SignalOutcomeBackgroundService
 from app.services import HistoricalBackfillService
 from app.sentiment import SymbolSentimentService
 
@@ -27,6 +33,14 @@ async def lifespan(app: FastAPI):
 
     rest_client = BinanceRestClient(settings)
     websocket_client = BinanceWebSocketClient(base_url=settings.binance_ws_url)
+    futures_websocket_client = BinanceWebSocketClient(base_url="wss://fstream.binance.com/ws")
+    futures_scanner_heartbeat_service = FuturesScannerWebSocketHeartbeatService(futures_websocket_client)
+    liquidation_feed_service: BinanceLiquidationFeedService | None = None
+    if settings.heatmap_provider == "binance_force_orders":
+        liquidation_feed_service = BinanceLiquidationFeedService(futures_websocket_client)
+        liquidation_feed_service.start()
+        set_global_liquidation_feed_service(liquidation_feed_service)
+    signal_outcome_service = SignalOutcomeBackgroundService(database_url=settings.database_url)
     symbol_service = SpotSymbolService(rest_client)
     symbol_sentiment_service = SymbolSentimentService()
     backfill_service = HistoricalBackfillService(
@@ -43,10 +57,19 @@ async def lifespan(app: FastAPI):
     app.state.symbol_sentiment_service = symbol_sentiment_service
     app.state.backfill_service = backfill_service
     app.state.bot_runtime = bot_runtime
+    app.state.futures_scanner_heartbeat_service = futures_scanner_heartbeat_service
+    app.state.liquidation_feed_service = liquidation_feed_service
+    app.state.signal_outcome_service = signal_outcome_service
+    signal_outcome_service.start()
 
     try:
         yield
     finally:
+        await signal_outcome_service.close()
+        if liquidation_feed_service is not None:
+            await liquidation_feed_service.close()
+            set_global_liquidation_feed_service(None)
+        await futures_scanner_heartbeat_service.close()
         await bot_runtime.close()
         await rest_client.close()
 
