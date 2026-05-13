@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
 import { AIEvaluationCard } from './components/AIEvaluationCard';
 import { AIHistorySection } from './components/AIHistorySection';
@@ -145,6 +145,11 @@ interface WorkspaceRefreshOptions {
   includeAutoTrade?: boolean;
 }
 
+const SYMBOL_SWITCH_DEBOUNCE_MS = 350;
+const ADVANCED_LOAD_DELAY_MS = 250;
+const ADVANCED_DATA_WARNING = 'Some advanced data is still loading or timed out.';
+const ADVANCED_SOFT_MESSAGE = 'Advanced data is still loading. Try refresh if it does not appear.';
+
 const INITIAL_BOT_STATUS: BotStatusResponse = {
   state: 'stopped',
   mode: 'stopped',
@@ -228,19 +233,48 @@ function setPending<T>(current: RemoteState<T>): RemoteState<T> {
   return { ...current, refreshing: true, error: null };
 }
 
+function stopSoftLoading<T>(current: RemoteState<T>): RemoteState<T> {
+  return { ...current, loading: false, refreshing: false, error: null };
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
+
+function isCanceledRequest(error: unknown): boolean {
+  return error instanceof ApiRequestError && error.category === 'request_canceled';
+}
+
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const timeoutId = window.setTimeout(resolve, ms);
+    signal.addEventListener(
+      'abort',
+      () => {
+        window.clearTimeout(timeoutId);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+}
+
 function futuresScannerErrorMessage(error: unknown): string {
   if (error instanceof ApiRequestError) {
     if (error.category === 'backend_unavailable') {
       return 'Backend unavailable. The API server may be offline or restarting.';
     }
     if (error.category === 'scanner_timeout') {
-      return 'Scanner timed out. Previous results remain visible while the next refresh can retry.';
+      return 'Scanner timed out. Retry when Binance futures data is reachable.';
     }
     if (error.category === 'binance_unavailable') {
-      return 'Binance API temporarily unavailable. Previous futures scanner results remain visible.';
+      return 'Binance API temporarily unavailable. Retry when Binance is reachable.';
     }
     if (error.category === 'network_proxy_error') {
-      return 'Network/proxy error. Check the frontend proxy or API connection; previous results remain visible.';
+      return 'Network/proxy error. Check the frontend proxy or API connection.';
     }
     return error.message;
   }
@@ -315,7 +349,7 @@ function describeLiveFieldGap(workstation: WorkstationResponse | null): string {
 }
 
 type WorkstationTab = 'discover' | 'signal' | 'simulate' | 'validate' | 'advanced';
-type SignalAnalysisTab = 'ai' | 'horizon' | 'technicals' | 'sentiment' | 'liquidity' | 'validation' | 'notes';
+type SignalAnalysisTab = 'ai' | 'technicals' | 'liquidity' | 'sentiment' | 'validation' | 'similar' | 'notes';
 type MainSignal = 'BUY' | 'WAIT' | 'AVOID' | 'EXIT';
 
 function humanize(value: string | null | undefined): string {
@@ -399,7 +433,7 @@ function leverageRiskTone(label: LeverageRiskLabel): string {
 
 function liquiditySummary(assistant: TradingAssistantResponse | null): string {
   if (!assistant) {
-    return 'Liquidity: not enough data';
+    return 'Liquidity: collecting context';
   }
   if (assistant.sweep_risk === 'downside_sweep') {
     return 'Liquidity: Downside sweep risk';
@@ -421,7 +455,7 @@ function liquiditySummary(assistant: TradingAssistantResponse | null): string {
 
 function crowdSummary(assistant: TradingAssistantResponse | null): string {
   if (!assistant) {
-    return 'Crowd: not enough data';
+    return 'Crowd: collecting context';
   }
   if (assistant.crowd_side === 'long_crowded') {
     return 'Crowd: Long heavy (downside risk)';
@@ -690,22 +724,22 @@ function SimulatePanel({
   });
 
   return (
-    <section className="rounded-lg border border-slate-800 bg-slate-950/70 p-6 shadow-glow">
+    <section className="rounded-lg border border-borderSoft bg-panelBg/82 p-6 shadow-glow">
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div>
           <div className="flex flex-wrap items-center gap-3">
-            <h2 className="text-2xl font-semibold text-white">{selectedSymbol}</h2>
+            <h2 className="text-2xl font-semibold text-textPrimary">Risk Simulation - {selectedSymbol}</h2>
             <span className={classNames('rounded-full border px-4 py-1.5 text-sm font-semibold', signalTone(signal))}>{signal}</span>
-            <span className="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-xs font-semibold text-slate-300">Paper mode</span>
+            <span className="rounded-md border border-longGreen/25 bg-longGreen/10 px-3 py-1 text-xs font-semibold text-emerald-100">Paper mode</span>
           </div>
-          <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-400">Paper-only simulation for the selected signal. No live futures execution or real orders are enabled.</p>
+          <p className="mt-3 max-w-2xl text-sm leading-6 text-textSecondary">Display-only paper leverage math for the selected signal. No live futures execution or real orders are enabled.</p>
         </div>
-        <label className="grid gap-2 text-sm text-slate-300">
+        <label className="grid gap-2 text-sm text-textSecondary">
           Leverage
           <select
             value={leverage}
             onChange={(event) => onLeverageChange(Number(event.target.value) as LeverageOption)}
-            className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-white"
+            className="rounded-lg border border-borderSoft bg-panelBg px-3 py-2 text-sm text-textPrimary"
           >
             {LEVERAGE_OPTIONS.map((option) => <option key={option} value={option}>{option}x</option>)}
           </select>
@@ -724,27 +758,27 @@ function SimulatePanel({
       </div>
 
       {simulation.leverage_warning ? (
-        <div className={classNames('mt-4 rounded-lg border border-rose-400/30 bg-rose-400/10 p-3 text-sm', leverageRiskTone(simulation.liquidation_risk_label))}>
-          {simulation.leverage_warning}
+        <div className={classNames('mt-4 rounded-lg border border-rose-400/30 bg-rose-400/10 p-4 text-sm leading-6', leverageRiskTone(simulation.liquidation_risk_label))}>
+          {simulation.leverage_warning} This is paper-only and liquidation-risk-aware; it does not change scanner scoring or execution behavior.
         </div>
       ) : null}
 
       <div className="mt-6 grid gap-4 lg:grid-cols-2">
-        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
-          <p className="text-sm font-semibold text-slate-200">Paper Position State</p>
+        <div className="rounded-lg border border-borderSoft bg-panelBgSoft/65 p-4">
+          <p className="text-sm font-semibold text-textPrimary">Paper Position State</p>
           {workstation?.current_position ? (
-            <div className="mt-3 grid grid-cols-2 gap-3 text-sm text-slate-300">
-              <div><span className="text-slate-500">Quantity</span><p>{formatDecimal(workstation.current_position.quantity)}</p></div>
-              <div><span className="text-slate-500">Avg Entry</span><p>{formatCurrency(workstation.current_position.avg_entry_price)}</p></div>
-              <div><span className="text-slate-500">Realized PnL</span><p className={pnlTone(workstation.current_position.realized_pnl)}>{formatCurrency(workstation.current_position.realized_pnl)}</p></div>
-              <div><span className="text-slate-500">Quote</span><p>{workstation.current_position.quote_asset}</p></div>
+            <div className="mt-3 grid grid-cols-2 gap-3 text-sm text-textSecondary">
+              <div><span className="text-textMuted">Quantity</span><p>{formatDecimal(workstation.current_position.quantity)}</p></div>
+              <div><span className="text-textMuted">Avg Entry</span><p>{formatCurrency(workstation.current_position.avg_entry_price)}</p></div>
+              <div><span className="text-textMuted">Realized PnL</span><p className={pnlTone(workstation.current_position.realized_pnl)}>{formatCurrency(workstation.current_position.realized_pnl)}</p></div>
+              <div><span className="text-textMuted">Quote</span><p>{workstation.current_position.quote_asset}</p></div>
             </div>
           ) : (
-            <p className="mt-3 text-sm text-slate-400">No open paper position for the selected symbol.</p>
+            <p className="mt-3 text-sm text-textSecondary">No open paper position for the selected symbol.</p>
           )}
         </div>
-        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
-          <p className="text-sm font-semibold text-slate-200">Manual Paper Controls</p>
+        <div className="rounded-lg border border-borderSoft bg-panelBgSoft/65 p-4">
+          <p className="text-sm font-semibold text-textPrimary">Manual Paper Controls</p>
           <div className="mt-4 flex flex-wrap gap-2">
             <button type="button" disabled={actionLoading} onClick={onManualBuy} className="rounded-lg border border-emerald-400/30 bg-emerald-400/10 px-3 py-2 text-sm font-medium text-emerald-100 disabled:cursor-not-allowed disabled:opacity-50">
               Manual Paper Buy
@@ -771,24 +805,34 @@ function ValidationSummary({ report, signalValidation, similarSetups }: {
     .sort((left, right) => Number(right.average_net_return ?? 0) - Number(left.average_net_return ?? 0))[0]?.name
     ?? similarSetups?.best_horizon
     ?? '-';
+  const evaluated = report?.evaluated_snapshots ?? signalValidation?.actionable_signals ?? 0;
+  const valueOrGuide = (value: string | null | undefined) => value ?? (evaluated > 0 ? 'Pending' : 'Collect signals');
+  const conclusion = humanize(report?.conclusion ?? signalValidation?.status ?? 'insufficient_data');
   return (
-    <section className="rounded-lg border border-slate-800 bg-slate-950/70 p-6 shadow-glow">
+    <section className="rounded-lg border border-borderSoft bg-panelBg/82 p-6 shadow-glow">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h2 className="text-2xl font-semibold text-white">Paper Validation</h2>
-          <p className="mt-2 text-sm text-slate-400">Trust view for scanner and selected-symbol signal evidence. Estimated net return only; not guaranteed future performance.</p>
+          <h2 className="text-2xl font-semibold text-textPrimary">Paper Validation</h2>
+          <p className="mt-2 text-sm leading-6 text-textSecondary">
+            Trust view for scanner and selected-symbol signal evidence. Validation appears after enough paper signals are evaluated.
+          </p>
         </div>
-        <span className="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-xs font-semibold text-slate-300">
-          {humanize(report?.conclusion ?? signalValidation?.status ?? 'insufficient_data')}
+        <span className="rounded-md border border-accentPurple/35 bg-accentPurple/15 px-3 py-1 text-xs font-semibold text-violet-100">
+          {conclusion}
         </span>
       </div>
       <div className="mt-6 grid gap-3 md:grid-cols-2 xl:grid-cols-5">
-        <MetricCard label="Total Evaluated Signals" value={String(report?.evaluated_snapshots ?? signalValidation?.actionable_signals ?? 0)} helper="Paper validation samples" />
-        <MetricCard label="Win Rate" value={report?.win_rate ? `${formatDecimal(report.win_rate)}%` : 'not enough data'} helper="Scanner outcomes" />
-        <MetricCard label="Expectancy" value={report?.expectancy ? `${formatDecimal(report.expectancy)}%` : 'not enough data'} helper="Estimated net return" />
-        <MetricCard label="Scanner vs Random" value={report?.scanner_vs_random_baseline.edge_vs_random ? `${formatDecimal(report.scanner_vs_random_baseline.edge_vs_random)}%` : 'not enough data'} helper="Baseline comparison" />
+        <MetricCard label="Total Evaluated Signals" value={String(evaluated)} helper="Paper validation samples" />
+        <MetricCard label="Win Rate" value={valueOrGuide(report?.win_rate ? `${formatDecimal(report.win_rate)}%` : null)} helper="Scanner outcomes" />
+        <MetricCard label="Expectancy" value={valueOrGuide(report?.expectancy ? `${formatDecimal(report.expectancy)}%` : null)} helper="Estimated net return" />
+        <MetricCard label="Scanner vs Random" value={valueOrGuide(report?.scanner_vs_random_baseline.edge_vs_random ? `${formatDecimal(report.scanner_vs_random_baseline.edge_vs_random)}%` : null)} helper="Baseline comparison" />
         <MetricCard label="Best Horizon" value={bestHorizon} helper="Measured paper evidence" />
       </div>
+      {evaluated === 0 ? (
+        <div className="mt-4 rounded-lg border border-waitAmber/25 bg-waitAmber/10 p-4 text-sm leading-6 text-amber-100">
+          Run the paper scanner and keep paper runtime active. This panel will summarize win rate, expectancy, and baseline comparison once evaluated outcomes exist.
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -815,8 +859,8 @@ function PostSignalPerformancePanel({
     return <StatePanel title="Post-signal performance unavailable" message={error} tone="error" />;
   }
   const latestOutcome = detail?.outcomes[0] ?? null;
-  const tpRate = summary?.tp_hit_rate ? `${formatDecimal(summary.tp_hit_rate)}%` : 'not enough data';
-  const slRate = summary?.sl_hit_rate ? `${formatDecimal(summary.sl_hit_rate)}%` : 'not enough data';
+  const tpRate = summary?.tp_hit_rate ? `${formatDecimal(summary.tp_hit_rate)}%` : 'Collect signals';
+  const slRate = summary?.sl_hit_rate ? `${formatDecimal(summary.sl_hit_rate)}%` : 'Collect signals';
   return (
     <section className="rounded-lg border border-slate-800 bg-slate-950/70 p-5">
       <div className="flex flex-wrap items-start justify-between gap-4">
@@ -827,14 +871,14 @@ function PostSignalPerformancePanel({
         <span className="rounded-full border border-slate-700 px-3 py-1 text-xs font-semibold text-slate-300">analysis only</span>
       </div>
       <div className="mt-4 grid gap-3 md:grid-cols-3">
-        <MetricCard label="Win Rate" value={summary?.win_rate ? `${formatDecimal(summary.win_rate)}%` : 'not enough data'} helper={`${summary?.evaluated_signals ?? 0} evaluated`} />
-        <MetricCard label="Avg Return" value={summary?.avg_return ? `${formatDecimal(summary.avg_return)}%` : 'not enough data'} helper="15m paper outcome" />
+        <MetricCard label="Win Rate" value={summary?.win_rate ? `${formatDecimal(summary.win_rate)}%` : 'Collect signals'} helper={`${summary?.evaluated_signals ?? 0} evaluated`} />
+        <MetricCard label="Avg Return" value={summary?.avg_return ? `${formatDecimal(summary.avg_return)}%` : 'Collect signals'} helper="15m paper outcome" />
         <MetricCard label="TP vs SL" value={`${tpRate} / ${slRate}`} helper="Lightweight TP/SL model" />
       </div>
       <div className="mt-3 grid gap-3 md:grid-cols-3">
-        <MetricCard label="Base Win Rate" value={summary?.base_win_rate ? `${formatDecimal(summary.base_win_rate)}%` : 'not enough data'} helper="Existing logic only" />
-        <MetricCard label="Heatmap Win Rate" value={summary?.heatmap_win_rate ? `${formatDecimal(summary.heatmap_win_rate)}%` : 'not enough data'} helper="Parallel heatmap read" />
-        <MetricCard label="Heatmap Delta" value={summary?.delta_win_rate ? `${formatDecimal(summary.delta_win_rate)}%` : 'not enough data'} helper="Heatmap minus base" />
+        <MetricCard label="Base Win Rate" value={summary?.base_win_rate ? `${formatDecimal(summary.base_win_rate)}%` : 'Collect signals'} helper="Existing logic only" />
+        <MetricCard label="Heatmap Win Rate" value={summary?.heatmap_win_rate ? `${formatDecimal(summary.heatmap_win_rate)}%` : 'Collect signals'} helper="Parallel heatmap read" />
+        <MetricCard label="Heatmap Delta" value={summary?.delta_win_rate ? `${formatDecimal(summary.delta_win_rate)}%` : 'Collect signals'} helper="Heatmap minus base" />
       </div>
       <div className="mt-5 grid gap-4 lg:grid-cols-[1fr_1fr]">
         <div>
@@ -871,7 +915,7 @@ function PostSignalPerformancePanel({
               <div><span className="text-slate-500">Max Upside</span><p>{latestOutcome?.max_upside_percent ? `${formatDecimal(latestOutcome.max_upside_percent)}%` : '-'}</p></div>
               <div><span className="text-slate-500">Max Downside</span><p>{latestOutcome?.max_downside_percent ? `${formatDecimal(latestOutcome.max_downside_percent)}%` : '-'}</p></div>
               <div><span className="text-slate-500">TP/SL</span><p>{latestOutcome ? `${latestOutcome.did_price_hit_tp ? 'TP hit' : 'TP not hit'} / ${latestOutcome.did_price_hit_sl ? 'SL hit' : 'SL not hit'}` : '-'}</p></div>
-              <div><span className="text-slate-500">Liquidity Prediction</span><p>{latestOutcome?.sweep_prediction_correct === null || latestOutcome?.sweep_prediction_correct === undefined ? 'not enough data' : latestOutcome.sweep_prediction_correct ? 'correct' : 'missed'}</p></div>
+              <div><span className="text-slate-500">Liquidity Prediction</span><p>{latestOutcome?.sweep_prediction_correct === null || latestOutcome?.sweep_prediction_correct === undefined ? 'Collect signals' : latestOutcome.sweep_prediction_correct ? 'correct' : 'missed'}</p></div>
               <div><span className="text-slate-500">Base vs Heatmap</span><p>{detail.base_signal_type ?? detail.signal_type} / {detail.heatmap_signal_type ?? '-'}</p></div>
               <div><span className="text-slate-500">Heatmap Result</span><p>{latestOutcome?.did_heatmap_improve_result ? 'improved' : latestOutcome?.did_heatmap_reduce_loss ? 'reduced loss' : 'not proven'}</p></div>
               <div><span className="text-slate-500">Heatmap Bias</span><p>{humanize(detail.heatmap_bias ?? 'neutral')}</p></div>
@@ -900,12 +944,12 @@ function PremiumCard({
   className?: string;
 }) {
   return (
-    <section className={classNames('rounded-lg border border-slate-800/80 bg-slate-950/70 p-4 shadow-glow backdrop-blur', className)}>
+    <section className={classNames('min-w-0 rounded-lg border border-borderSoft bg-panelBg/82 p-4 shadow-glow backdrop-blur', className)}>
       {(title || eyebrow || action) ? (
         <div className="mb-4 flex items-start justify-between gap-3">
           <div>
-            {eyebrow ? <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-violet-300">{eyebrow}</p> : null}
-            {title ? <h2 className="mt-1 text-base font-semibold text-white">{title}</h2> : null}
+            {eyebrow ? <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-accentPurple">{eyebrow}</p> : null}
+            {title ? <h2 className="mt-1 text-base font-semibold text-textPrimary">{title}</h2> : null}
           </div>
           {action}
         </div>
@@ -937,34 +981,35 @@ function TopNavigation({
   onAutoRefreshChange: (value: AutoRefreshIntervalSeconds) => void;
 }) {
   return (
-    <header className="sticky top-0 z-30 border-b border-slate-800/80 bg-[#050915]/92 backdrop-blur-xl">
+    <header className="sticky top-0 z-30 border-b border-borderSoft bg-appBg/92 backdrop-blur-xl">
       <div className="mx-auto flex max-w-[1880px] flex-col gap-4 px-4 py-4 sm:px-6 2xl:px-8">
         <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex items-center gap-3">
-            <div className="grid h-10 w-10 place-items-center rounded-lg border border-violet-400/30 bg-violet-400/10 text-sm font-black text-violet-100">
+            <div className="grid h-10 w-10 place-items-center rounded-lg border border-accentPurple/40 bg-accentPurple/20 text-sm font-black text-textPrimary shadow-glow">
               CX
             </div>
             <div>
-              <h1 className="text-lg font-semibold leading-tight text-white">CEX AI</h1>
-              <p className="text-xs text-slate-400">Paper Trading Intelligence</p>
+              <h1 className="text-lg font-semibold leading-tight text-textPrimary">CEX AI</h1>
+              <p className="text-xs text-textSecondary">Paper Trading Intelligence</p>
             </div>
           </div>
 
-          <nav className="flex gap-1 overflow-x-auto rounded-lg border border-slate-800 bg-slate-950/60 p-1">
+          <nav aria-label="Workspace tabs" className="flex min-w-0 gap-1 overflow-x-auto rounded-lg border border-borderSoft bg-panelBg/80 p-1">
             {tabs.map(([value, label, subtitle]) => (
               <button
                 key={value}
                 type="button"
+                aria-current={tab === value ? 'page' : undefined}
                 onClick={() => onTabChange(value)}
                 className={classNames(
-                  'min-w-32 rounded-md border px-4 py-2 text-left transition',
+                  'min-w-32 rounded-md border px-4 py-2 text-left transition focus-visible:border-accentPurple',
                   tab === value
-                    ? 'border-violet-400/45 bg-violet-500/15 text-white shadow-[0_10px_30px_rgba(124,58,237,0.18)]'
-                    : 'border-transparent text-slate-300 hover:bg-slate-900 hover:text-white',
+                    ? 'border-accentPurple/60 bg-accentPurple/20 text-textPrimary shadow-glow'
+                    : 'border-transparent text-textSecondary hover:bg-panelBgSoft hover:text-textPrimary',
                 )}
               >
                 <span className="block text-sm font-semibold">{label}</span>
-                <span className="mt-0.5 block text-[11px] text-slate-500">{subtitle}</span>
+                <span className="mt-0.5 block text-[11px] text-textMuted">{subtitle}</span>
               </button>
             ))}
           </nav>
@@ -973,23 +1018,22 @@ function TopNavigation({
             <span className={classNames('rounded-lg px-3 py-2 text-xs font-semibold', badgeTone(health?.status ?? 'unknown'))}>
               {health?.status ?? 'loading'}
             </span>
-            <span className="rounded-lg border border-emerald-400/25 bg-emerald-400/10 px-3 py-2 text-xs font-semibold text-emerald-100">
+            <span className="rounded-lg border border-longGreen/25 bg-longGreen/10 px-3 py-2 text-xs font-semibold text-emerald-100">
               Paper Mode
-              <span className="ml-2 text-emerald-300/80">No Real Money</span>
+              <span className="ml-2 text-longGreen/80">No Real Money</span>
             </span>
             <button
               type="button"
               onClick={onRefresh}
-              className="rounded-lg border border-violet-400/30 bg-violet-500/15 px-3 py-2 text-xs font-semibold text-violet-100 transition hover:border-violet-300 hover:bg-violet-500/25"
+              className="rounded-lg border border-accentPurple/35 bg-accentPurple/15 px-3 py-2 text-xs font-semibold text-violet-100 transition hover:border-accentPurple hover:bg-accentPurple/25"
             >
               Refresh
             </button>
             <AutoRefreshSelector value={autoRefreshSeconds} onChange={onAutoRefreshChange} />
-            <button type="button" className="h-9 rounded-lg border border-slate-800 bg-slate-950 px-3 text-xs font-semibold text-slate-300">Theme</button>
-            <button type="button" className="h-9 rounded-lg border border-slate-800 bg-slate-950 px-3 text-xs font-semibold text-slate-300">Settings</button>
+            <button type="button" aria-label="Theme placeholder" className="h-9 rounded-lg border border-borderSoft bg-panelBg px-3 text-xs font-semibold text-textSecondary">Theme</button>
           </div>
         </div>
-        <p className="text-xs text-slate-500">Last updated {formatDateTime(lastUpdatedAt?.toISOString() ?? null)} | Auto refresh {refreshLabel}</p>
+        <p className="text-xs text-textMuted">Last updated {formatDateTime(lastUpdatedAt?.toISOString() ?? null)} | Auto refresh {refreshLabel}</p>
       </div>
     </header>
   );
@@ -1065,10 +1109,12 @@ function LeftSidebar({
   livePrices,
   marketSentiment,
   technicalAnalysis,
+  collapsed,
   onSearchChange,
   onSelectSymbol,
   onClearSelection,
   onViewScanner,
+  onToggleCollapse,
 }: {
   selectedSymbol: string;
   symbolSearch: string;
@@ -1079,10 +1125,12 @@ function LeftSidebar({
   livePrices: FuturesLivePriceResponse | null;
   marketSentiment: MarketSentimentResponse | null;
   technicalAnalysis: TechnicalAnalysisResponse | null;
+  collapsed: boolean;
   onSearchChange: (value: string) => void;
   onSelectSymbol: (symbol: string) => void;
   onClearSelection: () => void;
   onViewScanner: () => void;
+  onToggleCollapse: () => void;
 }) {
   const topSignals = [
     ...(futuresScan?.long_candidates ?? []),
@@ -1094,23 +1142,71 @@ function LeftSidebar({
   const marketBias = marketSentiment?.market_state ?? technicalAnalysis?.trend_direction ?? 'waiting';
   const volume = futuresScan?.scanned_count ? `${futuresScan.scanned_count} symbols scanned` : 'Scanner waiting';
 
+  if (collapsed) {
+    return (
+      <aside className="min-w-0 xl:sticky xl:top-28 xl:max-h-[calc(100vh-8rem)]">
+        <PremiumCard className="flex items-center gap-2 p-2 xl:flex-col">
+          <button
+            type="button"
+            aria-label="Expand watchlist sidebar"
+            onClick={onToggleCollapse}
+            className="grid h-10 w-10 place-items-center rounded-md border border-borderSoft bg-panelBgSoft text-textSecondary transition hover:border-accentPurple hover:text-textPrimary"
+          >
+            &gt;
+          </button>
+          {[selectedSymbol, ...topSignals.map((signal) => signal.symbol)]
+            .filter((symbol, index, list): symbol is string => Boolean(symbol) && list.indexOf(symbol) === index)
+            .slice(0, 5)
+            .map((symbol) => (
+              <button
+                key={symbol}
+                type="button"
+                aria-label={`Open ${symbol} signal`}
+                onClick={() => onSelectSymbol(symbol)}
+                className={classNames(
+                  'grid h-10 w-10 place-items-center rounded-md border text-xs font-bold transition',
+                  selectedSymbol === symbol
+                    ? 'border-accentPurple bg-accentPurple/20 text-textPrimary shadow-glow'
+                    : 'border-borderSoft bg-panelBgSoft text-textSecondary hover:border-accentPurple/60 hover:text-textPrimary',
+                )}
+              >
+                {symbol.slice(0, 3)}
+              </button>
+            ))}
+        </PremiumCard>
+      </aside>
+    );
+  }
+
   return (
-    <aside className="space-y-4 xl:sticky xl:top-28 xl:max-h-[calc(100vh-8rem)] xl:overflow-y-auto">
-      <PremiumCard title="Market Overview">
+    <aside className="min-w-0 space-y-4 xl:sticky xl:top-28 xl:max-h-[calc(100vh-8rem)] xl:overflow-y-auto">
+      <PremiumCard
+        title="Market Overview"
+        action={(
+          <button
+            type="button"
+            aria-label="Collapse watchlist sidebar"
+            onClick={onToggleCollapse}
+            className="rounded-md border border-borderSoft px-2 py-1 text-xs font-semibold text-textSecondary transition hover:border-accentPurple hover:text-textPrimary"
+          >
+            Collapse
+          </button>
+        )}
+      >
         <div className="space-y-3 text-sm">
-          <div className="flex items-center justify-between gap-3 border-b border-slate-800 pb-3">
-            <span className="text-slate-400">Market Tone</span>
+          <div className="flex items-center justify-between gap-3 border-b border-borderSoft pb-3">
+            <span className="text-textSecondary">Market Tone</span>
             <span className={marketBias.includes('bull') || marketBias === 'risk_on' ? 'font-semibold text-emerald-300' : marketBias.includes('bear') || marketBias === 'risk_off' ? 'font-semibold text-rose-300' : 'font-semibold text-amber-200'}>
               {humanize(marketBias)}
             </span>
           </div>
-          <div className="flex items-center justify-between gap-3 border-b border-slate-800 pb-3">
-            <span className="text-slate-400">Scanner Coverage</span>
-            <span className="font-semibold text-white">{volume}</span>
+          <div className="flex items-center justify-between gap-3 border-b border-borderSoft pb-3">
+            <span className="text-textSecondary">Scanner Coverage</span>
+            <span className="font-semibold text-textPrimary">{volume}</span>
           </div>
           <div className="flex items-center justify-between gap-3">
-            <span className="text-slate-400">Selected Symbol</span>
-            <span className="font-semibold text-white">{selectedSymbol || '-'}</span>
+            <span className="text-textSecondary">Selected Symbol</span>
+            <span className="font-semibold text-textPrimary">{selectedSymbol || '-'}</span>
           </div>
         </div>
       </PremiumCard>
@@ -1171,7 +1267,19 @@ function LeftSidebar({
                 <span className="font-semibold">{symbol}</span>
                 <span className="text-xs text-slate-500">{livePriceBySymbol.get(symbol) ? formatCurrency(livePriceBySymbol.get(symbol) as string) : 'watch'}</span>
               </button>
-            ))}
+          ))}
+        </div>
+      </PremiumCard>
+
+      <PremiumCard>
+        <div className="flex gap-3">
+          <div className="grid h-10 w-10 shrink-0 place-items-center rounded-lg border border-accentPurple/30 bg-accentPurple/15 text-accentPurple">
+            PM
+          </div>
+          <div>
+            <p className="text-sm font-semibold text-textPrimary">Paper Mode Active</p>
+            <p className="mt-2 text-sm leading-6 text-textSecondary">All orders are simulated. No real spot or futures orders are submitted.</p>
+          </div>
         </div>
       </PremiumCard>
     </aside>
@@ -1220,25 +1328,31 @@ function RightSidebar({
   onValidate: () => void;
   onAdvanced: () => void;
 }) {
-  const validationWin = signalValidation?.horizons[0]?.win_rate_pct ? `${formatDecimal(signalValidation.horizons[0].win_rate_pct)}%` : 'not enough data';
-  const validationExp = signalValidation?.horizons[0]?.expectancy_pct ? `${formatDecimal(signalValidation.horizons[0].expectancy_pct)}%` : 'not enough data';
+  const validationWin = signalValidation?.horizons[0]?.win_rate_pct ? `${formatDecimal(signalValidation.horizons[0].win_rate_pct)}%` : 'Collect signals';
+  const validationExp = signalValidation?.horizons[0]?.expectancy_pct ? `${formatDecimal(signalValidation.horizons[0].expectancy_pct)}%` : 'Collect signals';
+  const runtimeStatus = workstation?.runtime_status.state ?? health?.status ?? 'waiting';
+  const recentEvents = [
+    workstation?.last_action ? ['Last action', `${workstation.last_action.signal_side} ${workstation.last_action.execution_status ?? 'pending'}`, workstation.last_action.event_time] : null,
+    workstation?.last_market_event ? ['Market update', workstation.symbol, workstation.last_market_event] : null,
+    persistence.persistence_last_ok_at ? ['Persistence', humanize(persistence.persistence_state), persistence.persistence_last_ok_at] : null,
+  ].filter(Boolean) as Array<[string, string, string]>;
   return (
-    <aside className="space-y-4 xl:sticky xl:top-28 xl:max-h-[calc(100vh-8rem)] xl:overflow-y-auto">
-      <PremiumCard title="Data State">
+    <aside className="min-w-0 space-y-4 xl:sticky xl:top-28 xl:max-h-[calc(100vh-8rem)] xl:overflow-y-auto">
+      <PremiumCard title="System Status">
         <div className="flex items-start gap-3">
-          <span className={classNames('mt-1 h-3 w-3 rounded-full', workstation?.data_state === 'ready' ? 'bg-emerald-400 shadow-[0_0_20px_rgba(52,211,153,0.75)]' : 'bg-amber-300')} />
+          <span className={classNames('mt-1 h-3 w-3 rounded-full', workstation?.data_state === 'ready' ? 'bg-longGreen shadow-greenGlow' : 'bg-waitAmber')} />
           <div>
-            <p className="font-semibold text-white">{humanize(workstation?.data_state ?? health?.status ?? 'waiting')}</p>
-            <p className="mt-2 text-sm leading-6 text-slate-400">{workstation?.status_message ?? persistence.persistence_message}</p>
+            <p className="font-semibold text-textPrimary">Runtime: {humanize(runtimeStatus)}</p>
+            <p className="mt-2 text-sm leading-6 text-textSecondary">{workstation?.data_state === 'ready' ? 'All systems operational.' : 'Start paper runtime to collect live market context.'}</p>
           </div>
         </div>
-        <button type="button" onClick={onAdvanced} className="mt-4 w-full rounded-md border border-slate-800 bg-slate-900/70 px-3 py-2 text-sm font-semibold text-violet-200 hover:border-violet-400/40">
+        <button type="button" onClick={onAdvanced} className="mt-4 w-full rounded-md border border-borderSoft bg-panelBgSoft px-3 py-2 text-sm font-semibold text-violet-200 transition hover:border-accentPurple/60">
           View Details
         </button>
       </PremiumCard>
 
       <SidebarSummaryCard
-        title="Signal Validation Summary"
+        title="Validation Summary"
         rows={[
           ['Total Signals', String(signalValidation?.total_signals ?? 0)],
           ['Win Rate', validationWin, 'text-emerald-300'],
@@ -1249,7 +1363,7 @@ function RightSidebar({
       />
 
       <SidebarSummaryCard
-        title="Paper Trading Performance"
+        title="Performance Summary"
         rows={[
           ['Total PnL', formatCurrency(performance?.session_realized_pnl ?? '0'), pnlTone(performance?.session_realized_pnl ?? '0')],
           ['Closed Trades', String(performance?.total_closed_trades ?? 0)],
@@ -1259,16 +1373,28 @@ function RightSidebar({
         action={<button type="button" onClick={onAdvanced} className="text-xs font-semibold text-violet-300 hover:text-violet-100">View Full</button>}
       />
 
-      <SidebarSummaryCard
-        title="Trade Quality"
-        rows={[
-          ['Entry Quality', tradeQuality?.summary.average_entry_quality_score ? `${formatDecimal(tradeQuality.summary.average_entry_quality_score)}%` : '-'],
-          ['Exit Quality', tradeQuality?.summary.average_exit_quality_score ? `${formatDecimal(tradeQuality.summary.average_exit_quality_score)}%` : '-'],
-          ['MFE Captured', tradeQuality?.summary.average_captured_move_pct ? `${formatDecimal(tradeQuality.summary.average_captured_move_pct)}%` : '-'],
-          ['Closed Trades', String(tradeQuality?.summary.total_closed_trades ?? 0)],
-        ]}
-        action={<button type="button" onClick={onAdvanced} className="text-xs font-semibold text-violet-300 hover:text-violet-100">View Full</button>}
-      />
+      <PremiumCard title="Recent Events" action={<button type="button" onClick={onAdvanced} className="text-xs font-semibold text-violet-300 hover:text-violet-100">View All</button>}>
+        <div className="space-y-3">
+          {recentEvents.length === 0 ? <p className="text-sm leading-6 text-textSecondary">AI history and paper events will appear after the runtime generates advisory snapshots.</p> : null}
+          {recentEvents.map(([label, value, time]) => (
+            <div key={`${label}-${time}`} className="flex gap-3 border-b border-borderSoft pb-3 last:border-b-0 last:pb-0">
+              <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-longGreen" />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center justify-between gap-3 text-sm">
+                  <span className="font-medium text-textPrimary">{label}</span>
+                  <span className="text-xs text-textMuted">{formatDateTime(time)}</span>
+                </div>
+                <p className="mt-1 truncate text-xs text-textSecondary">{value}</p>
+              </div>
+            </div>
+          ))}
+          {tradeQuality?.summary.total_closed_trades ? (
+            <div className="rounded-md border border-borderSoft bg-panelBgSoft p-3 text-xs text-textSecondary">
+              Trade quality: {tradeQuality.summary.average_entry_quality_score ? `${formatDecimal(tradeQuality.summary.average_entry_quality_score)}%` : 'pending'} entry quality across {tradeQuality.summary.total_closed_trades} closed trades.
+            </div>
+          ) : null}
+        </div>
+      </PremiumCard>
     </aside>
   );
 }
@@ -1300,25 +1426,26 @@ function SignalHeader({
       <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
         <div>
           <div className="flex flex-wrap items-center gap-3">
-            <h2 className="text-2xl font-semibold text-white">{selectedSymbol || 'Select Symbol'}</h2>
-            <span className="rounded-md border border-slate-800 bg-slate-900/80 px-2 py-1 text-xs font-semibold text-slate-300">Binance</span>
+            <h2 className="text-3xl font-semibold text-textPrimary">{selectedSymbol || 'Select Symbol'}</h2>
+            <span className="rounded-md border border-borderSoft bg-panelBgSoft px-2 py-1 text-xs font-semibold text-textSecondary">Binance Spot</span>
             <span className={change !== null && change >= 0 ? 'text-sm font-semibold text-emerald-300' : 'text-sm font-semibold text-rose-300'}>{pctDisplay(change)}</span>
           </div>
-          <p className="mt-2 text-sm text-slate-400">
+          <p className="mt-2 text-sm text-textSecondary">
             {price ? formatCurrency(price) : 'Price waiting'} | Updated {formatDateTime(workstation?.last_market_event ?? chart?.candles[chart.candles.length - 1]?.close_time ?? null)}
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Chart timeframe">
           {(['1m', '5m', '15m', '1h'] as const).map((item) => (
             <button
               key={item}
               type="button"
+              aria-pressed={timeframe === item}
               onClick={() => onTimeframeChange(item)}
               className={classNames(
                 'h-9 rounded-md border px-3 text-sm font-semibold transition',
                 timeframe === item
-                  ? 'border-violet-400/45 bg-violet-500/25 text-violet-100'
-                  : 'border-slate-800 bg-slate-950/80 text-slate-300 hover:border-slate-600 hover:text-white',
+                  ? 'border-accentPurple/60 bg-accentPurple/25 text-violet-100 shadow-glow'
+                  : 'border-borderSoft bg-panelBg text-textSecondary hover:border-borderMedium hover:text-textPrimary',
               )}
             >
               {item}
@@ -1327,7 +1454,7 @@ function SignalHeader({
           <button
             type="button"
             onClick={onRefresh}
-            className="h-9 rounded-md border border-violet-400/35 bg-violet-500/15 px-3 text-sm font-semibold text-violet-100 transition hover:border-violet-300"
+            className="h-9 rounded-md border border-accentPurple/35 bg-accentPurple/15 px-3 text-sm font-semibold text-violet-100 transition hover:border-accentPurple"
           >
             {refreshing ? 'Refreshing' : 'Refresh'}
           </button>
@@ -1345,6 +1472,7 @@ function PrimaryAssistantCard({
   tradeEligibility,
   loading,
   error,
+  onViewFullAnalysis,
 }: {
   selectedSymbol: string;
   workstation: WorkstationResponse | null;
@@ -1353,6 +1481,7 @@ function PrimaryAssistantCard({
   tradeEligibility: TradeEligibilityResponse | null;
   loading: boolean;
   error: string | null;
+  onViewFullAnalysis: () => void;
 }) {
   if (!selectedSymbol) {
     return <StatePanel title="Select a symbol" message="Choose a Binance symbol to load the decision view." tone="empty" />;
@@ -1371,56 +1500,76 @@ function PrimaryAssistantCard({
     tradeEligibility?.reason,
   ].filter(Boolean).slice(0, 5) as string[];
   const invalidation = fusionSignal?.invalidation_hint ?? (tradingAssistant?.suggested_stop_loss ? formatCurrency(tradingAssistant.suggested_stop_loss) : 'Not defined yet');
-  const expectedEdge = fusionSignal?.expected_edge_pct ? `${formatDecimal(fusionSignal.expected_edge_pct)}%` : 'not enough data';
+  const expectedEdge = fusionSignal?.expected_edge_pct ? `${formatDecimal(fusionSignal.expected_edge_pct)}%` : 'Collect signals';
   const risk = humanize(tradingAssistant?.risk_label ?? fusionSignal?.risk_grade);
+  const entryZone = tradingAssistant?.suggested_entry_zone ?? 'Wait for a cleaner entry zone';
+  const stopLoss = tradingAssistant?.suggested_stop_loss ? formatCurrency(tradingAssistant.suggested_stop_loss) : '-';
+  const takeProfit = tradingAssistant?.suggested_take_profit ? formatCurrency(tradingAssistant.suggested_take_profit) : '-';
+  const bestTimeframe = tradingAssistant?.best_timeframe ?? fusionSignal?.preferred_horizon ?? tradeEligibility?.preferred_horizon ?? '-';
+  const confidenceTone = signal === 'BUY' ? 'border-longGreen text-longGreen' : signal === 'WAIT' ? 'border-waitAmber text-waitAmber' : 'border-shortRed text-shortRed';
 
   return (
-    <PremiumCard title="AI Trading Assistant" className="h-full">
-      <div className="grid gap-6 lg:grid-cols-[0.9fr,1fr]">
+    <PremiumCard
+      title="AI Trading Assistant"
+      action={<span className="rounded-md border border-borderSoft px-2 py-1 text-xs text-textSecondary">Beginner View</span>}
+      className="h-full"
+    >
+      <div className="grid gap-6">
         <div>
-          <span className={classNames('inline-flex rounded-md border px-4 py-2 text-2xl font-semibold', signalTone(signal))}>{signal}</span>
-          <p className="mt-2 text-sm font-semibold text-slate-300">{tradingAssistant?.confidence_label ? `${tradingAssistant.confidence_label} confidence` : 'Confidence building'}</p>
-          <div className="mt-6 flex items-end gap-3">
-            <p className="text-5xl font-semibold text-white">{confidence}%</p>
-            <p className="pb-2 text-sm text-slate-500">Confidence</p>
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <span className={classNames('inline-flex rounded-md border px-4 py-2 text-4xl font-semibold', signalTone(signal))}>{signal}</span>
+              <p className="mt-3 text-sm font-semibold text-textSecondary">{tradingAssistant?.confidence_label ? `${humanize(tradingAssistant.confidence_label)} confidence` : 'Confidence building'}</p>
+            </div>
+            <div className={classNames('grid h-24 w-24 shrink-0 place-items-center rounded-full border-4 bg-panelBgSoft shadow-cyanGlow', confidenceTone)}>
+              <div className="text-center">
+                <p className="text-2xl font-semibold">{confidence}%</p>
+                <p className="text-[11px] text-textSecondary">Confidence</p>
+              </div>
+            </div>
           </div>
-          <div className="mt-5 h-3 overflow-hidden rounded-full bg-slate-800">
-            <div className={classNames('h-full rounded-full', signal === 'BUY' ? 'bg-emerald-400' : signal === 'WAIT' ? 'bg-amber-300' : 'bg-rose-400')} style={{ width: `${Math.max(4, Math.min(100, confidence))}%` }} />
+          <div className="mt-5">
+            <p className="text-sm font-semibold text-textPrimary">Why?</p>
+            <p className="mt-2 text-sm leading-6 text-textSecondary">{reasons[0] ?? 'Signal reasoning is waiting for more context.'}</p>
           </div>
           <div className="mt-5 grid grid-cols-2 gap-3 text-sm">
             <div>
-              <p className="text-slate-500">Expected Edge</p>
-              <p className="mt-1 font-semibold text-white">{expectedEdge}</p>
+              <p className="text-textMuted">Entry Zone</p>
+              <p className="mt-1 font-semibold text-textPrimary">{entryZone}</p>
             </div>
             <div>
-              <p className="text-slate-500">Risk Grade</p>
-              <p className="mt-1 font-semibold text-white">{risk}</p>
+              <p className="text-textMuted">Stop Loss</p>
+              <p className="mt-1 font-semibold text-textPrimary">{stopLoss}</p>
             </div>
             <div>
-              <p className="text-slate-500">Invalidation</p>
-              <p className="mt-1 font-semibold text-amber-100">{invalidation}</p>
+              <p className="text-textMuted">Take Profit</p>
+              <p className="mt-1 font-semibold text-textPrimary">{takeProfit}</p>
             </div>
             <div>
-              <p className="text-slate-500">Signal Age</p>
-              <p className="mt-1 font-semibold text-white">{formatDateTime(fusionSignal?.generated_at ?? workstation?.last_market_event ?? null)}</p>
+              <p className="text-textMuted">Best Timeframe</p>
+              <p className="mt-1 font-semibold text-textPrimary">{bestTimeframe}</p>
+            </div>
+            <div>
+              <p className="text-textMuted">Risk Level</p>
+              <p className="mt-1 font-semibold text-textPrimary">{risk}</p>
+            </div>
+            <div>
+              <p className="text-textMuted">Expected Edge</p>
+              <p className="mt-1 font-semibold text-textPrimary">{expectedEdge}</p>
             </div>
           </div>
         </div>
-        <div className="border-t border-slate-800 pt-5 lg:border-l lg:border-t-0 lg:pl-5 lg:pt-0">
-          <p className="text-sm font-semibold text-white">AI Reasoning</p>
-          <div className="mt-4 space-y-3">
-            {reasons.length === 0 ? <p className="text-sm text-slate-500">Signal reasoning is waiting for more context.</p> : null}
-            {reasons.map((reason, index) => (
-              <div key={`${reason}-${index}`} className="flex gap-3 text-sm leading-6 text-slate-300">
-                <span className="mt-2 h-2 w-2 shrink-0 rounded-full bg-emerald-400" />
-                <span>{reason}</span>
-              </div>
-            ))}
-          </div>
-          <div className="mt-5 rounded-md border border-slate-800 bg-slate-900/45 p-3 text-sm text-slate-300">
-            {tradingAssistant?.why_not_trade ?? tradeEligibility?.reason ?? 'Paper-only advisory. Wait for deterministic risk checks before any paper action.'}
-          </div>
+        <div className="rounded-md border border-borderSoft bg-panelBgSoft/65 p-3 text-sm leading-6 text-textSecondary">
+          <p><span className="font-semibold text-textPrimary">Invalidation:</span> {invalidation}</p>
+          <p className="mt-1">{tradingAssistant?.why_not_trade ?? tradeEligibility?.reason ?? 'Paper-only advisory. Wait for deterministic risk checks before any paper action.'}</p>
         </div>
+        <button
+          type="button"
+          onClick={onViewFullAnalysis}
+          className="w-full rounded-md border border-borderSoft bg-panelBgSoft px-3 py-3 text-sm font-semibold text-textSecondary transition hover:border-accentPurple/60 hover:text-textPrimary"
+        >
+          View Full Analysis
+        </button>
       </div>
     </PremiumCard>
   );
@@ -1514,11 +1663,11 @@ function SignalAnalysisTabs({
 }) {
   const tabs: Array<[SignalAnalysisTab, string]> = [
     ['ai', 'AI Analysis'],
-    ['horizon', 'Multi-Horizon'],
     ['technicals', 'Technicals'],
-    ['sentiment', 'Sentiment'],
     ['liquidity', 'Liquidity'],
+    ['sentiment', 'Sentiment'],
     ['validation', 'Validation'],
+    ['similar', 'Similar Setups'],
     ['notes', 'Notes'],
   ];
   return (
@@ -1545,7 +1694,6 @@ function SignalAnalysisTabs({
             <AIEvaluationCard symbol={selectedSymbol} evaluation={aiEvaluation.data} loading={aiEvaluation.loading} refreshing={aiEvaluation.refreshing} error={aiEvaluation.error} dataState={aiEvaluation.data?.data_state ?? workstationDataState} statusMessage={aiEvaluation.data?.status_message ?? workstationStatusMessage} />
           </div>
         ) : null}
-        {activeTab === 'horizon' ? <PatternAnalysisSection symbol={selectedSymbol} selectedHorizon={selectedPatternHorizon} analysis={patternAnalysis.data} loading={patternAnalysis.loading} refreshing={patternAnalysis.refreshing} error={patternAnalysis.error} onSelectHorizon={onSelectPatternHorizon} /> : null}
         {activeTab === 'technicals' ? <TechnicalAnalysisSection symbol={selectedSymbol} analysis={technicalAnalysis.data} loading={technicalAnalysis.loading} refreshing={technicalAnalysis.refreshing} error={technicalAnalysis.error} /> : null}
         {activeTab === 'sentiment' ? (
           <div className="grid gap-4 xl:grid-cols-2">
@@ -1555,6 +1703,17 @@ function SignalAnalysisTabs({
         ) : null}
         {activeTab === 'liquidity' ? <TradingAssistantSection symbol={selectedSymbol} assistant={tradingAssistant.data?.symbol === selectedSymbol ? tradingAssistant.data : null} loading={loading} refreshing={refreshing} error={errors} /> : null}
         {activeTab === 'validation' ? <SignalValidationSection symbol={selectedSymbol} validation={signalValidation.data} edgeReport={edgeReport.data} moduleAttribution={moduleAttribution.data} similarSetups={similarSetups} loading={signalValidation.loading} refreshing={signalValidation.refreshing || edgeReport.refreshing || moduleAttribution.refreshing} error={signalValidation.error ?? edgeReport.error ?? moduleAttribution.error} /> : null}
+        {activeTab === 'similar' ? (
+          <div className="grid gap-4 lg:grid-cols-[0.9fr,1.1fr]">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <InsightCard label="Reliability" value={humanize(similarSetups?.reliability_label ?? 'waiting')} helper={similarSetups ? `${similarSetups.matching_sample_size} evaluated matches` : 'Collect paper outcomes to compare setups.'} tone="text-violet-200" />
+              <InsightCard label="Best Horizon" value={similarSetups?.best_horizon ?? '-'} helper="Measured closest outcome window" />
+              <InsightCard label="Pattern Window" value={selectedPatternHorizon} helper={patternAnalysis.data?.status_message ?? 'Pattern context updates with selected horizon.'} />
+              <InsightCard label="Pattern State" value={humanize(patternAnalysis.data?.data_state ?? 'waiting')} helper="Trend persistence, reversal, breakout/range context" />
+            </div>
+            <PatternAnalysisSection symbol={selectedSymbol} selectedHorizon={selectedPatternHorizon} analysis={patternAnalysis.data} loading={patternAnalysis.loading} refreshing={patternAnalysis.refreshing} error={patternAnalysis.error} onSelectHorizon={onSelectPatternHorizon} />
+          </div>
+        ) : null}
         {activeTab === 'notes' ? (
           <div className="grid gap-4 md:grid-cols-3">
             <InsightCard label="Safety" value="Paper Only" helper="No live trading or real futures execution." tone="text-emerald-300" />
@@ -1615,16 +1774,7 @@ function SignalWorkspace({
         onTimeframeChange={onChartTimeframeChange}
         onRefresh={onRefresh}
       />
-      <div className="grid gap-4 2xl:grid-cols-[0.95fr,1.05fr]">
-        <PrimaryAssistantCard
-          selectedSymbol={selectedSymbol}
-          workstation={workstation}
-          fusionSignal={fusionSignal}
-          tradingAssistant={tradingAssistant}
-          tradeEligibility={tradeEligibility}
-          loading={loading}
-          error={error}
-        />
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,1.55fr)_minmax(320px,0.85fr)]">
         <PremiumCard className="p-3">
           <SymbolCandlestickChart
             symbol={selectedSymbol}
@@ -1635,6 +1785,16 @@ function SignalWorkspace({
             technicalAnalysis={technicalAnalysis.data}
           />
         </PremiumCard>
+        <PrimaryAssistantCard
+          selectedSymbol={selectedSymbol}
+          workstation={workstation}
+          fusionSignal={fusionSignal}
+          tradingAssistant={tradingAssistant}
+          tradeEligibility={tradeEligibility}
+          loading={loading}
+          error={error}
+          onViewFullAnalysis={() => onSignalAnalysisTabChange('ai')}
+        />
       </div>
       <KeyInsightCards
         regime={regimeAnalysis}
@@ -1712,6 +1872,7 @@ function App() {
   const [futuresAutoRescanMinutes, setFuturesAutoRescanMinutes] = useState<0 | 5 | 15>(0);
   const [heartbeatNow, setHeartbeatNow] = useState(new Date());
   const [futuresLiveSubscriptionWarning, setFuturesLiveSubscriptionWarning] = useState<string | null>(null);
+  const [leftSidebarCollapsed, setLeftSidebarCollapsed] = useState(false);
   const [selectedTradingProfile, setSelectedTradingProfile] = useState<TradingProfile>('balanced');
   const [aiHistoryOffset, setAiHistoryOffset] = useState(0);
   const [botActionLoading, setBotActionLoading] = useState(false);
@@ -1721,6 +1882,12 @@ function App() {
   const [scannerValidationEvaluating, setScannerValidationEvaluating] = useState(false);
   const [scannerValidationEvaluateMessage, setScannerValidationEvaluateMessage] = useState<string | null>(null);
   const [scannerValidationEvaluateError, setScannerValidationEvaluateError] = useState<string | null>(null);
+  const [debouncedSelectedSymbol, setDebouncedSelectedSymbol] = useState('');
+  const [advancedDataWarning, setAdvancedDataWarning] = useState<string | null>(null);
+  const selectedSymbolRef = useRef(selectedSymbol);
+  const workspaceRefreshControllerRef = useRef<AbortController | null>(null);
+  const backfillControllerRef = useRef<AbortController | null>(null);
+  const workspaceRefreshSequenceRef = useRef(0);
 
   const futuresHeartbeatSymbols = useMemo(() => {
     const scan = futuresOpportunities.data;
@@ -1830,23 +1997,37 @@ function App() {
     const includeSignal = options.includeSignal ?? true;
     const includeAutoTrade = options.includeAutoTrade ?? false;
     const requestedSymbol = symbol.trim().toUpperCase();
+    workspaceRefreshControllerRef.current?.abort();
+    const controller = new AbortController();
+    workspaceRefreshControllerRef.current = controller;
+    const refreshSequence = workspaceRefreshSequenceRef.current + 1;
+    workspaceRefreshSequenceRef.current = refreshSequence;
+    const fastOptions = { signal: controller.signal };
+    const advancedOptions = { signal: controller.signal };
+    const isCurrentRefresh = () => (
+      workspaceRefreshSequenceRef.current === refreshSequence
+      && !controller.signal.aborted
+      && (requestedSymbol.length === 0 || selectedSymbolRef.current === requestedSymbol)
+    );
+
+    setAdvancedDataWarning(null);
     setHealth((current) => setPending(current));
     setBotStatus((current) => setPending(current));
     if (includeSignal) {
       setWorkstation((current) => setPending(current));
-      setAiSignal((current) => setPending(current));
-      setAiHistory((current) => setPending(current));
-      setAiEvaluation((current) => setPending(current));
       setCandles((current) => setPending(current));
       setBackfillStatus((current) => setPending(current));
       setTechnicalAnalysis((current) => setPending(current));
-      setMarketSentiment((current) => setPending(current));
-      setSymbolSentiment((current) => setPending(current));
-      setPatternAnalysis((current) => setPending(current));
       setRegimeAnalysis((current) => setPending(current));
       setFusionSignal((current) => setPending(current));
       setTradingAssistant((current) => setPending(current));
       setTradeEligibility((current) => setPending(current));
+      setAiSignal((current) => setPending(current));
+      setAiHistory((current) => setPending(current));
+      setAiEvaluation((current) => setPending(current));
+      setMarketSentiment((current) => setPending(current));
+      setSymbolSentiment((current) => setPending(current));
+      setPatternAnalysis((current) => setPending(current));
     }
     if (includeAutoTrade) {
       setPerformanceAnalytics((current) => setPending(current));
@@ -1863,161 +2044,215 @@ function App() {
     }
 
     try {
-      const [healthData, botStatusData] = await Promise.all([getHealth(), getBotStatus()]);
-      const resolvedSymbol = requestedSymbol || botStatusData.symbol || '';
-      setHealth({ data: healthData, loading: false, refreshing: false, error: null });
-      setBotStatus({ data: botStatusData, loading: false, refreshing: false, error: null });
-      if (!hasAdoptedRuntimeSymbol && !requestedSymbol && !symbolSearch.trim() && botStatusData.symbol && botStatusData.state !== 'stopped') {
+      const [healthResult, botStatusResult] = await Promise.allSettled([
+        getHealth(fastOptions),
+        getBotStatus(fastOptions),
+      ]);
+      if (!isCurrentRefresh()) {
+        return;
+      }
+      if (healthResult.status === 'fulfilled') {
+        setHealth({ data: healthResult.value, loading: false, refreshing: false, error: null });
+      } else if (!isCanceledRequest(healthResult.reason)) {
+        setHealth((current) => ({
+          ...current,
+          loading: false,
+          refreshing: false,
+          error: errorMessage(healthResult.reason, 'Unable to refresh backend health.'),
+        }));
+      }
+      const botStatusData = botStatusResult.status === 'fulfilled' ? botStatusResult.value : null;
+      if (botStatusData) {
+        setBotStatus({ data: botStatusData, loading: false, refreshing: false, error: null });
+      } else if (botStatusResult.status === 'rejected' && !isCanceledRequest(botStatusResult.reason)) {
+        setBotStatus((current) => ({
+          ...current,
+          loading: false,
+          refreshing: false,
+          error: errorMessage(botStatusResult.reason, 'Unable to refresh paper runtime status.'),
+        }));
+      }
+      const resolvedSymbol = requestedSymbol || botStatusData?.symbol || '';
+      if (!hasAdoptedRuntimeSymbol && !requestedSymbol && !symbolSearch.trim() && botStatusData?.symbol && botStatusData.state !== 'stopped') {
+        selectedSymbolRef.current = botStatusData.symbol;
         setSelectedSymbol(botStatusData.symbol);
         setSymbolSearch(botStatusData.symbol);
         setHasAdoptedRuntimeSymbol(true);
       }
-      if (botStatusData.state !== 'stopped') {
+      if (botStatusData && botStatusData.state !== 'stopped') {
         setSelectedTradingProfile(botStatusData.trading_profile);
       }
 
-      let criticalSignalData:
-        | [
-            WorkstationResponse | null,
-            CandleHistoryResponse | null,
-            BackfillStatusResponse | null,
-            RegimeAnalysisResponse | null,
-            FusionSignalResponse | null,
-            TradingAssistantResponse | null,
-            TradeEligibilityResponse | null,
-          ]
-        | null = null;
-      let advancedSignalData:
-        | [
-            AISignalSummary | null,
-            AISignalHistoryResponse,
-            AIOutcomeEvaluationResponse | null,
-            TechnicalAnalysisResponse | null,
-            MarketSentimentResponse | null,
-            SymbolSentimentResponse | null,
-            PatternAnalysisResponse | null,
-          ]
-        | null = null;
       if (includeSignal) {
-        criticalSignalData = await Promise.all([
-          resolvedSymbol ? getWorkstation(resolvedSymbol) : Promise.resolve<WorkstationResponse | null>(null),
-          resolvedSymbol ? getCandles(resolvedSymbol, selectedChartTimeframe, 120) : Promise.resolve<CandleHistoryResponse | null>(null),
-          resolvedSymbol ? getBackfillStatus(resolvedSymbol) : Promise.resolve<BackfillStatusResponse | null>(null),
-          resolvedSymbol ? getRegimeAnalysis(resolvedSymbol, selectedPatternHorizon) : Promise.resolve<RegimeAnalysisResponse | null>(null),
-          resolvedSymbol ? getFusionSignal(resolvedSymbol) : Promise.resolve<FusionSignalResponse | null>(null),
-          resolvedSymbol ? getTradingAssistant(resolvedSymbol) : Promise.resolve<TradingAssistantResponse | null>(null),
-          resolvedSymbol ? getTradeEligibility(resolvedSymbol) : Promise.resolve<TradeEligibilityResponse | null>(null),
+        const criticalSignalData = await Promise.allSettled([
+          resolvedSymbol ? getWorkstation(resolvedSymbol, fastOptions) : Promise.resolve<WorkstationResponse | null>(null),
+          resolvedSymbol ? getCandles(resolvedSymbol, selectedChartTimeframe, 120, fastOptions) : Promise.resolve<CandleHistoryResponse | null>(null),
+          resolvedSymbol ? getBackfillStatus(resolvedSymbol, fastOptions) : Promise.resolve<BackfillStatusResponse | null>(null),
+          resolvedSymbol ? getTechnicalAnalysis(resolvedSymbol, fastOptions) : Promise.resolve<TechnicalAnalysisResponse | null>(null),
+          resolvedSymbol ? getRegimeAnalysis(resolvedSymbol, selectedPatternHorizon, fastOptions) : Promise.resolve<RegimeAnalysisResponse | null>(null),
+          resolvedSymbol ? getFusionSignal(resolvedSymbol, fastOptions) : Promise.resolve<FusionSignalResponse | null>(null),
+          resolvedSymbol ? getTradingAssistant(resolvedSymbol, fastOptions) : Promise.resolve<TradingAssistantResponse | null>(null),
+          resolvedSymbol ? getTradeEligibility(resolvedSymbol, undefined, fastOptions) : Promise.resolve<TradeEligibilityResponse | null>(null),
         ]);
-        const [
-          workstationData,
-          candleData,
-          backfillStatusData,
-          regimeAnalysisData,
-          fusionSignalData,
-          tradingAssistantData,
-          tradeEligibilityData,
-        ] = criticalSignalData;
-        setWorkstation({ data: workstationData, loading: false, refreshing: false, error: null });
-        setCandles({ data: candleData, loading: false, refreshing: false, error: null });
-        setBackfillStatus({ data: backfillStatusData, loading: false, refreshing: false, error: null });
-        setRegimeAnalysis({ data: regimeAnalysisData, loading: false, refreshing: false, error: null });
-        setFusionSignal({ data: fusionSignalData, loading: false, refreshing: false, error: null });
-        setTradingAssistant({ data: tradingAssistantData, loading: false, refreshing: false, error: null });
-        setTradeEligibility({ data: tradeEligibilityData, loading: false, refreshing: false, error: null });
+        if (!isCurrentRefresh()) {
+          return;
+        }
+        const workstationResult = criticalSignalData[0] as PromiseSettledResult<WorkstationResponse | null>;
+        const candleResult = criticalSignalData[1] as PromiseSettledResult<CandleHistoryResponse | null>;
+        const backfillResult = criticalSignalData[2] as PromiseSettledResult<BackfillStatusResponse | null>;
+        const technicalResult = criticalSignalData[3] as PromiseSettledResult<TechnicalAnalysisResponse | null>;
+        const regimeResult = criticalSignalData[4] as PromiseSettledResult<RegimeAnalysisResponse | null>;
+        const fusionResult = criticalSignalData[5] as PromiseSettledResult<FusionSignalResponse | null>;
+        const assistantResult = criticalSignalData[6] as PromiseSettledResult<TradingAssistantResponse | null>;
+        const eligibilityResult = criticalSignalData[7] as PromiseSettledResult<TradeEligibilityResponse | null>;
+        setWorkstation(workstationResult.status === 'fulfilled'
+          ? { data: workstationResult.value, loading: false, refreshing: false, error: null }
+          : { data: null, loading: false, refreshing: false, error: errorMessage(workstationResult.reason, 'Unable to refresh workstation state.') });
+        setCandles(candleResult.status === 'fulfilled'
+          ? { data: candleResult.value, loading: false, refreshing: false, error: null }
+          : { data: null, loading: false, refreshing: false, error: errorMessage(candleResult.reason, 'Unable to refresh chart candles.') });
+        setBackfillStatus(backfillResult.status === 'fulfilled'
+          ? { data: backfillResult.value, loading: false, refreshing: false, error: null }
+          : { data: null, loading: false, refreshing: false, error: errorMessage(backfillResult.reason, 'Unable to refresh backfill status.') });
+        setTechnicalAnalysis(technicalResult.status === 'fulfilled'
+          ? { data: technicalResult.value, loading: false, refreshing: false, error: null }
+          : { data: null, loading: false, refreshing: false, error: errorMessage(technicalResult.reason, 'Unable to refresh technical analysis.') });
+        setRegimeAnalysis(regimeResult.status === 'fulfilled'
+          ? { data: regimeResult.value, loading: false, refreshing: false, error: null }
+          : { data: null, loading: false, refreshing: false, error: errorMessage(regimeResult.reason, 'Unable to refresh regime analysis.') });
+        setFusionSignal(fusionResult.status === 'fulfilled'
+          ? { data: fusionResult.value, loading: false, refreshing: false, error: null }
+          : { data: null, loading: false, refreshing: false, error: errorMessage(fusionResult.reason, 'Unable to refresh final signal.') });
+        setTradingAssistant(assistantResult.status === 'fulfilled'
+          ? { data: assistantResult.value, loading: false, refreshing: false, error: null }
+          : { data: null, loading: false, refreshing: false, error: errorMessage(assistantResult.reason, 'Unable to refresh trading assistant.') });
+        setTradeEligibility(eligibilityResult.status === 'fulfilled'
+          ? { data: eligibilityResult.value, loading: false, refreshing: false, error: null }
+          : { data: null, loading: false, refreshing: false, error: errorMessage(eligibilityResult.reason, 'Unable to refresh trade eligibility.') });
+        setLastUpdatedAt(new Date());
 
-        advancedSignalData = await Promise.all([
-          resolvedSymbol ? getAISignal(resolvedSymbol) : Promise.resolve<AISignalSummary | null>(null),
+        await delay(ADVANCED_LOAD_DELAY_MS, controller.signal);
+        if (!isCurrentRefresh()) {
+          return;
+        }
+        const advancedSignalData = await Promise.allSettled([
+          resolvedSymbol ? getAISignal(resolvedSymbol, advancedOptions) : Promise.resolve<AISignalSummary | null>(null),
           resolvedSymbol
-            ? getAISignalHistory(resolvedSymbol, { limit: AI_HISTORY_PAGE_SIZE, offset: aiHistoryOffset })
+            ? getAISignalHistory(resolvedSymbol, { limit: AI_HISTORY_PAGE_SIZE, offset: aiHistoryOffset }, advancedOptions)
             : Promise.resolve<AISignalHistoryResponse>(INITIAL_AI_HISTORY),
-          resolvedSymbol ? getAISignalEvaluation(resolvedSymbol) : Promise.resolve<AIOutcomeEvaluationResponse | null>(null),
-          resolvedSymbol ? getTechnicalAnalysis(resolvedSymbol) : Promise.resolve<TechnicalAnalysisResponse | null>(null),
-          resolvedSymbol ? getMarketSentiment(resolvedSymbol) : Promise.resolve<MarketSentimentResponse | null>(null),
-          resolvedSymbol ? getSymbolSentiment(resolvedSymbol) : Promise.resolve<SymbolSentimentResponse | null>(null),
-          resolvedSymbol ? getPatternAnalysis(resolvedSymbol, selectedPatternHorizon) : Promise.resolve<PatternAnalysisResponse | null>(null),
+          resolvedSymbol ? getAISignalEvaluation(resolvedSymbol, advancedOptions) : Promise.resolve<AIOutcomeEvaluationResponse | null>(null),
+          resolvedSymbol ? getMarketSentiment(resolvedSymbol, advancedOptions) : Promise.resolve<MarketSentimentResponse | null>(null),
+          resolvedSymbol ? getSymbolSentiment(resolvedSymbol, advancedOptions) : Promise.resolve<SymbolSentimentResponse | null>(null),
+          resolvedSymbol ? getPatternAnalysis(resolvedSymbol, selectedPatternHorizon, advancedOptions) : Promise.resolve<PatternAnalysisResponse | null>(null),
         ]);
+        if (!isCurrentRefresh()) {
+          return;
+        }
+        let advancedHadIssue = false;
+        const aiSignalResult = advancedSignalData[0] as PromiseSettledResult<AISignalSummary | null>;
+        const aiHistoryResult = advancedSignalData[1] as PromiseSettledResult<AISignalHistoryResponse>;
+        const aiEvaluationResult = advancedSignalData[2] as PromiseSettledResult<AIOutcomeEvaluationResponse | null>;
+        const marketSentimentResult = advancedSignalData[3] as PromiseSettledResult<MarketSentimentResponse | null>;
+        const symbolSentimentResult = advancedSignalData[4] as PromiseSettledResult<SymbolSentimentResponse | null>;
+        const patternResult = advancedSignalData[5] as PromiseSettledResult<PatternAnalysisResponse | null>;
+        advancedHadIssue = advancedHadIssue || aiSignalResult.status === 'rejected';
+        advancedHadIssue = advancedHadIssue || aiHistoryResult.status === 'rejected';
+        advancedHadIssue = advancedHadIssue || aiEvaluationResult.status === 'rejected';
+        advancedHadIssue = advancedHadIssue || marketSentimentResult.status === 'rejected';
+        advancedHadIssue = advancedHadIssue || symbolSentimentResult.status === 'rejected';
+        advancedHadIssue = advancedHadIssue || patternResult.status === 'rejected';
+        setAiSignal(aiSignalResult.status === 'fulfilled'
+          ? { data: aiSignalResult.value, loading: false, refreshing: false, error: null }
+          : (current) => stopSoftLoading(current));
+        setAiHistory(aiHistoryResult.status === 'fulfilled'
+          ? { data: aiHistoryResult.value, loading: false, refreshing: false, error: null }
+          : (current) => stopSoftLoading(current));
+        setAiEvaluation(aiEvaluationResult.status === 'fulfilled'
+          ? { data: aiEvaluationResult.value, loading: false, refreshing: false, error: null }
+          : (current) => stopSoftLoading(current));
+        setMarketSentiment(marketSentimentResult.status === 'fulfilled'
+          ? { data: marketSentimentResult.value, loading: false, refreshing: false, error: null }
+          : (current) => stopSoftLoading(current));
+        setSymbolSentiment(symbolSentimentResult.status === 'fulfilled'
+          ? { data: symbolSentimentResult.value, loading: false, refreshing: false, error: null }
+          : (current) => stopSoftLoading(current));
+        setPatternAnalysis(patternResult.status === 'fulfilled'
+          ? { data: patternResult.value, loading: false, refreshing: false, error: null }
+          : (current) => stopSoftLoading(current));
+        if (advancedHadIssue) {
+          setAdvancedDataWarning(ADVANCED_DATA_WARNING);
+        }
       }
-      let autoTradeData:
-        | [
-            PerformanceAnalyticsResponse | null,
-            TradeQualityResponse | null,
-            PaperTradeReviewResponse | null,
-            ProfileCalibrationResponse | null,
-            ProfileCalibrationComparisonResponse | null,
-            SignalValidationResponse | null,
-            EdgeReportResponse | null,
-            ModuleAttributionResponse | null,
-            SimilarSetupResponse | null,
-            TradeEligibilityResponse | null,
-            AdaptiveRecommendationResponse | null,
-          ]
-        | null = null;
       if (includeAutoTrade) {
-        autoTradeData = await Promise.all([
-          resolvedSymbol ? getPerformanceAnalytics(resolvedSymbol) : Promise.resolve<PerformanceAnalyticsResponse | null>(null),
-          resolvedSymbol ? getTradeQualityAnalytics(resolvedSymbol) : Promise.resolve<TradeQualityResponse | null>(null),
-          resolvedSymbol ? getPaperTradeReview(resolvedSymbol) : Promise.resolve<PaperTradeReviewResponse | null>(null),
+        const autoTradeData = await Promise.allSettled([
+          resolvedSymbol ? getPerformanceAnalytics(resolvedSymbol, undefined, advancedOptions) : Promise.resolve<PerformanceAnalyticsResponse | null>(null),
+          resolvedSymbol ? getTradeQualityAnalytics(resolvedSymbol, undefined, advancedOptions) : Promise.resolve<TradeQualityResponse | null>(null),
+          resolvedSymbol ? getPaperTradeReview(resolvedSymbol, undefined, advancedOptions) : Promise.resolve<PaperTradeReviewResponse | null>(null),
           resolvedSymbol
-            ? getProfileCalibration(resolvedSymbol, { profile: selectedTradingProfile })
+            ? getProfileCalibration(resolvedSymbol, { profile: selectedTradingProfile }, advancedOptions)
             : Promise.resolve<ProfileCalibrationResponse | null>(null),
           resolvedSymbol
-            ? getProfileCalibrationComparison(resolvedSymbol, selectedTradingProfile)
+            ? getProfileCalibrationComparison(resolvedSymbol, selectedTradingProfile, undefined, advancedOptions)
             : Promise.resolve<ProfileCalibrationComparisonResponse | null>(null),
-          resolvedSymbol ? getSignalValidation(resolvedSymbol) : Promise.resolve<SignalValidationResponse | null>(null),
-          resolvedSymbol ? getEdgeReport(resolvedSymbol) : Promise.resolve<EdgeReportResponse | null>(null),
-          resolvedSymbol ? getModuleAttribution(resolvedSymbol) : Promise.resolve<ModuleAttributionResponse | null>(null),
-          resolvedSymbol ? getSimilarSetups(resolvedSymbol) : Promise.resolve<SimilarSetupResponse | null>(null),
-          resolvedSymbol ? getTradeEligibility(resolvedSymbol) : Promise.resolve<TradeEligibilityResponse | null>(null),
-          resolvedSymbol ? getAdaptiveRecommendations(resolvedSymbol) : Promise.resolve<AdaptiveRecommendationResponse | null>(null),
+          resolvedSymbol ? getSignalValidation(resolvedSymbol, undefined, advancedOptions) : Promise.resolve<SignalValidationResponse | null>(null),
+          resolvedSymbol ? getEdgeReport(resolvedSymbol, undefined, advancedOptions) : Promise.resolve<EdgeReportResponse | null>(null),
+          resolvedSymbol ? getModuleAttribution(resolvedSymbol, undefined, advancedOptions) : Promise.resolve<ModuleAttributionResponse | null>(null),
+          resolvedSymbol ? getSimilarSetups(resolvedSymbol, undefined, advancedOptions) : Promise.resolve<SimilarSetupResponse | null>(null),
+          resolvedSymbol ? getAdaptiveRecommendations(resolvedSymbol, undefined, advancedOptions) : Promise.resolve<AdaptiveRecommendationResponse | null>(null),
         ]);
-      }
-
-      if (advancedSignalData !== null) {
-        const [
-          aiSignalData,
-          aiHistoryData,
-          aiEvaluationData,
-          technicalAnalysisData,
-          marketSentimentData,
-          symbolSentimentData,
-          patternAnalysisData,
-        ] = advancedSignalData;
-        setAiSignal({ data: aiSignalData, loading: false, refreshing: false, error: null });
-        setAiHistory({ data: aiHistoryData, loading: false, refreshing: false, error: null });
-        setAiEvaluation({ data: aiEvaluationData, loading: false, refreshing: false, error: null });
-        setTechnicalAnalysis({ data: technicalAnalysisData, loading: false, refreshing: false, error: null });
-        setMarketSentiment({ data: marketSentimentData, loading: false, refreshing: false, error: null });
-        setSymbolSentiment({ data: symbolSentimentData, loading: false, refreshing: false, error: null });
-        setPatternAnalysis({ data: patternAnalysisData, loading: false, refreshing: false, error: null });
-      }
-      if (autoTradeData !== null) {
-        const [
-          performanceData,
-          tradeQualityData,
-          paperReviewData,
-          profileCalibrationData,
-          profileCalibrationComparisonData,
-          signalValidationData,
-          edgeReportData,
-          moduleAttributionData,
-          similarSetupsData,
-          tradeEligibilityData,
-          adaptiveRecommendationData,
-        ] = autoTradeData;
-        setPerformanceAnalytics({ data: performanceData, loading: false, refreshing: false, error: null });
-        setTradeQualityAnalytics({ data: tradeQualityData, loading: false, refreshing: false, error: null });
-        setPaperTradeReview({ data: paperReviewData, loading: false, refreshing: false, error: null });
-        setProfileCalibration({ data: profileCalibrationData, loading: false, refreshing: false, error: null });
-        setProfileCalibrationComparison({ data: profileCalibrationComparisonData, loading: false, refreshing: false, error: null });
-        setSignalValidation({ data: signalValidationData, loading: false, refreshing: false, error: null });
-        setEdgeReport({ data: edgeReportData, loading: false, refreshing: false, error: null });
-        setModuleAttribution({ data: moduleAttributionData, loading: false, refreshing: false, error: null });
-        setSimilarSetups({ data: similarSetupsData, loading: false, refreshing: false, error: null });
-        setTradeEligibility({ data: tradeEligibilityData, loading: false, refreshing: false, error: null });
-        setAdaptiveRecommendations({ data: adaptiveRecommendationData, loading: false, refreshing: false, error: null });
+        if (!isCurrentRefresh()) {
+          return;
+        }
+        const performanceResult = autoTradeData[0] as PromiseSettledResult<PerformanceAnalyticsResponse | null>;
+        const tradeQualityResult = autoTradeData[1] as PromiseSettledResult<TradeQualityResponse | null>;
+        const paperReviewResult = autoTradeData[2] as PromiseSettledResult<PaperTradeReviewResponse | null>;
+        const profileCalibrationResult = autoTradeData[3] as PromiseSettledResult<ProfileCalibrationResponse | null>;
+        const profileComparisonResult = autoTradeData[4] as PromiseSettledResult<ProfileCalibrationComparisonResponse | null>;
+        const signalValidationResult = autoTradeData[5] as PromiseSettledResult<SignalValidationResponse | null>;
+        const edgeReportResult = autoTradeData[6] as PromiseSettledResult<EdgeReportResponse | null>;
+        const moduleAttributionResult = autoTradeData[7] as PromiseSettledResult<ModuleAttributionResponse | null>;
+        const similarSetupsResult = autoTradeData[8] as PromiseSettledResult<SimilarSetupResponse | null>;
+        const adaptiveResult = autoTradeData[9] as PromiseSettledResult<AdaptiveRecommendationResponse | null>;
+        const autoHadIssue = autoTradeData.some((result) => result.status === 'rejected');
+        setPerformanceAnalytics(performanceResult.status === 'fulfilled'
+          ? { data: performanceResult.value, loading: false, refreshing: false, error: null }
+          : (current) => stopSoftLoading(current));
+        setTradeQualityAnalytics(tradeQualityResult.status === 'fulfilled'
+          ? { data: tradeQualityResult.value, loading: false, refreshing: false, error: null }
+          : (current) => stopSoftLoading(current));
+        setPaperTradeReview(paperReviewResult.status === 'fulfilled'
+          ? { data: paperReviewResult.value, loading: false, refreshing: false, error: null }
+          : (current) => stopSoftLoading(current));
+        setProfileCalibration(profileCalibrationResult.status === 'fulfilled'
+          ? { data: profileCalibrationResult.value, loading: false, refreshing: false, error: null }
+          : (current) => stopSoftLoading(current));
+        setProfileCalibrationComparison(profileComparisonResult.status === 'fulfilled'
+          ? { data: profileComparisonResult.value, loading: false, refreshing: false, error: null }
+          : (current) => stopSoftLoading(current));
+        setSignalValidation(signalValidationResult.status === 'fulfilled'
+          ? { data: signalValidationResult.value, loading: false, refreshing: false, error: null }
+          : (current) => stopSoftLoading(current));
+        setEdgeReport(edgeReportResult.status === 'fulfilled'
+          ? { data: edgeReportResult.value, loading: false, refreshing: false, error: null }
+          : (current) => stopSoftLoading(current));
+        setModuleAttribution(moduleAttributionResult.status === 'fulfilled'
+          ? { data: moduleAttributionResult.value, loading: false, refreshing: false, error: null }
+          : (current) => stopSoftLoading(current));
+        setSimilarSetups(similarSetupsResult.status === 'fulfilled'
+          ? { data: similarSetupsResult.value, loading: false, refreshing: false, error: null }
+          : (current) => stopSoftLoading(current));
+        setAdaptiveRecommendations(adaptiveResult.status === 'fulfilled'
+          ? { data: adaptiveResult.value, loading: false, refreshing: false, error: null }
+          : (current) => stopSoftLoading(current));
+        if (autoHadIssue) {
+          setAdvancedDataWarning(ADVANCED_DATA_WARNING);
+        }
       }
       setLastUpdatedAt(new Date());
     } catch (error) {
+      if (controller.signal.aborted || isCanceledRequest(error)) {
+        return;
+      }
       const message = error instanceof Error ? error.message : 'Unable to refresh workstation state.';
       setHealth((current) => ({ ...current, loading: false, refreshing: false, error: message }));
       setBotStatus((current) => ({ ...current, loading: false, refreshing: false, error: message }));
@@ -2061,15 +2296,26 @@ function App() {
   }, [loadSymbols, symbolSearch]);
 
   useEffect(() => {
-    void refreshWorkspace(selectedSymbol, { includeSignal: true, includeAutoTrade: false });
-  }, [refreshWorkspace, selectedSymbol]);
+    selectedSymbolRef.current = selectedSymbol;
+    workspaceRefreshControllerRef.current?.abort();
+    backfillControllerRef.current?.abort();
+    const timeoutId = window.setTimeout(() => {
+      setDebouncedSelectedSymbol(selectedSymbol);
+    }, SYMBOL_SWITCH_DEBOUNCE_MS);
+    return () => window.clearTimeout(timeoutId);
+  }, [selectedSymbol]);
+
+  useEffect(() => () => {
+    workspaceRefreshControllerRef.current?.abort();
+    backfillControllerRef.current?.abort();
+  }, []);
 
   useEffect(() => {
-    if (!['simulate', 'validate', 'advanced'].includes(tab) || selectedSymbol.trim().length === 0) {
-      return;
-    }
-    void refreshWorkspace(selectedSymbol, { includeSignal: false, includeAutoTrade: true });
-  }, [refreshWorkspace, selectedSymbol, tab]);
+    void refreshWorkspace(debouncedSelectedSymbol, {
+      includeSignal: true,
+      includeAutoTrade: ['simulate', 'validate', 'advanced'].includes(tab),
+    });
+  }, [debouncedSelectedSymbol, refreshWorkspace, tab]);
 
   useEffect(() => {
     void refreshOpportunities();
@@ -2131,25 +2377,35 @@ function App() {
     if (tab !== 'validate') {
       return;
     }
-    void refreshPostSignalPerformance(selectedSymbol);
-  }, [refreshPostSignalPerformance, selectedSymbol, tab]);
+    void refreshPostSignalPerformance(debouncedSelectedSymbol);
+  }, [debouncedSelectedSymbol, refreshPostSignalPerformance, tab]);
 
   useEffect(() => {
-    const symbol = selectedSymbol.trim();
+    const symbol = debouncedSelectedSymbol.trim();
     if (!symbol) {
       return;
     }
+    backfillControllerRef.current?.abort();
+    const controller = new AbortController();
+    backfillControllerRef.current = controller;
     setBackfillStatus((current) => setPending(current));
-    void triggerBackfill(symbol)
+    void triggerBackfill(symbol, { signal: controller.signal })
       .then((status) => {
+        if (controller.signal.aborted || selectedSymbolRef.current !== symbol.toUpperCase()) {
+          return;
+        }
         setBackfillStatus({ data: status, loading: false, refreshing: false, error: null });
         setLastUpdatedAt(new Date());
       })
       .catch((error) => {
+        if (controller.signal.aborted || isCanceledRequest(error)) {
+          return;
+        }
         const message = error instanceof Error ? error.message : 'Unable to start historical backfill.';
         setBackfillStatus((current) => ({ ...current, loading: false, refreshing: false, error: message }));
       });
-  }, [selectedSymbol]);
+    return () => controller.abort();
+  }, [debouncedSelectedSymbol]);
 
   useEffect(() => {
     if (autoRefreshSeconds === 0 || selectedSymbol.trim().length === 0) {
@@ -2164,6 +2420,9 @@ function App() {
   const handleSymbolSearchChange = useCallback((value: string) => {
     setSymbolSearch(value);
     if (value.trim().toUpperCase() !== selectedSymbol) {
+      workspaceRefreshControllerRef.current?.abort();
+      backfillControllerRef.current?.abort();
+      selectedSymbolRef.current = '';
       setSelectedSymbol('');
     }
     setBotActionError(null);
@@ -2171,26 +2430,52 @@ function App() {
   }, [selectedSymbol]);
 
   const handleSelectSymbol = useCallback((symbol: string) => {
+    const normalizedSymbol = symbol.trim().toUpperCase();
+    workspaceRefreshControllerRef.current?.abort();
+    backfillControllerRef.current?.abort();
+    selectedSymbolRef.current = normalizedSymbol;
     setAiHistoryOffset(0);
-    setSelectedSymbol(symbol);
-    setSymbolSearch(symbol);
+    setSelectedSymbol(normalizedSymbol);
+    setSymbolSearch(normalizedSymbol);
     setHasAdoptedRuntimeSymbol(true);
+    setAdvancedDataWarning(null);
     setBotActionError(null);
     setBotActionMessage(null);
     setWorkstation({ data: null, loading: true, refreshing: false, error: null });
+    setAiSignal({ data: null, loading: true, refreshing: false, error: null });
+    setAiHistory({ data: INITIAL_AI_HISTORY, loading: true, refreshing: false, error: null });
+    setAiEvaluation({ data: null, loading: true, refreshing: false, error: null });
     setCandles({ data: null, loading: true, refreshing: false, error: null });
     setBackfillStatus({ data: null, loading: true, refreshing: false, error: null });
+    setTechnicalAnalysis({ data: null, loading: true, refreshing: false, error: null });
+    setMarketSentiment({ data: null, loading: true, refreshing: false, error: null });
+    setSymbolSentiment({ data: null, loading: true, refreshing: false, error: null });
+    setPatternAnalysis({ data: null, loading: true, refreshing: false, error: null });
     setRegimeAnalysis({ data: null, loading: true, refreshing: false, error: null });
     setFusionSignal({ data: null, loading: true, refreshing: false, error: null });
     setTradingAssistant({ data: null, loading: true, refreshing: false, error: null });
+    setPerformanceAnalytics({ data: null, loading: false, refreshing: false, error: null });
+    setTradeQualityAnalytics({ data: null, loading: false, refreshing: false, error: null });
+    setPaperTradeReview({ data: null, loading: false, refreshing: false, error: null });
+    setProfileCalibration({ data: null, loading: false, refreshing: false, error: null });
+    setProfileCalibrationComparison({ data: null, loading: false, refreshing: false, error: null });
+    setSignalValidation({ data: null, loading: false, refreshing: false, error: null });
+    setEdgeReport({ data: null, loading: false, refreshing: false, error: null });
+    setModuleAttribution({ data: null, loading: false, refreshing: false, error: null });
+    setSimilarSetups({ data: null, loading: false, refreshing: false, error: null });
     setTradeEligibility({ data: null, loading: true, refreshing: false, error: null });
+    setAdaptiveRecommendations({ data: null, loading: false, refreshing: false, error: null });
   }, []);
 
   const handleClearSelection = useCallback(() => {
+    workspaceRefreshControllerRef.current?.abort();
+    backfillControllerRef.current?.abort();
+    selectedSymbolRef.current = '';
     setAiHistoryOffset(0);
     setSelectedSymbol('');
     setSymbolSearch('');
     setHasAdoptedRuntimeSymbol(true);
+    setAdvancedDataWarning(null);
     setBotActionError(null);
     setBotActionMessage(null);
     setWorkstation({ data: null, loading: false, refreshing: false, error: null });
@@ -2236,6 +2521,7 @@ function App() {
       setSelectedTradingProfile(nextStatus.trading_profile);
       if (nextStatus.symbol) {
         setAiHistoryOffset(0);
+        selectedSymbolRef.current = nextStatus.symbol;
         setSelectedSymbol(nextStatus.symbol);
         setSymbolSearch(nextStatus.symbol);
       }
@@ -2362,7 +2648,7 @@ function App() {
     return null;
   }, [regimeAnalysis.data, selectedSymbol]);
 
-  const trendLabel = effectiveWorkstation?.trend_bias ?? 'Waiting for live data';
+  const trendLabel = effectiveWorkstation?.trend_bias ?? 'Start paper runtime to collect live market context.';
   const workstationDataState = effectiveWorkstation?.data_state ?? 'waiting_for_runtime';
   const workstationStatusMessage = effectiveWorkstation?.status_message ?? (selectedSymbol ? `Start or attach the live runtime for ${selectedSymbol} to populate symbol-scoped workstation data.` : 'Select one symbol to populate the workstation.');
   const signalExplanation = effectiveWorkstation?.explanation ?? 'Select a symbol, then start or pause the live paper runtime to populate live signal state.';
@@ -2452,7 +2738,7 @@ function App() {
   };
 
   return (
-    <div className="min-h-screen bg-[#050915] text-slate-100">
+    <div className="min-h-screen overflow-x-hidden bg-appBg text-textPrimary">
       <TopNavigation
         tab={tab}
         tabs={assistantTabs}
@@ -2465,7 +2751,14 @@ function App() {
         onAutoRefreshChange={setAutoRefreshSeconds}
       />
 
-      <div className="mx-auto grid max-w-[1880px] gap-4 px-4 py-4 sm:px-6 2xl:grid-cols-[270px_minmax(0,1fr)_320px] 2xl:px-8">
+      <div
+        className={classNames(
+          'mx-auto grid max-w-[1880px] gap-4 px-4 py-4 sm:px-6 xl:px-6 2xl:px-8',
+          leftSidebarCollapsed
+            ? 'xl:grid-cols-[76px_minmax(0,1fr)_300px]'
+            : 'xl:grid-cols-[260px_minmax(0,1fr)_300px]',
+        )}
+      >
         <LeftSidebar
           selectedSymbol={selectedSymbol}
           symbolSearch={symbolSearch}
@@ -2476,6 +2769,7 @@ function App() {
           livePrices={futuresLivePrices.data}
           marketSentiment={marketSentiment.data}
           technicalAnalysis={technicalAnalysis.data}
+          collapsed={leftSidebarCollapsed}
           onSearchChange={handleSymbolSearchChange}
           onSelectSymbol={(symbol) => {
             handleSelectSymbol(symbol);
@@ -2483,16 +2777,17 @@ function App() {
           }}
           onClearSelection={handleClearSelection}
           onViewScanner={() => setTab('discover')}
+          onToggleCollapse={() => setLeftSidebarCollapsed((current) => !current)}
         />
 
         <main className="min-w-0 space-y-4">
           <PremiumCard className="p-3">
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
-                <span className="rounded-md border border-slate-800 bg-slate-900/70 px-3 py-1">Selected {selectedSymbol || '-'}</span>
-                <span className="rounded-md border border-slate-800 bg-slate-900/70 px-3 py-1">Runtime {botStatus.data.state}</span>
-                <span className="rounded-md border border-slate-800 bg-slate-900/70 px-3 py-1">Profile {selectedTradingProfile}</span>
-                <span className="rounded-md border border-slate-800 bg-slate-900/70 px-3 py-1">Advisory Only</span>
+              <div className="flex flex-wrap items-center gap-2 text-xs text-textSecondary">
+                <span className="rounded-md border border-borderSoft bg-panelBgSoft px-3 py-1">Selected {selectedSymbol || '-'}</span>
+                <span className="rounded-md border border-borderSoft bg-panelBgSoft px-3 py-1">Runtime {botStatus.data.state}</span>
+                <span className="rounded-md border border-borderSoft bg-panelBgSoft px-3 py-1">Profile {selectedTradingProfile}</span>
+                <span className="rounded-md border border-longGreen/25 bg-longGreen/10 px-3 py-1 text-emerald-100">Paper Mode</span>
               </div>
               <div className="flex flex-wrap gap-2">
                 <button type="button" disabled={!selectedSymbol || botActionLoading} onClick={() => void runBotAction(() => startBot(selectedSymbol, selectedTradingProfile))} className="rounded-md border border-emerald-400/30 bg-emerald-400/10 px-3 py-2 text-xs font-semibold text-emerald-100 disabled:cursor-not-allowed disabled:opacity-50">Start</button>
@@ -2503,6 +2798,16 @@ function App() {
             {botActionMessage ? <p className="mt-2 text-xs text-emerald-300">{botActionMessage}</p> : null}
             {botActionError ? <p className="mt-2 text-xs text-rose-300">{botActionError}</p> : null}
           </PremiumCard>
+
+          {advancedDataWarning ? (
+            <div
+              role="status"
+              className="rounded-lg border border-amber-400/20 bg-amber-400/10 px-4 py-3 text-sm text-amber-100"
+            >
+              <span className="font-semibold">{advancedDataWarning}</span>
+              <span className="ml-2 text-amber-100/75">{ADVANCED_SOFT_MESSAGE}</span>
+            </div>
+          ) : null}
 
           {tab === 'discover' ? (
             <ErrorBoundary fallbackTitle="Futures paper scanner unavailable">
@@ -2659,7 +2964,7 @@ function App() {
         {tab === 'advanced' ? (
           <div className="space-y-5">
             <ErrorBoundary fallbackTitle="Advanced workspace unavailable">
-              <AdvancedDetailsPro defaultOpen>
+              <AdvancedDetailsPro>
                 <div className="grid gap-4">
                   <BotControlPanel
                     searchQuery={symbolSearch}

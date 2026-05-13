@@ -2281,6 +2281,7 @@ def test_futures_opportunities_uses_cached_symbol_universe_when_exchange_info_fa
     assert second_response.status_code == 200
     body = second_response.json()
     assert body['futures_symbol_universe_source'] == 'cache'
+    assert body['data_source'] == 'symbol_universe_cache'
     assert body['last_successful_fetch_at'] is not None
     assert body['latest_error']
 
@@ -2299,9 +2300,11 @@ def test_futures_opportunities_uses_manual_fallback_when_exchange_info_fails_wit
     assert response.status_code == 200
     body = response.json()
     assert body['futures_symbol_universe_source'] == 'fallback'
+    assert body['data_source'] == 'fallback_scan'
     assert body['symbol_count'] == 2
     assert body['scan_state'] in {'partial', 'degraded'}
-    assert any('fallback symbols' in warning for warning in body['warnings'])
+    assert body['fallback_symbol_count'] == 20
+    assert any('curated fallback list' in warning for warning in body['warnings'])
     assert body['latest_error']
 
 
@@ -2319,9 +2322,107 @@ def test_futures_opportunities_returns_degraded_when_exchange_info_fails_without
     assert response.status_code == 200
     body = response.json()
     assert body['scan_state'] == 'degraded'
+    assert body['data_source'] == 'empty_degraded'
     assert body['futures_symbol_universe_source'] == 'unavailable'
     assert body['symbol_count'] == 0
     assert body['latest_error']
+    assert any('No cached scanner results' in warning for warning in body['warnings'])
+
+
+def test_futures_opportunities_full_scan_failure_returns_last_successful_result() -> None:
+    settings = Settings(DATABASE_URL=f"sqlite:///{_db_path()}")
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: FakeFuturesRestClient()
+    client = TestClient(app)
+
+    try:
+        first_response = client.get('/bot/futures-opportunities', params={'limit': 1, 'include_avoid': 'true'})
+        repository = StorageRepository(settings.database_url)
+        try:
+            with repository._connection_scope() as connection:
+                with connection:
+                    connection.execute('DELETE FROM futures_historical_candles')
+                    connection.execute('DELETE FROM symbol_candle_cache')
+        finally:
+            repository.close()
+        app.dependency_overrides[get_rest_client] = lambda: FailingFuturesRestClient(count=1)
+        second_response = client.get('/bot/futures-opportunities', params={'limit': 1, 'include_avoid': 'true'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    first_body = first_response.json()
+    second_body = second_response.json()
+    assert second_body['scan_state'] == 'degraded'
+    assert second_body['data_source'] == 'last_successful_cache'
+    assert second_body['latest_successful_scanner_at'] is not None
+    assert second_body['persisted_candidate_count'] >= 1
+    assert second_body['long_candidates'] == first_body['long_candidates']
+    assert any('last successful scanner result' in warning for warning in second_body['warnings'])
+
+
+def test_futures_opportunities_no_last_result_returns_empty_degraded_state() -> None:
+    settings = Settings(DATABASE_URL=f"sqlite:///{_db_path()}")
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: FailingFuturesRestClient(count=2)
+    client = TestClient(app)
+
+    try:
+        response = client.get('/bot/futures-opportunities', params={'limit': 2, 'include_avoid': 'true'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['scan_state'] == 'degraded'
+    assert body['data_source'] == 'empty_degraded'
+    assert body['persisted_candidate_count'] == 0
+    assert body['long_candidates'] == []
+    assert body['short_candidates'] == []
+    assert body['neutral_candidates'] == []
+    assert len(body['failed_symbols']) == 2
+    assert body['latest_scanner_error']
+
+
+def test_futures_opportunities_persisted_candidates_reload_after_backend_restart() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: FakeFuturesRestClient()
+    client = TestClient(app)
+
+    try:
+        first_response = client.get('/bot/futures-opportunities', params={'limit': 1, 'include_avoid': 'true'})
+        repository = StorageRepository(settings.database_url)
+        try:
+            with repository._connection_scope() as connection:
+                with connection:
+                    connection.execute('DELETE FROM futures_historical_candles')
+                    connection.execute('DELETE FROM symbol_candle_cache')
+        finally:
+            repository.close()
+        _FUTURES_SYMBOL_UNIVERSE_CACHE.clear()
+        app.dependency_overrides[get_rest_client] = lambda: FailingFuturesRestClient(count=1)
+        second_response = client.get('/bot/futures-opportunities', params={'limit': 1, 'include_avoid': 'true'})
+    finally:
+        app.dependency_overrides.clear()
+
+    repository = StorageRepository(settings.database_url)
+    try:
+        latest_run = repository.get_latest_successful_scanner_run(quote_asset='USDT', horizon='7d')
+        candidates = repository.get_scanner_candidates(scanner_run_id=latest_run.id if latest_run else '')
+    finally:
+        repository.close()
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert latest_run is not None
+    assert latest_run.result_json is not None
+    assert candidates
+    body = second_response.json()
+    assert body['data_source'] == 'last_successful_cache'
+    assert body['persisted_candidate_count'] == len(candidates)
 
 
 def test_futures_opportunities_skips_slow_symbols_after_timeout() -> None:

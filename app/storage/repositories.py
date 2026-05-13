@@ -33,12 +33,17 @@ from app.storage.models import (
     PositionSnapshotRecord,
     ProfileTuningSetRecord,
     RuntimeSessionRecord,
+    ScannerCandidatePriceRecord,
+    ScannerCandidateRecord,
+    ScannerRunRecord,
     RunnerEventRecord,
     ScannerValidationOutcomeRecord,
     ScannerValidationSnapshotRecord,
     SignalOutcomeRecord,
     SignalOutcomeSnapshotRecord,
     SignalValidationSnapshotRecord,
+    SymbolAnalysisCacheRecord,
+    SymbolBackfillJobRecord,
     TradeRecord,
 )
 
@@ -245,6 +250,48 @@ def _scanner_validation_outcome_from_row(row: sqlite3.Row) -> ScannerValidationO
         first_exit=row["first_exit"],
         outcome_state=row["outcome_state"],
         evaluated_at=datetime.fromisoformat(row["evaluated_at"]),
+    )
+
+
+def _scanner_run_from_row(row: sqlite3.Row) -> ScannerRunRecord:
+    """Convert a SQLite row into scanner-run metadata."""
+
+    return ScannerRunRecord(
+        id=row["id"],
+        generated_at=datetime.fromisoformat(row["generated_at"]),
+        quote_asset=row["quote_asset"],
+        horizon=row["horizon"],
+        max_symbols=int(row["max_symbols"]),
+        min_opportunity_score=int(row["min_opportunity_score"]),
+        scan_state=row["scan_state"],
+        scanned_count=int(row["scanned_count"]),
+        failed_symbols_json=row["failed_symbols_json"],
+        warnings_json=row["warnings_json"],
+        result_json=row["result_json"] if "result_json" in row.keys() else None,
+        candidate_count=int(row["candidate_count"]) if "candidate_count" in row.keys() else 0,
+    )
+
+
+def _scanner_candidate_from_row(row: sqlite3.Row) -> ScannerCandidateRecord:
+    """Convert a SQLite row into a scanner candidate record."""
+
+    return ScannerCandidateRecord(
+        id=row["id"],
+        scanner_run_id=row["scanner_run_id"],
+        symbol=row["symbol"],
+        direction=row["direction"],
+        opportunity_score=int(row["opportunity_score"]),
+        confidence=int(row["confidence"]),
+        evidence_strength=row["evidence_strength"],
+        current_price=_decimal(row["current_price"]) if row["current_price"] is not None else None,
+        entry_zone=row["entry_zone"],
+        stop_loss=_decimal(row["stop_loss"]) if row["stop_loss"] is not None else None,
+        take_profit=_decimal(row["take_profit"]) if row["take_profit"] is not None else None,
+        risk_grade=row["risk_grade"],
+        regime=row["regime"],
+        reason=row["reason"],
+        warnings_json=row["warnings_json"],
+        timestamp=datetime.fromisoformat(row["timestamp"]),
     )
 
 
@@ -511,6 +558,12 @@ class StorageRepository:
                     "signal_validation_snapshots",
                     "historical_candles",
                     "futures_historical_candles",
+                    "scanner_runs",
+                    "scanner_candidates",
+                    "scanner_candidate_prices",
+                    "symbol_candle_cache",
+                    "symbol_analysis_cache",
+                    "symbol_backfill_jobs",
                     "scanner_validation_snapshots",
                     "scanner_validation_outcomes",
                     "signal_snapshots",
@@ -1342,6 +1395,441 @@ class StorageRepository:
             return []
         return [_scanner_validation_outcome_from_row(row) for row in rows]
 
+    def upsert_scanner_run(self, run: ScannerRunRecord) -> None:
+        """Persist scanner run metadata with stable idempotency by run id."""
+
+        try:
+            with self._connection_scope() as connection:
+                with connection:
+                    connection.execute(
+                        """
+                        INSERT INTO scanner_runs (
+                            id, generated_at, quote_asset, horizon, max_symbols,
+                            min_opportunity_score, scan_state, scanned_count,
+                            failed_symbols_json, warnings_json, result_json, candidate_count
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            generated_at = excluded.generated_at,
+                            quote_asset = excluded.quote_asset,
+                            horizon = excluded.horizon,
+                            max_symbols = excluded.max_symbols,
+                            min_opportunity_score = excluded.min_opportunity_score,
+                            scan_state = excluded.scan_state,
+                            scanned_count = excluded.scanned_count,
+                            failed_symbols_json = excluded.failed_symbols_json,
+                            warnings_json = excluded.warnings_json,
+                            result_json = excluded.result_json,
+                            candidate_count = excluded.candidate_count
+                        """,
+                        (
+                            run.id,
+                            run.generated_at.isoformat(),
+                            run.quote_asset,
+                            run.horizon,
+                            run.max_symbols,
+                            run.min_opportunity_score,
+                            run.scan_state,
+                            run.scanned_count,
+                            run.failed_symbols_json,
+                            run.warnings_json,
+                            run.result_json,
+                            run.candidate_count,
+                        ),
+                    )
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Scanner run storage is unavailable.")
+            LOGGER.warning("Skipping scanner run persistence due to schema issue: %s", exc)
+
+    def get_scanner_runs(self, *, limit: int = 20) -> list[ScannerRunRecord]:
+        """Return recent scanner runs."""
+
+        try:
+            with self._connection_scope() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id, generated_at, quote_asset, horizon, max_symbols,
+                           min_opportunity_score, scan_state, scanned_count,
+                           failed_symbols_json, warnings_json, result_json, candidate_count
+                    FROM scanner_runs
+                    ORDER BY generated_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Scanner run storage is unavailable.")
+            LOGGER.warning("Failed to read scanner runs due to schema issue: %s", exc)
+            return []
+        return [_scanner_run_from_row(row) for row in rows]
+
+    def get_latest_successful_scanner_run(
+        self,
+        *,
+        quote_asset: str = "USDT",
+        horizon: str | None = None,
+    ) -> ScannerRunRecord | None:
+        """Return the latest persisted scanner result with usable candidates."""
+
+        query = """
+            SELECT id, generated_at, quote_asset, horizon, max_symbols,
+                   min_opportunity_score, scan_state, scanned_count,
+                   failed_symbols_json, warnings_json, result_json, candidate_count
+            FROM scanner_runs
+            WHERE quote_asset = ?
+              AND result_json IS NOT NULL
+              AND candidate_count > 0
+              AND scan_state IN ('ready', 'partial', 'insufficient_data')
+        """
+        params: list[Any] = [quote_asset.upper()]
+        if horizon is not None:
+            query += " AND horizon = ?"
+            params.append(horizon)
+        query += " ORDER BY generated_at DESC LIMIT 1"
+        try:
+            with self._connection_scope() as connection:
+                row = connection.execute(query, tuple(params)).fetchone()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Scanner run storage is unavailable.")
+            LOGGER.warning("Failed to read latest scanner run due to schema issue: %s", exc)
+            return None
+        if row is None:
+            return None
+        return _scanner_run_from_row(row)
+
+    def upsert_scanner_candidates(self, candidates: list[ScannerCandidateRecord]) -> int:
+        """Persist scanner candidates for later review and validation."""
+
+        if not candidates:
+            return 0
+        try:
+            with self._connection_scope() as connection:
+                with connection:
+                    cursor = connection.executemany(
+                        """
+                        INSERT INTO scanner_candidates (
+                            id, scanner_run_id, symbol, direction, opportunity_score,
+                            confidence, evidence_strength, current_price, entry_zone,
+                            stop_loss, take_profit, risk_grade, regime, reason,
+                            warnings_json, timestamp
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(scanner_run_id, symbol, direction) DO UPDATE SET
+                            opportunity_score = excluded.opportunity_score,
+                            confidence = excluded.confidence,
+                            evidence_strength = excluded.evidence_strength,
+                            current_price = excluded.current_price,
+                            entry_zone = excluded.entry_zone,
+                            stop_loss = excluded.stop_loss,
+                            take_profit = excluded.take_profit,
+                            risk_grade = excluded.risk_grade,
+                            regime = excluded.regime,
+                            reason = excluded.reason,
+                            warnings_json = excluded.warnings_json,
+                            timestamp = excluded.timestamp
+                        """,
+                        [
+                            (
+                                candidate.id,
+                                candidate.scanner_run_id,
+                                candidate.symbol.upper(),
+                                candidate.direction,
+                                candidate.opportunity_score,
+                                candidate.confidence,
+                                candidate.evidence_strength,
+                                str(candidate.current_price) if candidate.current_price is not None else None,
+                                candidate.entry_zone,
+                                str(candidate.stop_loss) if candidate.stop_loss is not None else None,
+                                str(candidate.take_profit) if candidate.take_profit is not None else None,
+                                candidate.risk_grade,
+                                candidate.regime,
+                                candidate.reason,
+                                candidate.warnings_json,
+                                candidate.timestamp.isoformat(),
+                            )
+                            for candidate in candidates
+                        ],
+                    )
+            return int(cursor.rowcount)
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Scanner candidate storage is unavailable.")
+            LOGGER.warning("Skipping scanner candidate persistence due to schema issue: %s", exc)
+            return 0
+
+    def get_scanner_candidates(
+        self,
+        *,
+        scanner_run_id: str | None = None,
+        symbol: str | None = None,
+        limit: int = 100,
+    ) -> list[ScannerCandidateRecord]:
+        """Return persisted scanner candidates."""
+
+        query = """
+            SELECT id, scanner_run_id, symbol, direction, opportunity_score, confidence,
+                   evidence_strength, current_price, entry_zone, stop_loss, take_profit,
+                   risk_grade, regime, reason, warnings_json, timestamp
+            FROM scanner_candidates
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if scanner_run_id is not None:
+            query += " AND scanner_run_id = ?"
+            params.append(scanner_run_id)
+        if symbol is not None:
+            query += " AND symbol = ?"
+            params.append(symbol.upper())
+        query += " ORDER BY timestamp DESC, opportunity_score DESC LIMIT ?"
+        params.append(limit)
+        try:
+            with self._connection_scope() as connection:
+                rows = connection.execute(query, tuple(params)).fetchall()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Scanner candidate storage is unavailable.")
+            LOGGER.warning("Failed to read scanner candidates due to schema issue: %s", exc)
+            return []
+        return [_scanner_candidate_from_row(row) for row in rows]
+
+    def upsert_scanner_candidate_prices(self, prices: list[ScannerCandidatePriceRecord]) -> int:
+        """Persist price observations tied to scanner candidates."""
+
+        if not prices:
+            return 0
+        try:
+            with self._connection_scope() as connection:
+                with connection:
+                    cursor = connection.executemany(
+                        """
+                        INSERT OR IGNORE INTO scanner_candidate_prices (
+                            scanner_candidate_id, symbol, price, price_type, source, recorded_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                item.scanner_candidate_id,
+                                item.symbol.upper(),
+                                str(item.price) if item.price is not None else None,
+                                item.price_type,
+                                item.source,
+                                item.recorded_at.isoformat(),
+                            )
+                            for item in prices
+                        ],
+                    )
+            return int(cursor.rowcount)
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Scanner candidate price storage is unavailable.")
+            LOGGER.warning("Skipping scanner candidate price persistence due to schema issue: %s", exc)
+            return 0
+
+    def upsert_symbol_candle_cache(self, candles: list[Candle], *, source: str) -> int:
+        """Persist symbol candle cache rows for fast selected-symbol reads."""
+
+        closed_candles = [candle for candle in candles if candle.is_closed]
+        if not closed_candles:
+            return 0
+        now = datetime.now(tz=UTC).isoformat()
+        try:
+            with self._connection_scope() as connection:
+                with connection:
+                    connection.executemany(
+                        """
+                        INSERT INTO symbol_candle_cache (
+                            symbol, interval, open_time, open, high, low, close,
+                            volume, source, inserted_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(symbol, interval, open_time) DO UPDATE SET
+                            open = excluded.open,
+                            high = excluded.high,
+                            low = excluded.low,
+                            close = excluded.close,
+                            volume = excluded.volume,
+                            source = excluded.source,
+                            updated_at = excluded.updated_at
+                        """,
+                        [
+                            (
+                                candle.symbol.upper(),
+                                candle.timeframe,
+                                candle.open_time.isoformat(),
+                                str(candle.open),
+                                str(candle.high),
+                                str(candle.low),
+                                str(candle.close),
+                                str(candle.volume),
+                                source,
+                                now,
+                                now,
+                            )
+                            for candle in closed_candles
+                        ],
+                    )
+            return len(closed_candles)
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Symbol candle cache storage is unavailable.")
+            LOGGER.warning("Skipping symbol candle cache persistence due to schema issue: %s", exc)
+            return 0
+
+    def upsert_symbol_analysis_cache(self, record: SymbolAnalysisCacheRecord) -> None:
+        """Persist symbol analysis cache payloads for stale-while-revalidate reads."""
+
+        try:
+            with self._connection_scope() as connection:
+                with connection:
+                    connection.execute(
+                        """
+                        INSERT INTO symbol_analysis_cache (
+                            symbol, analysis_type, horizon, payload_json, generated_at, expires_at, data_state
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(symbol, analysis_type, horizon) DO UPDATE SET
+                            payload_json = excluded.payload_json,
+                            generated_at = excluded.generated_at,
+                            expires_at = excluded.expires_at,
+                            data_state = excluded.data_state
+                        """,
+                        (
+                            record.symbol.upper(),
+                            record.analysis_type,
+                            record.horizon,
+                            record.payload_json,
+                            record.generated_at.isoformat(),
+                            record.expires_at.isoformat(),
+                            record.data_state,
+                        ),
+                    )
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Symbol analysis cache storage is unavailable.")
+            LOGGER.warning("Skipping symbol analysis cache persistence due to schema issue: %s", exc)
+
+    def get_symbol_analysis_cache(
+        self,
+        *,
+        symbol: str,
+        analysis_type: str,
+        horizon: str,
+    ) -> SymbolAnalysisCacheRecord | None:
+        """Return one persisted symbol analysis cache entry."""
+
+        try:
+            with self._connection_scope() as connection:
+                row = connection.execute(
+                    """
+                    SELECT symbol, analysis_type, horizon, payload_json, generated_at, expires_at, data_state
+                    FROM symbol_analysis_cache
+                    WHERE symbol = ? AND analysis_type = ? AND horizon = ?
+                    """,
+                    (symbol.upper(), analysis_type, horizon),
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Symbol analysis cache storage is unavailable.")
+            LOGGER.warning("Failed to read symbol analysis cache due to schema issue: %s", exc)
+            return None
+        if row is None:
+            return None
+        return SymbolAnalysisCacheRecord(
+            symbol=row["symbol"],
+            analysis_type=row["analysis_type"],
+            horizon=row["horizon"],
+            payload_json=row["payload_json"],
+            generated_at=datetime.fromisoformat(row["generated_at"]),
+            expires_at=datetime.fromisoformat(row["expires_at"]),
+            data_state=row["data_state"],
+        )
+
+    def upsert_symbol_backfill_job(self, job: SymbolBackfillJobRecord) -> None:
+        """Persist the latest state of a symbol backfill job."""
+
+        try:
+            with self._connection_scope() as connection:
+                with connection:
+                    connection.execute(
+                        """
+                        INSERT INTO symbol_backfill_jobs (
+                            id, symbol, interval, lookback_days, status, started_at,
+                            completed_at, error_message, candles_inserted
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            status = excluded.status,
+                            completed_at = excluded.completed_at,
+                            error_message = excluded.error_message,
+                            candles_inserted = excluded.candles_inserted
+                        """,
+                        (
+                            job.id,
+                            job.symbol.upper(),
+                            job.interval,
+                            job.lookback_days,
+                            job.status,
+                            job.started_at.isoformat(),
+                            job.completed_at.isoformat() if job.completed_at is not None else None,
+                            job.error_message,
+                            job.candles_inserted,
+                        ),
+                    )
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Symbol backfill job storage is unavailable.")
+            LOGGER.warning("Skipping symbol backfill job persistence due to schema issue: %s", exc)
+
+    def get_active_symbol_backfill_job(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        lookback_days: int,
+    ) -> SymbolBackfillJobRecord | None:
+        """Return an active backfill job to prevent duplicate selected-symbol backfills."""
+
+        try:
+            with self._connection_scope() as connection:
+                row = connection.execute(
+                    """
+                    SELECT id, symbol, interval, lookback_days, status, started_at,
+                           completed_at, error_message, candles_inserted
+                    FROM symbol_backfill_jobs
+                    WHERE symbol = ? AND interval = ? AND lookback_days = ? AND status IN ('queued', 'loading')
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """,
+                    (symbol.upper(), interval, lookback_days),
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Symbol backfill job storage is unavailable.")
+            LOGGER.warning("Failed to read active symbol backfill job due to schema issue: %s", exc)
+            return None
+        if row is None:
+            return None
+        return SymbolBackfillJobRecord(
+            id=row["id"],
+            symbol=row["symbol"],
+            interval=row["interval"],
+            lookback_days=int(row["lookback_days"]),
+            status=row["status"],
+            started_at=datetime.fromisoformat(row["started_at"]),
+            completed_at=_safe_datetime(row["completed_at"]),
+            error_message=row["error_message"],
+            candles_inserted=int(row["candles_inserted"]),
+        )
+
     def upsert_historical_candles(
         self,
         candles: list[Candle],
@@ -1510,6 +1998,7 @@ class StorageRepository:
                         if candle.is_closed
                     ],
                 )
+            self.upsert_symbol_candle_cache(candles, source=source)
             return len(candles)
         except sqlite3.OperationalError as exc:
             if not _is_optional_schema_error(exc):

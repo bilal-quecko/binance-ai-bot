@@ -184,6 +184,96 @@ SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS scanner_runs (
+        id TEXT PRIMARY KEY,
+        generated_at TEXT NOT NULL,
+        quote_asset TEXT NOT NULL,
+        horizon TEXT NOT NULL,
+        max_symbols INTEGER NOT NULL,
+        min_opportunity_score INTEGER NOT NULL,
+        scan_state TEXT NOT NULL,
+        scanned_count INTEGER NOT NULL,
+        failed_symbols_json TEXT NOT NULL,
+        warnings_json TEXT NOT NULL,
+        result_json TEXT,
+        candidate_count INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS scanner_candidates (
+        id TEXT PRIMARY KEY,
+        scanner_run_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        opportunity_score INTEGER NOT NULL,
+        confidence INTEGER NOT NULL,
+        evidence_strength TEXT NOT NULL,
+        current_price TEXT,
+        entry_zone TEXT,
+        stop_loss TEXT,
+        take_profit TEXT,
+        risk_grade TEXT NOT NULL,
+        regime TEXT,
+        reason TEXT NOT NULL,
+        warnings_json TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        UNIQUE(scanner_run_id, symbol, direction)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS scanner_candidate_prices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scanner_candidate_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        price TEXT,
+        price_type TEXT NOT NULL,
+        source TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        UNIQUE(scanner_candidate_id, recorded_at)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS symbol_candle_cache (
+        symbol TEXT NOT NULL,
+        interval TEXT NOT NULL,
+        open_time TEXT NOT NULL,
+        open TEXT NOT NULL,
+        high TEXT NOT NULL,
+        low TEXT NOT NULL,
+        close TEXT NOT NULL,
+        volume TEXT NOT NULL,
+        source TEXT NOT NULL,
+        inserted_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(symbol, interval, open_time)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS symbol_analysis_cache (
+        symbol TEXT NOT NULL,
+        analysis_type TEXT NOT NULL,
+        horizon TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        generated_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        data_state TEXT NOT NULL,
+        PRIMARY KEY(symbol, analysis_type, horizon)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS symbol_backfill_jobs (
+        id TEXT PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        interval TEXT NOT NULL,
+        lookback_days INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        error_message TEXT,
+        candles_inserted INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS scanner_validation_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         scan_id TEXT NOT NULL,
@@ -354,6 +444,13 @@ SCHEMA_STATEMENTS = (
         ended_at TEXT
     )
     """,
+    "CREATE INDEX IF NOT EXISTS idx_scanner_runs_generated_at ON scanner_runs(generated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_scanner_candidates_symbol ON scanner_candidates(symbol, timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_scanner_candidates_run ON scanner_candidates(scanner_run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_scanner_candidate_prices_symbol ON scanner_candidate_prices(symbol, recorded_at)",
+    "CREATE INDEX IF NOT EXISTS idx_symbol_candle_cache_symbol_interval_open_time ON symbol_candle_cache(symbol, interval, open_time)",
+    "CREATE INDEX IF NOT EXISTS idx_symbol_analysis_cache_symbol_type ON symbol_analysis_cache(symbol, analysis_type, expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_symbol_backfill_jobs_symbol_interval ON symbol_backfill_jobs(symbol, interval, status)",
 )
 
 OPTIONAL_TABLE_COLUMNS: dict[str, dict[str, str]] = {
@@ -542,6 +639,10 @@ OPTIONAL_TABLE_COLUMNS: dict[str, dict[str, str]] = {
         "trading_profile": "TEXT NOT NULL DEFAULT 'balanced'",
         "tuning_version_id": "TEXT",
         "baseline_tuning_version_id": "TEXT",
+    },
+    "scanner_runs": {
+        "result_json": "TEXT",
+        "candidate_count": "INTEGER NOT NULL DEFAULT 0",
     },
     "trades": {
         "execution_source": "TEXT NOT NULL DEFAULT 'auto'",

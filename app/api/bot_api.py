@@ -57,6 +57,9 @@ from app.storage.candle_repository import CandleBackfillStatus, CandleRepository
 from app.storage.models import (
     HistoricalCandleRecord,
     MarketCandleSnapshotRecord,
+    ScannerCandidatePriceRecord,
+    ScannerCandidateRecord,
+    ScannerRunRecord,
     SignalValidationSnapshotRecord,
 )
 from app.monitoring.similar_setups import (
@@ -123,14 +126,24 @@ FUTURES_SYMBOL_UNIVERSE_CACHE_TTL = timedelta(minutes=20)
 FUTURES_SCANNER_FALLBACK_SYMBOLS = (
     "BTCUSDT",
     "ETHUSDT",
-    "SOLUSDT",
     "BNBUSDT",
+    "SOLUSDT",
     "XRPUSDT",
     "DOGEUSDT",
     "ADAUSDT",
     "AVAXUSDT",
     "LINKUSDT",
     "LTCUSDT",
+    "TRXUSDT",
+    "DOTUSDT",
+    "BCHUSDT",
+    "NEARUSDT",
+    "INJUSDT",
+    "OPUSDT",
+    "ARBUSDT",
+    "SUIUSDT",
+    "SEIUSDT",
+    "APTUSDT",
 )
 
 
@@ -568,6 +581,11 @@ class FuturesOpportunityScanResponse(BaseModel):
     symbol_count: int = 0
     last_successful_fetch_at: datetime | None = None
     latest_error: str | None = None
+    data_source: str = "live_scan"
+    latest_successful_scanner_at: datetime | None = None
+    latest_scanner_error: str | None = None
+    persisted_candidate_count: int = 0
+    fallback_symbol_count: int = 0
 
 
 class FuturesLivePriceItemResponse(BaseModel):
@@ -3370,6 +3388,19 @@ def _to_futures_signal_response(signal: FuturesPaperSignal) -> FuturesPaperSigna
 def _to_futures_scan_response(report: FuturesOpportunityScanReport) -> FuturesOpportunityScanResponse:
     """Convert paper futures scanner report into the API response shape."""
 
+    candidate_count = (
+        len(report.long_candidates)
+        + len(report.short_candidates)
+        + len(report.neutral_candidates)
+    )
+    fallback_symbol_count = (
+        len(_manual_futures_symbol_fallback("USDT"))
+        if report.futures_symbol_universe_source == "fallback"
+        else 0
+    )
+    data_source = "fallback_scan" if report.futures_symbol_universe_source == "fallback" else "live_scan"
+    if report.futures_symbol_universe_source == "cache":
+        data_source = "symbol_universe_cache"
     return FuturesOpportunityScanResponse(
         generated_at=report.generated_at,
         scan_state=report.scan_state,
@@ -3383,6 +3414,11 @@ def _to_futures_scan_response(report: FuturesOpportunityScanReport) -> FuturesOp
         symbol_count=report.symbol_count,
         last_successful_fetch_at=report.last_successful_fetch_at,
         latest_error=report.latest_error,
+        data_source=data_source,
+        latest_successful_scanner_at=report.generated_at if report.scan_state != "degraded" else None,
+        latest_scanner_error=report.latest_error,
+        persisted_candidate_count=candidate_count,
+        fallback_symbol_count=fallback_symbol_count,
     )
 
 
@@ -3710,6 +3746,149 @@ def _persist_scanner_outcome_snapshots(
             )
         except Exception:
             LOGGER.exception("Failed to persist post-signal scanner snapshot for %s.", signal.symbol)
+
+
+def _persist_scanner_run_candidates(
+    *,
+    repository: StorageRepository,
+    scan_id: str,
+    report: FuturesOpportunityScanReport,
+    response: FuturesOpportunityScanResponse,
+    quote_asset: str,
+    horizon: str,
+    max_symbols: int,
+    min_opportunity_score: int,
+) -> None:
+    """Persist scanner run and candidate rows for later review."""
+
+    all_candidates = report.long_candidates + report.short_candidates + report.neutral_candidates
+    candidate_count = len(all_candidates)
+    repository.upsert_scanner_run(
+        ScannerRunRecord(
+            id=scan_id,
+            generated_at=report.generated_at,
+            quote_asset=quote_asset,
+            horizon=horizon,
+            max_symbols=max_symbols,
+            min_opportunity_score=min_opportunity_score,
+            scan_state=report.scan_state,
+            scanned_count=report.scanned_count,
+            failed_symbols_json=json.dumps(report.failed_symbols),
+            warnings_json=json.dumps(report.warnings),
+            result_json=response.model_dump_json(),
+            candidate_count=candidate_count,
+        )
+    )
+    candidate_records = [
+        ScannerCandidateRecord(
+            id=f"{scan_id}:{signal.symbol}:{signal.direction}",
+            scanner_run_id=scan_id,
+            symbol=signal.symbol,
+            direction=signal.direction,
+            opportunity_score=signal.opportunity_score,
+            confidence=signal.confidence,
+            evidence_strength=signal.evidence_strength,
+            current_price=signal.current_price,
+            entry_zone=signal.suggested_entry_zone,
+            stop_loss=signal.suggested_stop_loss,
+            take_profit=signal.suggested_take_profit,
+            risk_grade=signal.risk_grade,
+            regime=signal.regime,
+            reason=signal.reason,
+            warnings_json=json.dumps(signal.warnings),
+            timestamp=signal.timestamp,
+        )
+        for signal in all_candidates
+    ]
+    repository.upsert_scanner_candidates(candidate_records)
+    repository.upsert_scanner_candidate_prices(
+        [
+            ScannerCandidatePriceRecord(
+                id=None,
+                scanner_candidate_id=f"{scan_id}:{signal.symbol}:{signal.direction}",
+                symbol=signal.symbol,
+                price=signal.current_price,
+                price_type=signal.price_type,
+                source=signal.data_source,
+                recorded_at=signal.timestamp,
+            )
+            for signal in all_candidates
+        ]
+    )
+
+
+def _latest_successful_scanner_response(
+    *,
+    repository: StorageRepository,
+    quote_asset: str,
+    horizon: str,
+    latest_error: str | None,
+    universe_source: FuturesSymbolUniverseSource,
+    fallback_symbol_count: int,
+) -> FuturesOpportunityScanResponse | None:
+    """Load the latest persisted full scanner result for degraded fallback."""
+
+    run = repository.get_latest_successful_scanner_run(quote_asset=quote_asset, horizon=horizon)
+    if run is None or not run.result_json:
+        return None
+    try:
+        cached = FuturesOpportunityScanResponse.model_validate(json.loads(run.result_json))
+    except Exception:
+        LOGGER.exception("Failed to parse cached scanner result %s.", run.id)
+        return None
+    warnings = [
+        "Binance API unavailable; showing last successful scanner result.",
+        *[
+            warning
+            for warning in cached.warnings
+            if warning != "Binance API unavailable; showing last successful scanner result."
+        ],
+    ]
+    return cached.model_copy(
+        update={
+            "scan_state": "degraded",
+            "warnings": warnings,
+            "data_source": "last_successful_cache",
+            "futures_symbol_universe_source": universe_source,
+            "latest_successful_scanner_at": run.generated_at,
+            "latest_scanner_error": latest_error,
+            "latest_error": latest_error,
+            "persisted_candidate_count": run.candidate_count,
+            "fallback_symbol_count": fallback_symbol_count,
+        }
+    )
+
+
+def _empty_degraded_scanner_response(
+    *,
+    universe_source: FuturesSymbolUniverseSource,
+    latest_error: str | None,
+    fallback_symbol_count: int,
+    failed_symbols: list[str] | None = None,
+) -> FuturesOpportunityScanResponse:
+    """Return a stable empty scanner state when no cached result exists."""
+
+    warning = "No scanner results yet. Run scanner when Binance API is available."
+    if universe_source == "fallback":
+        warning = "No fallback symbols could be scanned. Run scanner again when Binance USD-M klines are available."
+    elif universe_source == "unavailable":
+        warning = "No cached scanner results are available and the USD-M symbol universe is unavailable."
+    return FuturesOpportunityScanResponse(
+        generated_at=datetime.now(tz=UTC),
+        scan_state="degraded",
+        warnings=[warning],
+        scanned_count=0,
+        failed_symbols=failed_symbols or [],
+        futures_symbol_universe_source=universe_source,
+        symbol_count=0,
+        last_successful_fetch_at=None,
+        latest_error=latest_error,
+        data_source="empty_degraded",
+        latest_successful_scanner_at=None,
+        latest_scanner_error=latest_error,
+        persisted_candidate_count=0,
+        fallback_symbol_count=fallback_symbol_count,
+    )
 
 
 def _assistant_signal_type(decision: str) -> str:
@@ -5265,6 +5444,14 @@ async def get_futures_opportunities(
 
     scanner = FuturesOpportunityScanner()
     total_started_at = time.perf_counter()
+    repository = StorageRepository(settings.database_url)
+    signals: list[FuturesPaperSignal] = []
+    failed_symbols: list[str] = []
+    candle_cache: dict[tuple[str, SupportedInterval], list[Candle]] = {}
+    semaphore = asyncio.Semaphore(concurrency)
+    current_threshold = max(min_opportunity_score, min_confidence)
+    fallback_symbol_count = len(_manual_futures_symbol_fallback(normalized_quote))
+
     universe = await _load_futures_symbol_universe(
         rest_client=rest_client,
         quote_asset=normalized_quote,
@@ -5278,29 +5465,31 @@ async def get_futures_opportunities(
             scan_id,
             latest_error,
         )
-        return FuturesOpportunityScanResponse(
-            generated_at=datetime.now(tz=UTC),
-            scan_state="degraded",
-            warnings=["USD-M Futures symbol universe is unavailable; scanner results are temporarily degraded."],
-            scanned_count=0,
-            failed_symbols=[],
-            futures_symbol_universe_source=universe.source,
-            symbol_count=0,
-            last_successful_fetch_at=universe.last_successful_fetch_at,
+        cached_response = _latest_successful_scanner_response(
+            repository=repository,
+            quote_asset=normalized_quote,
+            horizon=normalized_horizon,
             latest_error=latest_error,
+            universe_source=universe.source,
+            fallback_symbol_count=fallback_symbol_count,
         )
+        if cached_response is not None:
+            repository.close()
+            return cached_response
+        repository.close()
+        return _empty_degraded_scanner_response(
+            universe_source=universe.source,
+            latest_error=latest_error,
+            fallback_symbol_count=fallback_symbol_count,
+        )
+
     universe_warnings: list[str] = []
     if universe.source == "cache":
-        universe_warnings.append("Using cached USD-M Futures symbol universe because live Binance exchangeInfo is unavailable or recently cached.")
+        universe_warnings.append(
+            "Using cached USD-M Futures symbol universe because live Binance exchangeInfo is unavailable or recently cached."
+        )
     elif universe.source == "fallback":
-        universe_warnings.append("Using manual major USD-M Futures fallback symbols because Binance exchangeInfo is unavailable.")
-
-    repository = StorageRepository(settings.database_url)
-    signals: list[FuturesPaperSignal] = []
-    failed_symbols: list[str] = []
-    candle_cache: dict[tuple[str, SupportedInterval], list[Candle]] = {}
-    semaphore = asyncio.Semaphore(concurrency)
-    current_threshold = max(min_opportunity_score, min_confidence)
+        universe_warnings.append("Live USD-M symbol universe unavailable; using curated fallback list.")
 
     async def scan_symbol(record: SpotSymbolRecord) -> FuturesPaperSignal | None:
         async with semaphore:
@@ -5400,16 +5589,49 @@ async def get_futures_opportunities(
         if pending:
             report.scan_state = "partial" if signals else "degraded"
             report.warnings.append("Scanner request timed out before all symbols completed; partial results are shown.")
+        if not signals and failed_symbols:
+            latest_error = universe.latest_error or "futures_klines_unavailable: no requested futures symbols returned candles."
+            cached_response = _latest_successful_scanner_response(
+                repository=repository,
+                quote_asset=normalized_quote,
+                horizon=normalized_horizon,
+                latest_error=latest_error,
+                universe_source=universe.source,
+                fallback_symbol_count=fallback_symbol_count,
+            )
+            if cached_response is not None:
+                return cached_response
+            return _empty_degraded_scanner_response(
+                universe_source=universe.source,
+                latest_error=latest_error,
+                fallback_symbol_count=fallback_symbol_count,
+                failed_symbols=failed_symbols,
+            )
+        response = _to_futures_scan_response(report)
+        try:
+            _persist_scanner_run_candidates(
+                repository=repository,
+                scan_id=scan_id,
+                report=report,
+                response=response,
+                quote_asset=normalized_quote,
+                horizon=normalized_horizon,
+                max_symbols=scan_limit,
+                min_opportunity_score=min_opportunity_score,
+            )
+        except Exception:
+            LOGGER.exception("Failed to persist futures scanner run candidates.")
+            response.warnings.append("Scanner candidate persistence failed; visible results are still usable for this session.")
         try:
             persist_scanner_validation_snapshots(repository=repository, report=report)
         except Exception:
             LOGGER.exception("Failed to persist futures scanner validation snapshots.")
-            report.warnings.append(
+            response.warnings.append(
                 "Scanner validation snapshot persistence failed; this scan will not be included in paper validation reports."
             )
         _persist_scanner_outcome_snapshots(repository=repository, report=report)
         LOGGER.info("Futures scanner total scan time %.3fs scan_id=%s.", time.perf_counter() - total_started_at, scan_id)
-        return _to_futures_scan_response(report)
+        return response
     finally:
         repository.close()
 

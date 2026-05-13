@@ -55,6 +55,7 @@
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '/api';
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const ADVANCED_ANALYTICS_TIMEOUT_MS = 60_000;
 const FUTURES_SCANNER_TIMEOUT_MS = 60_000;
 
 export type ApiErrorCategory =
@@ -62,6 +63,7 @@ export type ApiErrorCategory =
   | 'scanner_timeout'
   | 'binance_unavailable'
   | 'network_proxy_error'
+  | 'request_canceled'
   | 'http_error'
   | 'unknown';
 
@@ -81,6 +83,11 @@ interface RequestJsonOptions extends RequestInit {
   timeoutMs?: number;
 }
 
+export interface ApiRequestOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
 function buildUrl(path: string, params?: URLSearchParams): string {
   const suffix = params && params.toString().length > 0 ? `?${params.toString()}` : '';
   return `${API_BASE_URL}${path}${suffix}`;
@@ -89,7 +96,11 @@ function buildUrl(path: string, params?: URLSearchParams): string {
 async function requestJson<T>(path: string, params?: URLSearchParams, init?: RequestJsonOptions): Promise<T> {
   const timeoutMs = init?.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  const timeoutId = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
   init?.signal?.addEventListener('abort', () => controller.abort(), { once: true });
   const { timeoutMs: _timeoutMs, signal: _signal, ...fetchInit } = init ?? {};
 
@@ -106,6 +117,9 @@ async function requestJson<T>(path: string, params?: URLSearchParams, init?: Req
     });
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') {
+      if (!timedOut && init?.signal?.aborted) {
+        throw new ApiRequestError('Request canceled because a newer symbol was selected.', 'request_canceled');
+      }
       throw new ApiRequestError('Request timed out before the backend returned a response.', 'scanner_timeout');
     }
     if (error instanceof TypeError) {
@@ -133,6 +147,23 @@ async function requestJson<T>(path: string, params?: URLSearchParams, init?: Req
   }
 
   return (await response.json()) as T;
+}
+
+function requestOptions(options?: ApiRequestOptions): RequestJsonOptions | undefined {
+  if (!options) {
+    return undefined;
+  }
+  return {
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+  };
+}
+
+function advancedRequestOptions(options?: ApiRequestOptions): RequestJsonOptions {
+  return {
+    signal: options?.signal,
+    timeoutMs: options?.timeoutMs ?? ADVANCED_ANALYTICS_TIMEOUT_MS,
+  };
 }
 
 function buildHistoryParams(filters: Partial<HistoryFilters>): URLSearchParams {
@@ -166,8 +197,8 @@ function buildRangeParams(filters?: RangeFilters): URLSearchParams {
   return params;
 }
 
-export function getHealth(): Promise<HealthResponse> {
-  return requestJson<HealthResponse>('/health');
+export function getHealth(options?: ApiRequestOptions): Promise<HealthResponse> {
+  return requestJson<HealthResponse>('/health', undefined, requestOptions(options));
 }
 
 export function getMetrics(): Promise<MetricsResponse> {
@@ -177,10 +208,11 @@ export function getMetrics(): Promise<MetricsResponse> {
 export function getPerformanceAnalytics(
   symbol: string,
   filters?: RangeFilters,
+  options?: ApiRequestOptions,
 ): Promise<PerformanceAnalyticsResponse> {
   const params = buildRangeParams(filters);
   params.set('symbol', symbol.trim().toUpperCase());
-  return requestJson<PerformanceAnalyticsResponse>('/performance', params);
+  return requestJson<PerformanceAnalyticsResponse>('/performance', params, advancedRequestOptions(options));
 }
 
 export function getPostSignalPerformanceSummary(horizon = '15m'): Promise<PostSignalPerformanceSummaryResponse> {
@@ -206,57 +238,63 @@ export function getPostSignalDetail(signalId: string): Promise<PostSignalSnapsho
 export function getTradeQualityAnalytics(
   symbol: string,
   filters?: RangeFilters,
+  options?: ApiRequestOptions,
 ): Promise<TradeQualityResponse> {
   const params = buildRangeParams(filters);
   params.set('symbol', symbol.trim().toUpperCase());
   params.set('limit', '5');
   params.set('offset', '0');
-  return requestJson<TradeQualityResponse>('/performance/trade-quality', params);
+  return requestJson<TradeQualityResponse>('/performance/trade-quality', params, advancedRequestOptions(options));
 }
 
 export function getSignalValidation(
   symbol: string,
   filters?: RangeFilters,
+  options?: ApiRequestOptions,
 ): Promise<SignalValidationResponse> {
   const params = buildRangeParams(filters);
   params.set('symbol', symbol.trim().toUpperCase());
-  return requestJson<SignalValidationResponse>('/performance/signal-validation', params);
+  return requestJson<SignalValidationResponse>('/performance/signal-validation', params, advancedRequestOptions(options));
 }
 
 export function getEdgeReport(
   symbol: string,
   filters?: RangeFilters,
+  options?: ApiRequestOptions,
 ): Promise<EdgeReportResponse> {
   const params = buildRangeParams(filters);
   params.set('symbol', symbol.trim().toUpperCase());
-  return requestJson<EdgeReportResponse>('/performance/edge-report', params);
+  return requestJson<EdgeReportResponse>('/performance/edge-report', params, advancedRequestOptions(options));
 }
 
 export function getModuleAttribution(
   symbol: string,
   filters?: RangeFilters,
+  options?: ApiRequestOptions,
 ): Promise<ModuleAttributionResponse> {
   const params = buildRangeParams(filters);
   params.set('symbol', symbol.trim().toUpperCase());
-  return requestJson<ModuleAttributionResponse>('/performance/module-attribution', params);
+  return requestJson<ModuleAttributionResponse>('/performance/module-attribution', params, advancedRequestOptions(options));
 }
 
 export function getSimilarSetups(
   symbol: string,
   filters?: RangeFilters,
+  options?: ApiRequestOptions,
 ): Promise<SimilarSetupResponse> {
   const params = buildRangeParams(filters);
   params.set('symbol', symbol.trim().toUpperCase());
-  return requestJson<SimilarSetupResponse>('/performance/similar-setups', params);
+  return requestJson<SimilarSetupResponse>('/performance/similar-setups', params, advancedRequestOptions(options));
 }
 
 export function getAdaptiveRecommendations(
   symbol: string,
   filters?: RangeFilters,
+  options?: ApiRequestOptions,
 ): Promise<AdaptiveRecommendationResponse> {
   const params = buildRangeParams(filters);
   params.set('symbol', symbol.trim().toUpperCase());
-  return requestJson<AdaptiveRecommendationResponse>('/performance/adaptive-recommendations', params);
+  return requestJson<AdaptiveRecommendationResponse>('/performance/adaptive-recommendations', params, advancedRequestOptions(options));
 }
 
 export function getScannerValidationReport(): Promise<ScannerValidationReportResponse> {
@@ -272,22 +310,24 @@ export function evaluateScannerValidation(): Promise<ScannerValidationEvaluateRe
 export function getPaperTradeReview(
   symbol: string,
   filters?: RangeFilters,
+  options?: ApiRequestOptions,
 ): Promise<PaperTradeReviewResponse> {
   const params = buildRangeParams(filters);
   params.set('symbol', symbol.trim().toUpperCase());
-  return requestJson<PaperTradeReviewResponse>('/performance/review', params);
+  return requestJson<PaperTradeReviewResponse>('/performance/review', params, advancedRequestOptions(options));
 }
 
 export function getProfileCalibration(
   symbol: string,
   filters?: RangeFilters & { profile?: TradingProfile },
+  options?: ApiRequestOptions,
 ): Promise<ProfileCalibrationResponse> {
   const params = buildRangeParams(filters);
   params.set('symbol', symbol.trim().toUpperCase());
   if (filters?.profile) {
     params.set('profile', filters.profile);
   }
-  return requestJson<ProfileCalibrationResponse>('/performance/profile-calibration', params);
+  return requestJson<ProfileCalibrationResponse>('/performance/profile-calibration', params, advancedRequestOptions(options));
 }
 
 export function applyProfileCalibration(
@@ -309,6 +349,7 @@ export function getProfileCalibrationComparison(
   symbol: string,
   profile: TradingProfile,
   filters?: RangeFilters & { sessionId?: string },
+  options?: ApiRequestOptions,
 ): Promise<ProfileCalibrationComparisonResponse> {
   const params = buildRangeParams(filters);
   params.set('symbol', symbol.trim().toUpperCase());
@@ -316,7 +357,7 @@ export function getProfileCalibrationComparison(
   if (filters?.sessionId) {
     params.set('session_id', filters.sessionId);
   }
-  return requestJson<ProfileCalibrationComparisonResponse>('/performance/profile-calibration/comparison', params);
+  return requestJson<ProfileCalibrationComparisonResponse>('/performance/profile-calibration/comparison', params, advancedRequestOptions(options));
 }
 
 export function getEquity(): Promise<EquityResponse> {
@@ -339,91 +380,98 @@ export function getPositions(): Promise<PositionItem[]> {
   return requestJson<PositionItem[]>('/positions');
 }
 
-export function getBotStatus(): Promise<BotStatusResponse> {
-  return requestJson<BotStatusResponse>('/bot/status');
+export function getBotStatus(options?: ApiRequestOptions): Promise<BotStatusResponse> {
+  return requestJson<BotStatusResponse>('/bot/status', undefined, requestOptions(options));
 }
 
-export function getWorkstation(symbol: string): Promise<WorkstationResponse> {
+export function getWorkstation(symbol: string, options?: ApiRequestOptions): Promise<WorkstationResponse> {
   const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
-  return requestJson<WorkstationResponse>('/bot/workstation', params);
+  return requestJson<WorkstationResponse>('/bot/workstation', params, requestOptions(options));
 }
 
 export function getCandles(
   symbol: string,
   timeframe: '1m' | '5m' | '15m' | '1h',
   limit = 120,
+  options?: ApiRequestOptions,
 ): Promise<CandleHistoryResponse> {
   const params = new URLSearchParams({
     symbol: symbol.trim().toUpperCase(),
     timeframe,
     limit: String(limit),
   });
-  return requestJson<CandleHistoryResponse>('/bot/candles', params);
+  return requestJson<CandleHistoryResponse>('/bot/candles', params, requestOptions(options));
 }
 
-export function getBackfillStatus(symbol: string): Promise<BackfillStatusResponse> {
+export function getBackfillStatus(symbol: string, options?: ApiRequestOptions): Promise<BackfillStatusResponse> {
   const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
-  return requestJson<BackfillStatusResponse>('/bot/backfill-status', params);
+  return requestJson<BackfillStatusResponse>('/bot/backfill-status', params, requestOptions(options));
 }
 
-export function triggerBackfill(symbol: string): Promise<BackfillStatusResponse> {
+export function triggerBackfill(symbol: string, options?: ApiRequestOptions): Promise<BackfillStatusResponse> {
   const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
-  return requestJson<BackfillStatusResponse>('/bot/backfill', params, { method: 'POST' });
+  return requestJson<BackfillStatusResponse>('/bot/backfill', params, {
+    method: 'POST',
+    signal: options?.signal,
+    timeoutMs: options?.timeoutMs,
+  });
 }
 
-export function getTechnicalAnalysis(symbol: string): Promise<TechnicalAnalysisResponse> {
+export function getTechnicalAnalysis(symbol: string, options?: ApiRequestOptions): Promise<TechnicalAnalysisResponse> {
   const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
-  return requestJson<TechnicalAnalysisResponse>('/bot/technical-analysis', params);
+  return requestJson<TechnicalAnalysisResponse>('/bot/technical-analysis', params, requestOptions(options));
 }
 
 export function getPatternAnalysis(
   symbol: string,
   horizon: string,
+  options?: ApiRequestOptions,
 ): Promise<PatternAnalysisResponse> {
   const params = new URLSearchParams({
     symbol: symbol.trim().toUpperCase(),
     horizon: horizon.trim().toLowerCase(),
   });
-  return requestJson<PatternAnalysisResponse>('/bot/pattern-analysis', params);
+  return requestJson<PatternAnalysisResponse>('/bot/pattern-analysis', params, advancedRequestOptions(options));
 }
 
 export function getRegimeAnalysis(
   symbol: string,
   horizon: string,
+  options?: ApiRequestOptions,
 ): Promise<RegimeAnalysisResponse> {
   const params = new URLSearchParams({
     symbol: symbol.trim().toUpperCase(),
     horizon: horizon.trim().toLowerCase(),
   });
-  return requestJson<RegimeAnalysisResponse>('/bot/regime-analysis', params);
+  return requestJson<RegimeAnalysisResponse>('/bot/regime-analysis', params, requestOptions(options));
 }
 
-export function getMarketSentiment(symbol: string): Promise<MarketSentimentResponse> {
+export function getMarketSentiment(symbol: string, options?: ApiRequestOptions): Promise<MarketSentimentResponse> {
   const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
-  return requestJson<MarketSentimentResponse>('/bot/market-sentiment', params);
+  return requestJson<MarketSentimentResponse>('/bot/market-sentiment', params, advancedRequestOptions(options));
 }
 
-export function getSymbolSentiment(symbol: string): Promise<SymbolSentimentResponse> {
+export function getSymbolSentiment(symbol: string, options?: ApiRequestOptions): Promise<SymbolSentimentResponse> {
   const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
-  return requestJson<SymbolSentimentResponse>('/bot/symbol-sentiment', params);
+  return requestJson<SymbolSentimentResponse>('/bot/symbol-sentiment', params, advancedRequestOptions(options));
 }
 
-export function getFusionSignal(symbol: string): Promise<FusionSignalResponse> {
+export function getFusionSignal(symbol: string, options?: ApiRequestOptions): Promise<FusionSignalResponse> {
   const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
-  return requestJson<FusionSignalResponse>('/bot/fusion-signal', params);
+  return requestJson<FusionSignalResponse>('/bot/fusion-signal', params, requestOptions(options));
 }
 
-export function getTradingAssistant(symbol: string): Promise<TradingAssistantResponse> {
+export function getTradingAssistant(symbol: string, options?: ApiRequestOptions): Promise<TradingAssistantResponse> {
   const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
-  return requestJson<TradingAssistantResponse>('/bot/trading-assistant', params);
+  return requestJson<TradingAssistantResponse>('/bot/trading-assistant', params, requestOptions(options));
 }
 
-export function getTradeEligibility(symbol: string, horizon?: string): Promise<TradeEligibilityResponse> {
+export function getTradeEligibility(symbol: string, horizon?: string, options?: ApiRequestOptions): Promise<TradeEligibilityResponse> {
   const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
   if (horizon) {
     params.set('horizon', horizon.trim().toLowerCase());
   }
-  return requestJson<TradeEligibilityResponse>('/bot/trade-eligibility', params);
+  return requestJson<TradeEligibilityResponse>('/bot/trade-eligibility', params, requestOptions(options));
 }
 
 export function getOpportunities(limit = 20): Promise<OpportunityResponse[]> {
@@ -471,14 +519,15 @@ export function updateFuturesLiveSubscriptions(symbols: string[]): Promise<Futur
   );
 }
 
-export function getAISignal(symbol: string): Promise<AISignalSummary | null> {
+export function getAISignal(symbol: string, options?: ApiRequestOptions): Promise<AISignalSummary | null> {
   const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
-  return requestJson<AISignalSummary | null>('/bot/ai-signal', params);
+  return requestJson<AISignalSummary | null>('/bot/ai-signal', params, advancedRequestOptions(options));
 }
 
 export function getAISignalHistory(
   symbol: string,
   filters?: Omit<Partial<HistoryFilters>, 'symbol'>,
+  options?: ApiRequestOptions,
 ): Promise<AISignalHistoryResponse> {
   const params = buildHistoryParams({
     symbol,
@@ -487,12 +536,12 @@ export function getAISignalHistory(
     limit: filters?.limit ?? 20,
     offset: filters?.offset ?? 0,
   });
-  return requestJson<AISignalHistoryResponse>('/bot/ai-signal/history', params);
+  return requestJson<AISignalHistoryResponse>('/bot/ai-signal/history', params, advancedRequestOptions(options));
 }
 
-export function getAISignalEvaluation(symbol: string): Promise<AIOutcomeEvaluationResponse> {
+export function getAISignalEvaluation(symbol: string, options?: ApiRequestOptions): Promise<AIOutcomeEvaluationResponse> {
   const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
-  return requestJson<AIOutcomeEvaluationResponse>('/bot/ai-signal/evaluation', params);
+  return requestJson<AIOutcomeEvaluationResponse>('/bot/ai-signal/evaluation', params, advancedRequestOptions(options));
 }
 
 export function getSymbols(query = '', limit = 20): Promise<SpotSymbolItem[]> {

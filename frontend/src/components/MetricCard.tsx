@@ -9,19 +9,19 @@ interface MetricCardProps {
 
 export function MetricCard({ label, value, helper, tone = 'default' }: MetricCardProps) {
   return (
-    <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
-      <p className="text-xs font-medium uppercase tracking-[0.16em] text-slate-500">{label}</p>
+    <div className="min-w-0 rounded-lg border border-borderSoft bg-cardBg/80 p-4">
+      <p className="text-xs font-medium text-textMuted">{label}</p>
       <p
         className={classNames(
-          'mt-3 text-2xl font-semibold',
-          tone === 'positive' && 'text-emerald-400',
-          tone === 'negative' && 'text-rose-400',
-          tone === 'default' && 'text-white',
+          'mt-3 truncate text-2xl font-semibold',
+          tone === 'positive' && 'text-longGreen',
+          tone === 'negative' && 'text-shortRed',
+          tone === 'default' && 'text-textPrimary',
         )}
       >
         {value}
       </p>
-      {helper ? <p className="mt-2 text-sm text-slate-400">{helper}</p> : null}
+      {helper ? <p className="mt-2 text-sm leading-5 text-textSecondary">{helper}</p> : null}
     </div>
   );
 }

@@ -2,6 +2,25 @@
 
 Chronological implementation checkpoints for Binance AI Bot.
 
+## Latest - Futures Scanner Fallback Bootstrap
+
+- Status: Completed
+- Scope:
+  - made the Futures Paper Scanner degrade gracefully when Binance USD-M APIs are temporarily unavailable
+  - persisted the full successful scanner response with scanner run metadata so failures can replay the last successful result
+  - added cached/fallback symbol-universe diagnostics, curated first-run fallback symbols, and stable empty degraded responses when no scan exists yet
+- Backend:
+  - returns `data_source=last_successful_cache` with `scan_state=degraded` when a live scan fails after a persisted successful run
+  - uses cached USD-M symbol universe first, then the curated USDT fallback list when `exchangeInfo` is unavailable
+  - skips failing futures kline symbols and returns an empty degraded state instead of a hard 500 when no cached scanner result exists
+- Frontend:
+  - shows cached degraded scanner results with a warning badge when candidates exist
+  - shows a clear no-results retry state when Binance is unavailable and no persisted result exists
+  - removed misleading "previous results remain visible" copy when there are no previous candidates
+- Validation:
+  - added backend regression coverage for cached universe fallback, curated fallback, last-successful replay, empty degraded startup, and persisted reload behavior
+  - added frontend helper coverage for cached-result and no-result scanner messaging
+
 ## No. 1 — AI Advisory History Persistence
 
 - Status: Completed
@@ -1355,6 +1374,35 @@ Chronological implementation checkpoints for Binance AI Bot.
   - performance still depends on Binance USD-M endpoint latency and local SQLite write speed
   - mark-price WebSocket heartbeat only tracks currently visible scanner symbols
   - historical validation rows created before this change may have no `data_source`
+
+## No. 40 - Symbol Switch Stability and Scanner Persistence Hardening
+
+- Status: Completed
+- Scope:
+  - stabilized frontend symbol switching after the V2 dashboard refactor
+  - split selected-symbol refresh into critical signal data first and delayed advanced analytics second
+  - added persistent scanner run/candidate and symbol cache storage for production-style review and later PostgreSQL migration
+- Frontend:
+  - added per-refresh `AbortController` cancellation and request sequence guards so old-symbol responses cannot overwrite the current symbol
+  - added 350ms selected-symbol debounce and debounced backfill triggering to avoid repeated refresh/backfill storms during rapid switching
+  - kept selected-symbol headers responsive while clearing old symbol-scoped data, so stale HYPEUSDT data does not appear under SOLUSDT
+  - moved AI history, AI evaluation, validation, edge report, module attribution, similar setups, adaptive recommendations, paper performance, and related analytics into delayed/lazy refresh paths
+  - added one non-blocking advanced-data warning instead of repeated timeout panels for non-critical analytics
+  - distinguished caller-canceled requests from real backend timeouts in the frontend API helper
+- Backend:
+  - added SQLite tables and repository methods for `scanner_runs`, `scanner_candidates`, `scanner_candidate_prices`, `symbol_candle_cache`, `symbol_analysis_cache`, and `symbol_backfill_jobs`
+  - persisted Futures Paper Scanner run metadata and candidate rows alongside existing validation snapshots and post-signal scanner snapshots
+  - mirrored stored historical candles into `symbol_candle_cache` for fast selected-symbol cache reads
+  - persisted selected-symbol backfill job state and limited concurrent backfill jobs while preserving existing stale-while-revalidate response behavior
+- Validation Run:
+  - frontend production build: `npm run build` from `frontend/` passed
+  - frontend tests: `node --test frontend\tests` passed
+  - targeted backend tests: `.\.venv\Scripts\python.exe -m pytest tests\test_storage.py tests\test_historical_backfill.py` passed
+  - full backend tests: `.\.venv\Scripts\python.exe -m pytest` passed (`264 passed`)
+  - Ruff lint: `.\.venv\Scripts\python.exe -m ruff check app tests` passed, with cache-write warnings only
+- Safety:
+  - no trading logic, scanner scoring, signal synthesis, validation math, paper broker behavior, live trading path, real futures execution, or Binance order placement was changed
+  - paper-only and advisory-only scanner behavior remains unchanged
 
 ## No. 39 - Premium Trading Dashboard UX Redesign
 

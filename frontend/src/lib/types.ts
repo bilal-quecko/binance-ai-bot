@@ -314,6 +314,11 @@ export interface FuturesOpportunityScanResponse {
   symbol_count: number;
   last_successful_fetch_at: string | null;
   latest_error: string | null;
+  data_source: string;
+  latest_successful_scanner_at: string | null;
+  latest_scanner_error: string | null;
+  persisted_candidate_count: number;
+  fallback_symbol_count: number;
 }
 
 export interface FuturesLivePriceItemResponse {

@@ -350,6 +350,87 @@ class SignalOutcomeRecord:
 
 
 @dataclass(slots=True)
+class ScannerRunRecord:
+    """Persisted scanner run metadata for replayable market scans."""
+
+    id: str
+    generated_at: datetime
+    quote_asset: str
+    horizon: str
+    max_symbols: int
+    min_opportunity_score: int
+    scan_state: str
+    scanned_count: int
+    failed_symbols_json: str
+    warnings_json: str
+    result_json: str | None = None
+    candidate_count: int = 0
+
+
+@dataclass(slots=True)
+class ScannerCandidateRecord:
+    """Persisted scanner candidate from one scanner run."""
+
+    id: str
+    scanner_run_id: str
+    symbol: str
+    direction: str
+    opportunity_score: int
+    confidence: int
+    evidence_strength: str
+    current_price: Decimal | None
+    entry_zone: str | None
+    stop_loss: Decimal | None
+    take_profit: Decimal | None
+    risk_grade: str
+    regime: str | None
+    reason: str
+    warnings_json: str
+    timestamp: datetime
+
+
+@dataclass(slots=True)
+class ScannerCandidatePriceRecord:
+    """Persisted price observation tied to a scanner candidate."""
+
+    id: int | None
+    scanner_candidate_id: str
+    symbol: str
+    price: Decimal | None
+    price_type: str
+    source: str
+    recorded_at: datetime
+
+
+@dataclass(slots=True)
+class SymbolAnalysisCacheRecord:
+    """Persisted symbol analysis cache entry."""
+
+    symbol: str
+    analysis_type: str
+    horizon: str
+    payload_json: str
+    generated_at: datetime
+    expires_at: datetime
+    data_state: str
+
+
+@dataclass(slots=True)
+class SymbolBackfillJobRecord:
+    """Persisted symbol backfill job state."""
+
+    id: str
+    symbol: str
+    interval: str
+    lookback_days: int
+    status: str
+    started_at: datetime
+    completed_at: datetime | None
+    error_message: str | None
+    candles_inserted: int
+
+
+@dataclass(slots=True)
 class RuntimeSessionRecord:
     """Persisted backend-owned runtime session state."""
 

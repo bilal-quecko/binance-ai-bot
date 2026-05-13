@@ -1,5 +1,11 @@
 import { classNames, formatCurrency, formatDateTime, formatDecimal } from '../lib/format';
 import type { LeverageOption } from '../lib/futuresLeverage';
+import {
+  buildScannerUnavailableMessage,
+  hasScannerCandidates,
+  isLastSuccessfulScannerCache,
+  scannerCandidateCount,
+} from '../lib/futures-scanner-ux.js';
 import type { FuturesLivePriceItemResponse, FuturesLivePriceResponse, FuturesOpportunityScanResponse, FuturesPaperSignalResponse } from '../lib/types';
 import { AdvancedDetailsPro } from './AdvancedDetailsPro';
 import { StatePanel } from './StatePanel';
@@ -41,22 +47,28 @@ function humanize(value: string | null | undefined): string {
 
 function cardTone(direction: FuturesPaperSignalResponse['direction']): string {
   if (direction === 'long') {
-    return 'border-emerald-500/30 bg-emerald-500/10';
+    return 'border-longGreen/30 bg-longGreen/10 shadow-greenGlow';
   }
   if (direction === 'short') {
-    return 'border-rose-500/30 bg-rose-500/10';
+    return 'border-shortRed/30 bg-shortRed/10';
   }
-  return 'border-slate-800 bg-slate-950/60';
+  if (direction === 'wait') {
+    return 'border-waitAmber/25 bg-waitAmber/8';
+  }
+  return 'border-borderSoft bg-cardBg/75';
 }
 
 function badgeTone(direction: FuturesPaperSignalResponse['direction']): string {
   if (direction === 'long') {
-    return 'border-emerald-400/40 bg-emerald-400/10 text-emerald-100';
+    return 'border-longGreen/40 bg-longGreen/10 text-emerald-100';
   }
   if (direction === 'short') {
-    return 'border-rose-400/40 bg-rose-400/10 text-rose-100';
+    return 'border-shortRed/40 bg-shortRed/10 text-rose-100';
   }
-  return 'border-slate-700 bg-slate-900/70 text-slate-200';
+  if (direction === 'wait') {
+    return 'border-waitAmber/40 bg-waitAmber/10 text-amber-100';
+  }
+  return 'border-neutralBlue/35 bg-neutralBlue/10 text-blue-100';
 }
 
 function liquidityLine(signal: FuturesPaperSignalResponse): string {
@@ -349,70 +361,69 @@ function SignalCard({
   const heatmapLabel = heatmapTag(signal);
   const livePriceLabel = priceTypeLabel(heartbeat.priceType);
   return (
-    <article className={classNames('rounded-lg border p-4 shadow-sm', cardTone(signal.direction))}>
+    <article className={classNames('min-w-0 rounded-lg border p-4 shadow-sm', cardTone(signal.direction))}>
       <div className="flex flex-wrap items-start justify-between gap-4">
-        <div>
+        <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <span className={classNames('rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em]', badgeTone(signal.direction))}>
+            <h3 className="text-lg font-semibold text-textPrimary">{signal.symbol}</h3>
+            <span className={classNames('rounded-md border px-3 py-1 text-xs font-semibold', badgeTone(signal.direction))}>
               {signal.direction.toUpperCase()}
             </span>
-            <span className={classNames('rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em]', heartbeatStatusTone(heartbeat.status))}>
+            <span className={classNames('rounded-md border px-3 py-1 text-xs font-semibold', heartbeatStatusTone(heartbeat.status))}>
               {heartbeatStatusLabel(heartbeat.status)}
             </span>
             {showSource ? (
-              <span className={classNames('rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em]', heartbeatSourceTone(heartbeat.source))}>
+              <span className={classNames('rounded-md border px-3 py-1 text-xs font-semibold', heartbeatSourceTone(heartbeat.source))}>
                 {heartbeatSourceLabel(heartbeat.source)}
               </span>
             ) : null}
-            <span className="rounded-full border border-slate-700 bg-slate-900/70 px-3 py-1 text-xs font-semibold text-slate-300">
-              Historically Accurate: {signal.validation_score !== null ? `${signal.validation_score}%` : 'not enough data'}
+            <span className="rounded-md border border-borderSoft bg-panelBgSoft px-3 py-1 text-xs font-semibold text-textSecondary">
+              Validation {signal.validation_score !== null ? `${signal.validation_score}%` : 'pending'}
             </span>
             {heatmapLabel ? (
-              <span className={classNames('rounded-full border px-3 py-1 text-xs font-semibold text-slate-300', heatmapTagTone(signal))}>
+              <span className={classNames('rounded-md border px-3 py-1 text-xs font-semibold text-slate-300', heatmapTagTone(signal))}>
                 {heatmapLabel}
               </span>
             ) : null}
-            <h3 className="text-lg font-semibold text-white">{signal.symbol}</h3>
           </div>
-          <p className="mt-3 max-w-3xl text-sm leading-6 text-slate-300">{signal.reason}</p>
-          <p className="mt-2 text-sm font-medium text-slate-200">{liquidityLine(signal)}</p>
-          <p className="mt-1 text-sm font-medium text-slate-200">{crowdLine(signal)}</p>
-          <p className="mt-1 text-sm font-medium text-slate-200">{liquidationLine(signal)}</p>
+          <p className="mt-3 max-w-3xl text-sm leading-6 text-textSecondary">{signal.reason}</p>
         </div>
-        <div className="grid min-w-44 grid-cols-2 gap-3 text-right">
-          <div>
-            <p className="text-2xl font-semibold text-white">{signal.opportunity_score}</p>
-            <p className="text-xs text-slate-500">Opportunity</p>
+        <div className="grid min-w-40 grid-cols-2 gap-3 text-right">
+          <div className="rounded-md border border-borderSoft bg-panelBg/70 p-3">
+            <p className="text-2xl font-semibold text-textPrimary">{signal.opportunity_score}</p>
+            <p className="text-xs text-textMuted">Score</p>
           </div>
-          <div>
-            <p className="text-2xl font-semibold text-white">{signal.confidence}%</p>
-            <p className="text-xs text-slate-500">Confidence</p>
+          <div className="rounded-md border border-borderSoft bg-panelBg/70 p-3">
+            <p className="text-2xl font-semibold text-textPrimary">{signal.confidence}%</p>
+            <p className="text-xs text-textMuted">Confidence</p>
           </div>
         </div>
       </div>
 
-      <div className="mt-5 grid gap-3 text-sm text-slate-300 sm:grid-cols-2 lg:grid-cols-4">
-        <div><span className="text-slate-500">Futures Scan Price</span><p>{signal.current_price ? formatCurrency(signal.current_price) : '-'}</p></div>
-        <div><span className="text-slate-500">{livePriceLabel}</span><p>{heartbeat.livePrice !== null ? formatCurrency(heartbeat.livePrice) : '-'}</p></div>
-        <div><span className="text-slate-500">Live Movement</span><p className={heartbeat.liveChangeSinceScan !== null && heartbeat.liveChangeSinceScan < 0 ? 'text-rose-200' : 'text-emerald-200'}>{formatSignedPct(heartbeat.liveChangeSinceScan)}</p></div>
-        <div><span className="text-slate-500">Updated</span><p>{heartbeat.livePriceAgeSeconds === null ? '-' : `${formatDuration(heartbeat.livePriceAgeSeconds)} ago`}</p></div>
+      <div className="mt-5 grid gap-3 text-sm text-textSecondary sm:grid-cols-2 lg:grid-cols-5">
+        <div><span className="text-textMuted">Entry</span><p className="font-semibold text-textPrimary">{signal.suggested_entry_zone ?? (signal.current_price ? formatCurrency(signal.current_price) : '-')}</p></div>
+        <div><span className="text-textMuted">Stop</span><p>{signal.suggested_stop_loss ? formatDecimal(signal.suggested_stop_loss) : '-'}</p></div>
+        <div><span className="text-textMuted">Take Profit</span><p>{signal.suggested_take_profit ? formatDecimal(signal.suggested_take_profit) : '-'}</p></div>
+        <div><span className="text-textMuted">{livePriceLabel}</span><p>{heartbeat.livePrice !== null ? formatCurrency(heartbeat.livePrice) : '-'}</p></div>
+        <div><span className="text-textMuted">Live Move</span><p className={heartbeat.liveChangeSinceScan !== null && heartbeat.liveChangeSinceScan < 0 ? 'text-rose-200' : 'text-emerald-200'}>{formatSignedPct(heartbeat.liveChangeSinceScan)}</p></div>
       </div>
 
-      <div className="mt-5 flex flex-wrap gap-2">
+      <div className="mt-5 flex flex-wrap items-center gap-2">
         <button
           type="button"
           onClick={() => onViewSignal(signal.symbol)}
-          className="rounded-lg border border-sky-400/30 bg-sky-400/10 px-3 py-2 text-sm font-medium text-sky-100 transition hover:border-sky-300 hover:bg-sky-400/20"
+          className="rounded-md border border-accentPurple/35 bg-accentPurple/15 px-3 py-2 text-sm font-medium text-violet-100 transition hover:border-accentPurple hover:bg-accentPurple/25"
         >
           View Signal
         </button>
         <button
           type="button"
           onClick={() => onSimulate(signal.symbol)}
-          className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm font-medium text-slate-200 transition hover:border-slate-500 hover:text-white"
+          className="rounded-md border border-borderSoft bg-panelBgSoft px-3 py-2 text-sm font-medium text-textSecondary transition hover:border-borderMedium hover:text-textPrimary"
         >
           Simulate
         </button>
+        <span className="text-xs text-textMuted">{liquidityLine(signal)} | {crowdLine(signal)} | {liquidationLine(signal)}</span>
       </div>
 
       <div className="mt-4">
@@ -604,7 +615,23 @@ export function FuturesPaperScannerSection({
   onRefresh,
 }: FuturesPaperScannerSectionProps) {
   if (error && !scan) {
-    return <StatePanel title="Futures paper scanner unavailable" message={error} tone="error" />;
+    return (
+      <section className="rounded-lg border border-slate-800 bg-slate-950/55 p-5 shadow-glow">
+        <StatePanel
+          title="No scanner results yet"
+          message={buildScannerUnavailableMessage(error, false)}
+          tone="empty"
+        />
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={refreshing || loading}
+          className="mt-4 rounded-lg border border-sky-400/30 bg-sky-400/10 px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-sky-100 transition hover:border-sky-300 hover:bg-sky-400/20 focus:outline-none focus:ring-2 focus:ring-sky-300/60 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          Retry Scanner
+        </button>
+      </section>
+    );
   }
   if (loading && !scan) {
     return (
@@ -615,9 +642,28 @@ export function FuturesPaperScannerSection({
     );
   }
   if (!scan) {
-    return <StatePanel title="No futures paper scan yet" message="Refresh the scanner to rank paper-only long/short opportunities." tone="empty" />;
+    return (
+      <section className="rounded-lg border border-slate-800 bg-slate-950/55 p-5 shadow-glow">
+        <StatePanel
+          title="No scanner results yet"
+          message="No scanner results yet. Run scanner when Binance API is available."
+          tone="empty"
+        />
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={refreshing || loading}
+          className="mt-4 rounded-lg border border-sky-400/30 bg-sky-400/10 px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-sky-100 transition hover:border-sky-300 hover:bg-sky-400/20 focus:outline-none focus:ring-2 focus:ring-sky-300/60 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          Retry Scanner
+        </button>
+      </section>
+    );
   }
   const livePriceBySymbol = new Map((livePrices?.items ?? []).map((item) => [item.symbol, item]));
+  const candidateCount = scannerCandidateCount(scan);
+  const hasCandidates = hasScannerCandidates(scan);
+  const showingLastSuccessfulCache = isLastSuccessfulScannerCache(scan);
 
   return (
     <section className="rounded-lg border border-slate-800 bg-slate-950/55 p-5 shadow-glow">
@@ -636,6 +682,11 @@ export function FuturesPaperScannerSection({
           {error ? (
             <span className="rounded-full border border-amber-400/35 bg-amber-400/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] text-amber-100">
               last refresh failed
+            </span>
+          ) : null}
+          {showingLastSuccessfulCache ? (
+            <span className="rounded-full border border-amber-400/35 bg-amber-400/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] text-amber-100">
+              cached degraded
             </span>
           ) : null}
           <span className="rounded-full border border-slate-700 px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] text-slate-300">
@@ -716,8 +767,16 @@ export function FuturesPaperScannerSection({
 
       {error ? (
         <div className="mb-5 rounded-lg border border-amber-500/25 bg-amber-500/10 p-4 text-sm text-amber-100">
-          <p>{error}</p>
-          <p className="mt-1 text-xs text-amber-200">Showing the previous successful futures scanner results.</p>
+          <p>{buildScannerUnavailableMessage(error, hasCandidates)}</p>
+          {hasCandidates ? (
+            <p className="mt-1 text-xs text-amber-200">Showing the last successful futures scanner result.</p>
+          ) : null}
+        </div>
+      ) : null}
+
+      {showingLastSuccessfulCache ? (
+        <div className="mb-5 rounded-lg border border-amber-500/25 bg-amber-500/10 p-4 text-sm text-amber-100">
+          Binance API unavailable; showing last successful scanner result.
         </div>
       ) : null}
 
@@ -738,15 +797,20 @@ export function FuturesPaperScannerSection({
         <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3"><span className="text-slate-500">Scanned</span><p className="mt-1 text-lg font-semibold text-white">{scan.scanned_count}</p></div>
         <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3"><span className="text-slate-500">LONG</span><p className="mt-1 text-lg font-semibold text-emerald-300">{scan.long_candidates.length}</p></div>
         <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3"><span className="text-slate-500">SHORT</span><p className="mt-1 text-lg font-semibold text-rose-300">{scan.short_candidates.length}</p></div>
-        <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3"><span className="text-slate-500">Max Leverage</span><p className="mt-1 text-lg font-semibold text-white">{scan.max_leverage_suggestion}</p></div>
+        <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3"><span className="text-slate-500">Candidates</span><p className="mt-1 text-lg font-semibold text-white">{candidateCount}</p></div>
       </div>
 
       <AdvancedDetailsPro>
         <div className="grid gap-3 text-sm text-slate-300 sm:grid-cols-2 xl:grid-cols-4">
           <div><span className="text-slate-500">Universe Source</span><p>{humanize(scan.futures_symbol_universe_source)}</p></div>
+          <div><span className="text-slate-500">Data Source</span><p>{humanize(scan.data_source)}</p></div>
           <div><span className="text-slate-500">Symbol Count</span><p>{scan.symbol_count}</p></div>
+          <div><span className="text-slate-500">Persisted Candidates</span><p>{scan.persisted_candidate_count}</p></div>
+          <div><span className="text-slate-500">Fallback Symbols</span><p>{scan.fallback_symbol_count}</p></div>
           <div><span className="text-slate-500">Last Fetch</span><p>{scan.last_successful_fetch_at ? formatDateTime(scan.last_successful_fetch_at) : '-'}</p></div>
+          <div><span className="text-slate-500">Last Successful Scan</span><p>{scan.latest_successful_scanner_at ? formatDateTime(scan.latest_successful_scanner_at) : '-'}</p></div>
           <div><span className="text-slate-500">Latest Error</span><p>{scan.latest_error ?? '-'}</p></div>
+          <div><span className="text-slate-500">Scanner Error</span><p>{scan.latest_scanner_error ?? '-'}</p></div>
         </div>
       </AdvancedDetailsPro>
 

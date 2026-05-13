@@ -16,14 +16,14 @@ interface ScannerValidationReportSectionProps {
 
 function pct(value: string | number | null | undefined): string {
   if (value === null || value === undefined) {
-    return 'not enough data';
+    return 'Collect signals';
   }
   return `${formatDecimal(value)}%`;
 }
 
 function signedPct(value: string | number | null | undefined): string {
   if (value === null || value === undefined) {
-    return 'not enough data';
+    return 'Collect signals';
   }
   const numeric = Number(value);
   return `${numeric > 0 ? '+' : ''}${formatDecimal(value)}%`;
@@ -48,7 +48,7 @@ function GroupList({ title, items }: { title: string; items: ScannerValidationGr
       <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">{title}</p>
       <div className="mt-3 space-y-2">
         {items.length === 0 ? (
-          <p className="text-sm text-slate-500">not enough data</p>
+          <p className="text-sm text-slate-500">Validation appears after enough paper signals are evaluated.</p>
         ) : (
           items.map((item) => (
             <div key={item.name} className="grid grid-cols-[1fr,auto,auto] items-center gap-3 text-sm">
