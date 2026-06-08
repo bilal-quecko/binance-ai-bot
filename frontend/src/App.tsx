@@ -42,8 +42,8 @@ import {
   getBotStatus,
   getCandles,
   getFusionSignal,
-  getFuturesOpportunities,
   getFuturesLivePrices,
+  getFuturesOpportunityScanJob,
   updateFuturesLiveSubscriptions,
   getHealth,
   getEdgeReport,
@@ -69,6 +69,7 @@ import {
   getSymbols,
   getTradingAssistant,
   getWorkstation,
+  cancelFuturesOpportunityScanJob,
   evaluateScannerValidation,
   manualBuyMarket,
   manualClosePosition,
@@ -77,9 +78,11 @@ import {
   resetBotSession,
   resumeBot,
   startBot,
+  startFuturesOpportunityScan,
   stopBot,
   triggerBackfill,
   ApiRequestError,
+  type SelectedMarket,
 } from './lib/api';
 import { badgeTone, classNames, formatCurrency, formatDateTime, formatDecimal, formatReasonCodes, pnlTone } from './lib/format';
 import {
@@ -101,8 +104,11 @@ import type {
   EdgeReportResponse,
   HealthResponse,
   FusionSignalResponse,
+  FuturesLivePriceItemResponse,
   FuturesLivePriceResponse,
+  FuturesOpportunityScanJobResponse,
   FuturesOpportunityScanResponse,
+  FuturesPaperSignalResponse,
   ModuleAttributionResponse,
   MarketSentimentResponse,
   ManualTradeResponse,
@@ -281,6 +287,10 @@ function futuresScannerErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Unable to refresh futures paper scanner.';
 }
 
+function isTerminalFuturesScanJob(job: FuturesOpportunityScanJobResponse | null): boolean {
+  return job ? ['completed', 'failed', 'cancelled'].includes(job.status) : true;
+}
+
 function describeSignal(side: string | null | undefined): string {
   if (side === 'BUY') {
     return 'Entry setup is active';
@@ -352,6 +362,20 @@ type WorkstationTab = 'discover' | 'signal' | 'simulate' | 'validate' | 'advance
 type SignalAnalysisTab = 'ai' | 'technicals' | 'liquidity' | 'sentiment' | 'validation' | 'similar' | 'notes';
 type MainSignal = 'BUY' | 'WAIT' | 'AVOID' | 'EXIT';
 
+interface FuturesSimulationDraft {
+  symbol: string;
+  direction: 'long' | 'short';
+  entryPrice: string | null;
+  livePrice: string | null;
+  stopLoss: string | null;
+  takeProfit: string | null;
+  leverageSuggestion: string | null;
+  confidence: number;
+  opportunityScore: number;
+  reason: string;
+  riskGrade: string;
+}
+
 function humanize(value: string | null | undefined): string {
   if (!value) {
     return '-';
@@ -416,6 +440,25 @@ function pctDisplay(value: number | null): string {
     return '-';
   }
   return `${value > 0 ? '+' : ''}${value.toFixed(2)}%`;
+}
+
+function futuresSimulationDraftFromSignal(
+  signal: FuturesPaperSignalResponse,
+  livePrice?: FuturesLivePriceItemResponse,
+): FuturesSimulationDraft {
+  return {
+    symbol: signal.symbol,
+    direction: signal.direction === 'short' ? 'short' : 'long',
+    entryPrice: signal.current_price,
+    livePrice: livePrice?.live_price ?? signal.current_price,
+    stopLoss: signal.suggested_stop_loss,
+    takeProfit: signal.suggested_take_profit,
+    leverageSuggestion: signal.leverage_suggestion,
+    confidence: signal.confidence,
+    opportunityScore: signal.opportunity_score,
+    reason: signal.reason,
+    riskGrade: signal.risk_grade,
+  };
 }
 
 function leverageRiskTone(label: LeverageRiskLabel): string {
@@ -527,7 +570,7 @@ function SymbolCommandBar({
     <section className="rounded-lg border border-slate-800 bg-slate-950/70 p-4 shadow-glow">
       <div className="grid gap-4 lg:grid-cols-[1.2fr,0.8fr] lg:items-end">
         <div>
-          <label className="text-sm font-medium text-slate-300" htmlFor="symbol-search">Symbol</label>
+          <label className="text-sm font-medium text-slate-300" htmlFor="symbol-search">Analyze Symbol</label>
           <div className="mt-2 flex gap-2">
             <input
               id="symbol-search"
@@ -565,7 +608,7 @@ function SymbolCommandBar({
         </div>
         <div className="flex flex-wrap items-end justify-start gap-2 lg:justify-end">
           <label className="grid gap-2 text-sm text-slate-300">
-            Profile
+            Market Sensitivity
             <select
               value={selectedTradingProfile}
               onChange={(event) => onTradingProfileChange(event.target.value as TradingProfile)}
@@ -573,9 +616,10 @@ function SymbolCommandBar({
             >
               <option value="conservative">Conservative</option>
               <option value="balanced">Balanced</option>
-              <option value="aggressive">Aggressive</option>
+              <option value="aggressive">Active</option>
             </select>
           </label>
+          <span className="basis-full text-xs font-semibold uppercase tracking-[0.14em] text-slate-500 lg:basis-auto">Paper Trading Controls</span>
           <button type="button" disabled={!selectedSymbol || actionLoading} onClick={onStart} className="rounded-lg border border-emerald-400/30 bg-emerald-400/10 px-3 py-2 text-sm font-medium text-emerald-100 disabled:cursor-not-allowed disabled:opacity-50">
             Start
           </button>
@@ -589,7 +633,7 @@ function SymbolCommandBar({
       </div>
       <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-400">
         <span className="rounded-full border border-slate-700 bg-slate-900 px-3 py-1">Selected {selectedSymbol || '-'}</span>
-        <span className="rounded-full border border-slate-700 bg-slate-900 px-3 py-1">Runtime {status.state}</span>
+        <span className="rounded-full border border-slate-700 bg-slate-900 px-3 py-1">Runtime {status.state}{status.symbol ? ` ${status.symbol}` : ''}</span>
         <span className="rounded-full border border-slate-700 bg-slate-900 px-3 py-1">Paper mode</span>
         <span className="rounded-full border border-slate-700 bg-slate-900 px-3 py-1">Advisory only</span>
         {actionMessage ? <span className="text-emerald-300">{actionMessage}</span> : null}
@@ -623,7 +667,7 @@ function SignalDecisionCard({
     return <StatePanel title="Signal unavailable" message={error} tone="error" />;
   }
   if (loading && !workstation && !fusionSignal && !tradingAssistant) {
-    return <StatePanel title="Loading signal" message={`Preparing ${selectedSymbol} signal context.`} tone="loading" />;
+    return <StatePanel title="Loading core signal" message={`Preparing ${selectedSymbol} price, candles, signal, and eligibility.`} tone="loading" />;
   }
 
   const signal = mainSignal(tradingAssistant, fusionSignal);
@@ -683,11 +727,18 @@ function SignalDecisionCard({
 
 function SimulatePanel({
   selectedSymbol,
+  selectedMarket,
+  futuresDraft,
+  futuresStopLoss,
+  futuresTakeProfit,
   workstation,
   tradingAssistant,
   fusionSignal,
   leverage,
   onLeverageChange,
+  onFuturesStopLossChange,
+  onFuturesTakeProfitChange,
+  onFuturesReset,
   actionLoading,
   actionError,
   actionMessage,
@@ -695,11 +746,18 @@ function SimulatePanel({
   onManualClose,
 }: {
   selectedSymbol: string;
+  selectedMarket: SelectedMarket;
+  futuresDraft: FuturesSimulationDraft | null;
+  futuresStopLoss: string;
+  futuresTakeProfit: string;
   workstation: WorkstationResponse | null;
   tradingAssistant: TradingAssistantResponse | null;
   fusionSignal: FusionSignalResponse | null;
   leverage: LeverageOption;
   onLeverageChange: (leverage: LeverageOption) => void;
+  onFuturesStopLossChange: (value: string) => void;
+  onFuturesTakeProfitChange: (value: string) => void;
+  onFuturesReset: () => void;
   actionLoading: boolean;
   actionError: string | null;
   actionMessage: string | null;
@@ -708,6 +766,120 @@ function SimulatePanel({
 }) {
   if (!selectedSymbol) {
     return <StatePanel title="Select a symbol" message="Choose a symbol before opening the paper simulation panel." tone="empty" />;
+  }
+
+  if (selectedMarket === 'futures') {
+    if (!futuresDraft || futuresDraft.symbol !== selectedSymbol) {
+      return (
+        <section className="rounded-lg border border-borderSoft bg-panelBg/82 p-6 shadow-glow">
+          <StatePanel
+            title="Futures Paper Simulation"
+            message="Choose Simulate on a LONG or SHORT futures scanner card to prefill this paper-only simulation."
+            tone="empty"
+          />
+        </section>
+      );
+    }
+    const simulation = simulateFuturesLeverageFromPrices({
+      direction: futuresDraft.direction,
+      entryPrice: futuresDraft.entryPrice,
+      takeProfit: futuresTakeProfit || futuresDraft.takeProfit,
+      stopLoss: futuresStopLoss || futuresDraft.stopLoss,
+      livePrice: futuresDraft.livePrice,
+      leverage,
+    });
+    const missingFuturesFields = [
+      futuresDraft.entryPrice ? null : 'Missing entry',
+      (futuresStopLoss || futuresDraft.stopLoss) ? null : 'Missing stop loss',
+      (futuresTakeProfit || futuresDraft.takeProfit) ? null : 'Missing take profit',
+    ].filter(Boolean);
+    return (
+      <section className="rounded-lg border border-borderSoft bg-panelBg/82 p-6 shadow-glow">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <div className="flex flex-wrap items-center gap-3">
+              <h2 className="text-2xl font-semibold text-textPrimary">Futures Paper Simulation - {selectedSymbol}</h2>
+              <span className={classNames('rounded-full border px-4 py-1.5 text-sm font-semibold', futuresDraft.direction === 'long' ? 'border-emerald-400/40 bg-emerald-400/10 text-emerald-100' : 'border-rose-400/40 bg-rose-400/10 text-rose-100')}>
+                {futuresDraft.direction.toUpperCase()}
+              </span>
+              <span className="rounded-md border border-amber-400/25 bg-amber-400/10 px-3 py-1 text-xs font-semibold text-amber-100">Paper Mode Only</span>
+              <span className="rounded-md border border-slate-700 bg-slate-900 px-3 py-1 text-xs font-semibold text-slate-300">No Real Orders</span>
+            </div>
+            <p className="mt-3 max-w-3xl text-sm leading-6 text-textSecondary">{futuresDraft.reason}</p>
+          </div>
+          <button
+            type="button"
+            onClick={onFuturesReset}
+            className="rounded-lg border border-borderSoft bg-panelBgSoft px-3 py-2 text-sm font-medium text-textSecondary transition hover:border-borderMedium hover:text-textPrimary"
+          >
+            Cancel / Reset
+          </button>
+        </div>
+
+        <div className="mt-6 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <MetricCard label="Entry Price" value={futuresDraft.entryPrice ? formatCurrency(futuresDraft.entryPrice) : '-'} helper="Scanner reference" />
+          <MetricCard label="Current Futures Price" value={futuresDraft.livePrice ? formatCurrency(futuresDraft.livePrice) : '-'} helper="USD-M Futures mark/last price" />
+          <MetricCard label="Confidence" value={`${futuresDraft.confidence}%`} helper={`Score ${futuresDraft.opportunityScore}`} />
+          <MetricCard label="Risk Grade" value={futuresDraft.riskGrade} helper={futuresDraft.leverageSuggestion ?? `${leverage}x paper`} />
+          <MetricCard label="Estimated TP %" value={pctDisplay(simulation.estimated_tp_return_percent)} helper="Editable target" />
+          <MetricCard label="Estimated SL %" value={pctDisplay(simulation.estimated_sl_return_percent)} helper="Editable invalidation" />
+          <MetricCard label="Live PnL %" value={pctDisplay(simulation.estimated_current_unrealized_return_percent)} helper="Display-only paper estimate" />
+          <MetricCard label="Risk Label" value={simulation.liquidation_risk_label} helper={`${leverage}x paper leverage`} tone={simulation.liquidation_risk_label === 'low' ? 'positive' : simulation.liquidation_risk_label === 'extreme' ? 'negative' : 'default'} />
+        </div>
+
+        <div className="mt-6 grid gap-4 md:grid-cols-3">
+          <label className="grid gap-2 text-sm text-textSecondary">
+            Leverage
+            <select
+              value={leverage}
+              onChange={(event) => onLeverageChange(Number(event.target.value) as LeverageOption)}
+              className="rounded-lg border border-borderSoft bg-panelBg px-3 py-2 text-sm text-textPrimary"
+            >
+              {LEVERAGE_OPTIONS.map((option) => <option key={option} value={option}>{option}x</option>)}
+            </select>
+          </label>
+          <label className="grid gap-2 text-sm text-textSecondary">
+            Stop Loss
+            <input
+              type="number"
+              value={futuresStopLoss}
+              onChange={(event) => onFuturesStopLossChange(event.target.value)}
+              className="rounded-lg border border-borderSoft bg-panelBg px-3 py-2 text-sm text-textPrimary"
+            />
+          </label>
+          <label className="grid gap-2 text-sm text-textSecondary">
+            Take Profit
+            <input
+              type="number"
+              value={futuresTakeProfit}
+              onChange={(event) => onFuturesTakeProfitChange(event.target.value)}
+              className="rounded-lg border border-borderSoft bg-panelBg px-3 py-2 text-sm text-textPrimary"
+            />
+          </label>
+        </div>
+
+        {simulation.leverage_warning ? (
+          <div className={classNames('mt-4 rounded-lg border border-rose-400/30 bg-rose-400/10 p-4 text-sm leading-6', leverageRiskTone(simulation.liquidation_risk_label))}>
+            {simulation.leverage_warning} This simulation is paper-only and does not place Binance futures orders.
+          </div>
+        ) : null}
+        {missingFuturesFields.length > 0 ? (
+          <div className="mt-4 rounded-lg border border-amber-400/25 bg-amber-400/10 p-4 text-sm text-amber-100">
+            {missingFuturesFields.join('. ')}.
+          </div>
+        ) : null}
+        <div className="mt-6 flex flex-wrap gap-2">
+          <button
+            type="button"
+            disabled
+            className="rounded-lg border border-slate-700 bg-slate-900/70 px-3 py-2 text-sm font-medium text-slate-400 disabled:cursor-not-allowed"
+          >
+            Place Futures Paper Simulation
+          </button>
+          <span className="self-center text-xs text-textMuted">Frontend-only simulation state in this slice; no real futures execution is connected.</span>
+        </div>
+      </section>
+    );
   }
 
   const signal = mainSignal(tradingAssistant, fusionSignal);
@@ -722,17 +894,27 @@ function SimulatePanel({
     livePrice: price,
     leverage,
   });
+  const spotBlockers = [
+    tradingAssistant?.data_state === 'waiting_for_history' ? 'Waiting for candles' : null,
+    tradingAssistant?.data_state === 'degraded_storage' ? 'Symbol not available on selected market.' : null,
+    signal !== 'BUY' ? 'Signal not eligible' : null,
+    tradingAssistant?.suggested_entry_zone || price ? null : 'Missing entry',
+    tradingAssistant?.suggested_stop_loss ? null : 'Missing stop loss',
+    tradingAssistant?.suggested_take_profit ? null : 'Missing take profit',
+  ].filter(Boolean);
+  const canPlaceSpotPaperTrade = spotBlockers.length === 0 && !actionLoading;
 
   return (
     <section className="rounded-lg border border-borderSoft bg-panelBg/82 p-6 shadow-glow">
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div>
           <div className="flex flex-wrap items-center gap-3">
-            <h2 className="text-2xl font-semibold text-textPrimary">Risk Simulation - {selectedSymbol}</h2>
+            <h2 className="text-2xl font-semibold text-textPrimary">Spot Paper Simulation - {selectedSymbol}</h2>
             <span className={classNames('rounded-full border px-4 py-1.5 text-sm font-semibold', signalTone(signal))}>{signal}</span>
-            <span className="rounded-md border border-longGreen/25 bg-longGreen/10 px-3 py-1 text-xs font-semibold text-emerald-100">Paper mode</span>
+            <span className="rounded-md border border-longGreen/25 bg-longGreen/10 px-3 py-1 text-xs font-semibold text-emerald-100">Paper Mode Only</span>
+            <span className="rounded-md border border-slate-700 bg-slate-900 px-3 py-1 text-xs font-semibold text-slate-300">No Real Orders</span>
           </div>
-          <p className="mt-3 max-w-2xl text-sm leading-6 text-textSecondary">Display-only paper leverage math for the selected signal. No live futures execution or real orders are enabled.</p>
+          <p className="mt-3 max-w-2xl text-sm leading-6 text-textSecondary">Review the selected Spot paper setup before using the existing manual paper trade path.</p>
         </div>
         <label className="grid gap-2 text-sm text-textSecondary">
           Leverage
@@ -754,7 +936,7 @@ function SimulatePanel({
         <MetricCard label="Estimated TP %" value={pctDisplay(simulation.estimated_tp_return_percent)} helper={simulation.fee_slippage_estimated ? 'Estimated fees/slippage' : 'Fee-adjusted inputs available'} />
         <MetricCard label="Estimated SL %" value={pctDisplay(simulation.estimated_sl_return_percent)} helper="Leveraged paper loss estimate" />
         <MetricCard label="Live PnL %" value={pctDisplay(simulation.estimated_current_unrealized_return_percent)} helper="Display-only paper estimate" />
-        <MetricCard label="Risk Label" value={simulation.liquidation_risk_label} helper={`${leverage}x paper leverage`} tone={simulation.liquidation_risk_label === 'low' ? 'positive' : simulation.liquidation_risk_label === 'extreme' ? 'negative' : 'default'} />
+        <MetricCard label="Risk Level" value={tradingAssistant?.risk_label ?? simulation.liquidation_risk_label} helper="Spot paper readiness" tone={(tradingAssistant?.risk_label ?? simulation.liquidation_risk_label) === 'low' ? 'positive' : (tradingAssistant?.risk_label ?? simulation.liquidation_risk_label) === 'high' || simulation.liquidation_risk_label === 'extreme' ? 'negative' : 'default'} />
       </div>
 
       {simulation.leverage_warning ? (
@@ -779,12 +961,17 @@ function SimulatePanel({
         </div>
         <div className="rounded-lg border border-borderSoft bg-panelBgSoft/65 p-4">
           <p className="text-sm font-semibold text-textPrimary">Manual Paper Controls</p>
+          {spotBlockers.length > 0 ? (
+            <div className="mt-3 rounded-lg border border-amber-400/25 bg-amber-400/10 p-3 text-sm text-amber-100">
+              {spotBlockers.join('. ')}.
+            </div>
+          ) : null}
           <div className="mt-4 flex flex-wrap gap-2">
-            <button type="button" disabled={actionLoading} onClick={onManualBuy} className="rounded-lg border border-emerald-400/30 bg-emerald-400/10 px-3 py-2 text-sm font-medium text-emerald-100 disabled:cursor-not-allowed disabled:opacity-50">
-              Manual Paper Buy
+            <button type="button" disabled={!canPlaceSpotPaperTrade} onClick={onManualBuy} className="rounded-lg border border-emerald-400/30 bg-emerald-400/10 px-3 py-2 text-sm font-medium text-emerald-100 disabled:cursor-not-allowed disabled:opacity-50">
+              Place Spot Paper Trade
             </button>
             <button type="button" disabled={actionLoading || !workstation?.current_position} onClick={onManualClose} className="rounded-lg border border-rose-400/30 bg-rose-400/10 px-3 py-2 text-sm font-medium text-rose-100 disabled:cursor-not-allowed disabled:opacity-50">
-              Manual Paper Close
+              Close Spot Paper Trade
             </button>
           </div>
           {actionMessage ? <p className="mt-3 text-sm text-emerald-300">{actionMessage}</p> : null}
@@ -1490,7 +1677,7 @@ function PrimaryAssistantCard({
     return <StatePanel title="Signal unavailable" message={error} tone="error" />;
   }
   if (loading && !workstation && !fusionSignal && !tradingAssistant) {
-    return <StatePanel title="Loading signal" message={`Preparing ${selectedSymbol} signal context.`} tone="loading" />;
+    return <StatePanel title="Loading core signal" message={`Preparing ${selectedSymbol} price, candles, signal, and eligibility.`} tone="loading" />;
   }
   const signal = mainSignal(tradingAssistant, fusionSignal);
   const confidence = tradingAssistant?.confidence_score ?? fusionSignal?.confidence ?? 0;
@@ -1838,6 +2025,7 @@ function App() {
   const [tradingAssistant, setTradingAssistant] = useState<RemoteState<TradingAssistantResponse | null>>(createRemoteState(INITIAL_TRADING_ASSISTANT));
   const [opportunities, setOpportunities] = useState<RemoteState<OpportunityResponse[]>>(createRemoteState(INITIAL_OPPORTUNITIES));
   const [futuresOpportunities, setFuturesOpportunities] = useState<RemoteState<FuturesOpportunityScanResponse | null>>(createRemoteState(INITIAL_FUTURES_OPPORTUNITIES));
+  const [futuresScanJob, setFuturesScanJob] = useState<FuturesOpportunityScanJobResponse | null>(null);
   const [futuresLivePrices, setFuturesLivePrices] = useState<RemoteState<FuturesLivePriceResponse | null>>(createRemoteState(INITIAL_FUTURES_LIVE_PRICES));
   const [performanceAnalytics, setPerformanceAnalytics] = useState<RemoteState<PerformanceAnalyticsResponse | null>>(createRemoteState(INITIAL_PERFORMANCE));
   const [tradeQualityAnalytics, setTradeQualityAnalytics] = useState<RemoteState<TradeQualityResponse | null>>(createRemoteState(INITIAL_TRADE_QUALITY));
@@ -1857,8 +2045,11 @@ function App() {
   const [symbolResults, setSymbolResults] = useState<RemoteState<SpotSymbolItem[]>>(createRemoteState<SpotSymbolItem[]>([]));
 
   const [selectedSymbol, setSelectedSymbol] = useState('');
+  const [selectedMarket, setSelectedMarket] = useState<SelectedMarket>('spot');
+  const [selectedFuturesSimulation, setSelectedFuturesSimulation] = useState<FuturesSimulationDraft | null>(null);
+  const [futuresSimulationStopLoss, setFuturesSimulationStopLoss] = useState('');
+  const [futuresSimulationTakeProfit, setFuturesSimulationTakeProfit] = useState('');
   const [symbolSearch, setSymbolSearch] = useState('');
-  const [hasAdoptedRuntimeSymbol, setHasAdoptedRuntimeSymbol] = useState(false);
   const [selectedPatternHorizon, setSelectedPatternHorizon] = useState<PatternHorizon>('7d');
   const [selectedChartTimeframe, setSelectedChartTimeframe] = useState<ChartTimeframe>('1m');
   const [futuresScannerFilters, setFuturesScannerFilters] = useState({
@@ -1867,6 +2058,7 @@ function App() {
     includeWeakEvidence: true,
     horizon: '7d',
     includeAvoid: true,
+    marketSensitivity: 'balanced' as TradingProfile,
   });
   const [selectedFuturesLeverage, setSelectedFuturesLeverage] = useState<LeverageOption>(5);
   const [futuresAutoRescanMinutes, setFuturesAutoRescanMinutes] = useState<0 | 5 | 15>(0);
@@ -1885,6 +2077,7 @@ function App() {
   const [debouncedSelectedSymbol, setDebouncedSelectedSymbol] = useState('');
   const [advancedDataWarning, setAdvancedDataWarning] = useState<string | null>(null);
   const selectedSymbolRef = useRef(selectedSymbol);
+  const selectedMarketRef = useRef<SelectedMarket>(selectedMarket);
   const workspaceRefreshControllerRef = useRef<AbortController | null>(null);
   const backfillControllerRef = useRef<AbortController | null>(null);
   const workspaceRefreshSequenceRef = useRef(0);
@@ -1927,8 +2120,14 @@ function App() {
   const refreshFuturesOpportunities = useCallback(async () => {
     setFuturesOpportunities((current) => setPending(current));
     try {
-      const scanData = await getFuturesOpportunities(futuresScannerFilters);
-      setFuturesOpportunities({ data: scanData, loading: false, refreshing: false, error: null });
+      const job = await startFuturesOpportunityScan(futuresScannerFilters);
+      setFuturesScanJob(job);
+      setFuturesOpportunities((current) => ({
+        data: job.scan ?? current.data,
+        loading: !job.scan && current.data === null,
+        refreshing: !job.scan && current.data !== null,
+        error: null,
+      }));
       setLastUpdatedAt(new Date());
     } catch (error) {
       const message = futuresScannerErrorMessage(error);
@@ -1941,6 +2140,30 @@ function App() {
       }));
     }
   }, [futuresScannerFilters]);
+
+  const cancelFuturesScan = useCallback(async () => {
+    if (!futuresScanJob || isTerminalFuturesScanJob(futuresScanJob)) {
+      return;
+    }
+    try {
+      const job = await cancelFuturesOpportunityScanJob(futuresScanJob.scan_id);
+      setFuturesScanJob(job);
+      setFuturesOpportunities((current) => ({
+        data: job.scan ?? current.data,
+        loading: false,
+        refreshing: false,
+        error: job.status === 'cancelled' ? null : current.error,
+      }));
+    } catch (error) {
+      const message = futuresScannerErrorMessage(error);
+      setFuturesOpportunities((current) => ({
+        ...current,
+        loading: false,
+        refreshing: false,
+        error: message,
+      }));
+    }
+  }, [futuresScanJob]);
 
   const refreshFuturesLivePrices = useCallback(async (symbols: string[]) => {
     if (symbols.length === 0) {
@@ -1997,6 +2220,8 @@ function App() {
     const includeSignal = options.includeSignal ?? true;
     const includeAutoTrade = options.includeAutoTrade ?? false;
     const requestedSymbol = symbol.trim().toUpperCase();
+    const selectedMarketForRefresh = selectedMarketRef.current;
+    const useFuturesMarket = selectedMarketForRefresh === 'futures';
     workspaceRefreshControllerRef.current?.abort();
     const controller = new AbortController();
     workspaceRefreshControllerRef.current = controller;
@@ -2072,27 +2297,21 @@ function App() {
           error: errorMessage(botStatusResult.reason, 'Unable to refresh paper runtime status.'),
         }));
       }
-      const resolvedSymbol = requestedSymbol || botStatusData?.symbol || '';
-      if (!hasAdoptedRuntimeSymbol && !requestedSymbol && !symbolSearch.trim() && botStatusData?.symbol && botStatusData.state !== 'stopped') {
-        selectedSymbolRef.current = botStatusData.symbol;
-        setSelectedSymbol(botStatusData.symbol);
-        setSymbolSearch(botStatusData.symbol);
-        setHasAdoptedRuntimeSymbol(true);
-      }
+      const resolvedSymbol = requestedSymbol;
       if (botStatusData && botStatusData.state !== 'stopped') {
         setSelectedTradingProfile(botStatusData.trading_profile);
       }
 
       if (includeSignal) {
         const criticalSignalData = await Promise.allSettled([
-          resolvedSymbol ? getWorkstation(resolvedSymbol, fastOptions) : Promise.resolve<WorkstationResponse | null>(null),
-          resolvedSymbol ? getCandles(resolvedSymbol, selectedChartTimeframe, 120, fastOptions) : Promise.resolve<CandleHistoryResponse | null>(null),
-          resolvedSymbol ? getBackfillStatus(resolvedSymbol, fastOptions) : Promise.resolve<BackfillStatusResponse | null>(null),
-          resolvedSymbol ? getTechnicalAnalysis(resolvedSymbol, fastOptions) : Promise.resolve<TechnicalAnalysisResponse | null>(null),
-          resolvedSymbol ? getRegimeAnalysis(resolvedSymbol, selectedPatternHorizon, fastOptions) : Promise.resolve<RegimeAnalysisResponse | null>(null),
-          resolvedSymbol ? getFusionSignal(resolvedSymbol, fastOptions) : Promise.resolve<FusionSignalResponse | null>(null),
-          resolvedSymbol ? getTradingAssistant(resolvedSymbol, fastOptions) : Promise.resolve<TradingAssistantResponse | null>(null),
-          resolvedSymbol ? getTradeEligibility(resolvedSymbol, undefined, fastOptions) : Promise.resolve<TradeEligibilityResponse | null>(null),
+          resolvedSymbol && !useFuturesMarket ? getWorkstation(resolvedSymbol, fastOptions) : Promise.resolve<WorkstationResponse | null>(null),
+          resolvedSymbol ? getCandles(resolvedSymbol, selectedChartTimeframe, 120, fastOptions, selectedMarketForRefresh) : Promise.resolve<CandleHistoryResponse | null>(null),
+          resolvedSymbol ? getBackfillStatus(resolvedSymbol, fastOptions, selectedMarketForRefresh) : Promise.resolve<BackfillStatusResponse | null>(null),
+          resolvedSymbol && !useFuturesMarket ? getTechnicalAnalysis(resolvedSymbol, fastOptions) : Promise.resolve<TechnicalAnalysisResponse | null>(null),
+          resolvedSymbol && !useFuturesMarket ? getRegimeAnalysis(resolvedSymbol, selectedPatternHorizon, fastOptions) : Promise.resolve<RegimeAnalysisResponse | null>(null),
+          resolvedSymbol && !useFuturesMarket ? getFusionSignal(resolvedSymbol, fastOptions) : Promise.resolve<FusionSignalResponse | null>(null),
+          resolvedSymbol && !useFuturesMarket ? getTradingAssistant(resolvedSymbol, fastOptions) : Promise.resolve<TradingAssistantResponse | null>(null),
+          resolvedSymbol && !useFuturesMarket ? getTradeEligibility(resolvedSymbol, undefined, fastOptions) : Promise.resolve<TradeEligibilityResponse | null>(null),
         ]);
         if (!isCurrentRefresh()) {
           return;
@@ -2136,14 +2355,14 @@ function App() {
           return;
         }
         const advancedSignalData = await Promise.allSettled([
-          resolvedSymbol ? getAISignal(resolvedSymbol, advancedOptions) : Promise.resolve<AISignalSummary | null>(null),
-          resolvedSymbol
+          resolvedSymbol && !useFuturesMarket ? getAISignal(resolvedSymbol, advancedOptions) : Promise.resolve<AISignalSummary | null>(null),
+          resolvedSymbol && !useFuturesMarket
             ? getAISignalHistory(resolvedSymbol, { limit: AI_HISTORY_PAGE_SIZE, offset: aiHistoryOffset }, advancedOptions)
             : Promise.resolve<AISignalHistoryResponse>(INITIAL_AI_HISTORY),
-          resolvedSymbol ? getAISignalEvaluation(resolvedSymbol, advancedOptions) : Promise.resolve<AIOutcomeEvaluationResponse | null>(null),
-          resolvedSymbol ? getMarketSentiment(resolvedSymbol, advancedOptions) : Promise.resolve<MarketSentimentResponse | null>(null),
-          resolvedSymbol ? getSymbolSentiment(resolvedSymbol, advancedOptions) : Promise.resolve<SymbolSentimentResponse | null>(null),
-          resolvedSymbol ? getPatternAnalysis(resolvedSymbol, selectedPatternHorizon, advancedOptions) : Promise.resolve<PatternAnalysisResponse | null>(null),
+          resolvedSymbol && !useFuturesMarket ? getAISignalEvaluation(resolvedSymbol, advancedOptions) : Promise.resolve<AIOutcomeEvaluationResponse | null>(null),
+          resolvedSymbol && !useFuturesMarket ? getMarketSentiment(resolvedSymbol, advancedOptions) : Promise.resolve<MarketSentimentResponse | null>(null),
+          resolvedSymbol && !useFuturesMarket ? getSymbolSentiment(resolvedSymbol, advancedOptions) : Promise.resolve<SymbolSentimentResponse | null>(null),
+          resolvedSymbol && !useFuturesMarket ? getPatternAnalysis(resolvedSymbol, selectedPatternHorizon, advancedOptions) : Promise.resolve<PatternAnalysisResponse | null>(null),
         ]);
         if (!isCurrentRefresh()) {
           return;
@@ -2183,7 +2402,7 @@ function App() {
           setAdvancedDataWarning(ADVANCED_DATA_WARNING);
         }
       }
-      if (includeAutoTrade) {
+      if (includeAutoTrade && !useFuturesMarket) {
         const autoTradeData = await Promise.allSettled([
           resolvedSymbol ? getPerformanceAnalytics(resolvedSymbol, undefined, advancedOptions) : Promise.resolve<PerformanceAnalyticsResponse | null>(null),
           resolvedSymbol ? getTradeQualityAnalytics(resolvedSymbol, undefined, advancedOptions) : Promise.resolve<TradeQualityResponse | null>(null),
@@ -2286,7 +2505,7 @@ function App() {
         setAdaptiveRecommendations((current) => ({ ...current, loading: false, refreshing: false, error: message }));
       }
     }
-  }, [aiHistoryOffset, hasAdoptedRuntimeSymbol, selectedChartTimeframe, selectedPatternHorizon, selectedTradingProfile, symbolSearch]);
+  }, [aiHistoryOffset, selectedChartTimeframe, selectedPatternHorizon, selectedTradingProfile]);
 
   useEffect(() => {
     const timeoutId = window.setTimeout(() => {
@@ -2297,13 +2516,14 @@ function App() {
 
   useEffect(() => {
     selectedSymbolRef.current = selectedSymbol;
+    selectedMarketRef.current = selectedMarket;
     workspaceRefreshControllerRef.current?.abort();
     backfillControllerRef.current?.abort();
     const timeoutId = window.setTimeout(() => {
       setDebouncedSelectedSymbol(selectedSymbol);
     }, SYMBOL_SWITCH_DEBOUNCE_MS);
     return () => window.clearTimeout(timeoutId);
-  }, [selectedSymbol]);
+  }, [selectedMarket, selectedSymbol]);
 
   useEffect(() => () => {
     workspaceRefreshControllerRef.current?.abort();
@@ -2315,7 +2535,7 @@ function App() {
       includeSignal: true,
       includeAutoTrade: ['simulate', 'validate', 'advanced'].includes(tab),
     });
-  }, [debouncedSelectedSymbol, refreshWorkspace, tab]);
+  }, [debouncedSelectedSymbol, refreshWorkspace, selectedMarket, tab]);
 
   useEffect(() => {
     void refreshOpportunities();
@@ -2324,6 +2544,67 @@ function App() {
   useEffect(() => {
     void refreshFuturesOpportunities();
   }, [refreshFuturesOpportunities]);
+
+  useEffect(() => {
+    if (!futuresScanJob || isTerminalFuturesScanJob(futuresScanJob)) {
+      return undefined;
+    }
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const job = await getFuturesOpportunityScanJob(futuresScanJob.scan_id);
+        if (cancelled) {
+          return;
+        }
+        setFuturesScanJob(job);
+        if (job.scan) {
+          setFuturesOpportunities({
+            data: job.scan,
+            loading: false,
+            refreshing: !isTerminalFuturesScanJob(job),
+            error: null,
+          });
+          if (job.status === 'completed') {
+            setLastUpdatedAt(new Date());
+          }
+        } else if (job.status === 'failed') {
+          setFuturesOpportunities((current) => ({
+            ...current,
+            loading: false,
+            refreshing: false,
+            error: 'Scanner failed. Last successful results are still shown.',
+          }));
+        }
+        if (job.status === 'cancelled') {
+          setFuturesOpportunities((current) => ({
+            ...current,
+            loading: false,
+            refreshing: false,
+            error: null,
+          }));
+        }
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        const message = futuresScannerErrorMessage(error);
+        setFuturesOpportunities((current) => ({
+          ...current,
+          loading: false,
+          refreshing: false,
+          error: message,
+        }));
+      }
+    };
+    void poll();
+    const intervalId = window.setInterval(() => {
+      void poll();
+    }, 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [futuresScanJob?.scan_id, futuresScanJob?.status]);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
@@ -2385,17 +2666,28 @@ function App() {
     if (!symbol) {
       return;
     }
+    const market = selectedMarketRef.current;
     backfillControllerRef.current?.abort();
     const controller = new AbortController();
     backfillControllerRef.current = controller;
     setBackfillStatus((current) => setPending(current));
-    void triggerBackfill(symbol, { signal: controller.signal })
+    void triggerBackfill(symbol, { signal: controller.signal }, market)
       .then((status) => {
-        if (controller.signal.aborted || selectedSymbolRef.current !== symbol.toUpperCase()) {
+        if (
+          controller.signal.aborted
+          || selectedSymbolRef.current !== symbol.toUpperCase()
+          || selectedMarketRef.current !== market
+        ) {
           return;
         }
         setBackfillStatus({ data: status, loading: false, refreshing: false, error: null });
         setLastUpdatedAt(new Date());
+        if (status.status === 'ready' || status.status === 'partial') {
+          void refreshWorkspace(symbol, {
+            includeSignal: true,
+            includeAutoTrade: ['simulate', 'validate', 'advanced'].includes(tab),
+          });
+        }
       })
       .catch((error) => {
         if (controller.signal.aborted || isCanceledRequest(error)) {
@@ -2405,7 +2697,52 @@ function App() {
         setBackfillStatus((current) => ({ ...current, loading: false, refreshing: false, error: message }));
       });
     return () => controller.abort();
-  }, [debouncedSelectedSymbol]);
+  }, [debouncedSelectedSymbol, refreshWorkspace, selectedMarket, tab]);
+
+  useEffect(() => {
+    const symbol = debouncedSelectedSymbol.trim();
+    const status = backfillStatus.data?.status;
+    if (!symbol || !status || !['loading', 'not_started'].includes(status)) {
+      return undefined;
+    }
+    const market = selectedMarketRef.current;
+    let cancelled = false;
+    const intervalId = window.setInterval(() => {
+      void getBackfillStatus(symbol, undefined, market)
+        .then((nextStatus) => {
+          if (
+            cancelled
+            || selectedSymbolRef.current !== symbol.toUpperCase()
+            || selectedMarketRef.current !== market
+          ) {
+            return;
+          }
+          setBackfillStatus({ data: nextStatus, loading: false, refreshing: nextStatus.status === 'loading', error: null });
+          if (nextStatus.status === 'ready' || nextStatus.status === 'partial') {
+            window.clearInterval(intervalId);
+            void refreshWorkspace(symbol, {
+              includeSignal: true,
+              includeAutoTrade: ['simulate', 'validate', 'advanced'].includes(tab),
+            });
+          }
+          if (nextStatus.status === 'failed') {
+            window.clearInterval(intervalId);
+          }
+        })
+        .catch((error) => {
+          if (cancelled || isCanceledRequest(error)) {
+            return;
+          }
+          const message = error instanceof Error ? error.message : 'Unable to refresh historical backfill status.';
+          setBackfillStatus((current) => ({ ...current, loading: false, refreshing: false, error: message }));
+          window.clearInterval(intervalId);
+        });
+    }, 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [backfillStatus.data?.status, debouncedSelectedSymbol, refreshWorkspace, selectedMarket, tab]);
 
   useEffect(() => {
     if (autoRefreshSeconds === 0 || selectedSymbol.trim().length === 0) {
@@ -2423,21 +2760,34 @@ function App() {
       workspaceRefreshControllerRef.current?.abort();
       backfillControllerRef.current?.abort();
       selectedSymbolRef.current = '';
+      selectedMarketRef.current = 'spot';
       setSelectedSymbol('');
+      setSelectedMarket('spot');
+      setSelectedFuturesSimulation(null);
+      setFuturesSimulationStopLoss('');
+      setFuturesSimulationTakeProfit('');
     }
     setBotActionError(null);
     setBotActionMessage(null);
   }, [selectedSymbol]);
 
-  const handleSelectSymbol = useCallback((symbol: string) => {
+  const handleSelectSymbol = useCallback((
+    symbol: string,
+    market: SelectedMarket = 'spot',
+    futuresDraft: FuturesSimulationDraft | null = null,
+  ) => {
     const normalizedSymbol = symbol.trim().toUpperCase();
     workspaceRefreshControllerRef.current?.abort();
     backfillControllerRef.current?.abort();
     selectedSymbolRef.current = normalizedSymbol;
+    selectedMarketRef.current = market;
     setAiHistoryOffset(0);
     setSelectedSymbol(normalizedSymbol);
+    setSelectedMarket(market);
+    setSelectedFuturesSimulation(futuresDraft);
+    setFuturesSimulationStopLoss(futuresDraft?.stopLoss ?? '');
+    setFuturesSimulationTakeProfit(futuresDraft?.takeProfit ?? '');
     setSymbolSearch(normalizedSymbol);
-    setHasAdoptedRuntimeSymbol(true);
     setAdvancedDataWarning(null);
     setBotActionError(null);
     setBotActionMessage(null);
@@ -2471,10 +2821,14 @@ function App() {
     workspaceRefreshControllerRef.current?.abort();
     backfillControllerRef.current?.abort();
     selectedSymbolRef.current = '';
+    selectedMarketRef.current = 'spot';
     setAiHistoryOffset(0);
     setSelectedSymbol('');
+    setSelectedMarket('spot');
+    setSelectedFuturesSimulation(null);
+    setFuturesSimulationStopLoss('');
+    setFuturesSimulationTakeProfit('');
     setSymbolSearch('');
-    setHasAdoptedRuntimeSymbol(true);
     setAdvancedDataWarning(null);
     setBotActionError(null);
     setBotActionMessage(null);
@@ -2516,15 +2870,8 @@ function App() {
     let refreshSymbol = selectedSymbol;
     try {
       const nextStatus = await action();
-      refreshSymbol = nextStatus.symbol ?? selectedSymbol;
       setBotStatus({ data: nextStatus, loading: false, refreshing: false, error: null });
       setSelectedTradingProfile(nextStatus.trading_profile);
-      if (nextStatus.symbol) {
-        setAiHistoryOffset(0);
-        selectedSymbolRef.current = nextStatus.symbol;
-        setSelectedSymbol(nextStatus.symbol);
-        setSymbolSearch(nextStatus.symbol);
-      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to update the paper bot.';
       setBotActionError(message);
@@ -2612,46 +2959,74 @@ function App() {
   }, []);
 
   const effectiveWorkstation = useMemo(() => {
+    if (selectedMarket !== 'spot') {
+      return null;
+    }
     if (workstation.data?.symbol === selectedSymbol) {
       return workstation.data;
     }
     return null;
-  }, [selectedSymbol, workstation.data]);
+  }, [selectedMarket, selectedSymbol, workstation.data]);
   const effectiveAiSignal = useMemo(() => {
+    if (selectedMarket !== 'spot') {
+      return null;
+    }
     if (aiSignal.data?.symbol === selectedSymbol) {
       return aiSignal.data;
     }
     return null;
-  }, [aiSignal.data, selectedSymbol]);
+  }, [aiSignal.data, selectedMarket, selectedSymbol]);
   const effectiveFusionSignal = useMemo(() => {
+    if (selectedMarket !== 'spot') {
+      return null;
+    }
     if (fusionSignal.data?.symbol === selectedSymbol) {
       return fusionSignal.data;
     }
     return null;
-  }, [fusionSignal.data, selectedSymbol]);
+  }, [fusionSignal.data, selectedMarket, selectedSymbol]);
   const effectiveTradingAssistant = useMemo(() => {
+    if (selectedMarket !== 'spot') {
+      return null;
+    }
     if (tradingAssistant.data?.symbol === selectedSymbol) {
       return tradingAssistant.data;
     }
     return null;
-  }, [selectedSymbol, tradingAssistant.data]);
+  }, [selectedMarket, selectedSymbol, tradingAssistant.data]);
   const effectiveTradeEligibility = useMemo(() => {
+    if (selectedMarket !== 'spot') {
+      return null;
+    }
     if (tradeEligibility.data?.symbol === selectedSymbol) {
       return tradeEligibility.data;
     }
     return null;
-  }, [selectedSymbol, tradeEligibility.data]);
+  }, [selectedMarket, selectedSymbol, tradeEligibility.data]);
   const effectiveRegimeAnalysis = useMemo(() => {
+    if (selectedMarket !== 'spot') {
+      return null;
+    }
     if (regimeAnalysis.data?.symbol === selectedSymbol) {
       return regimeAnalysis.data;
     }
     return null;
-  }, [regimeAnalysis.data, selectedSymbol]);
+  }, [regimeAnalysis.data, selectedMarket, selectedSymbol]);
 
-  const trendLabel = effectiveWorkstation?.trend_bias ?? 'Start paper runtime to collect live market context.';
-  const workstationDataState = effectiveWorkstation?.data_state ?? 'waiting_for_runtime';
-  const workstationStatusMessage = effectiveWorkstation?.status_message ?? (selectedSymbol ? `Start or attach the live runtime for ${selectedSymbol} to populate symbol-scoped workstation data.` : 'Select one symbol to populate the workstation.');
-  const signalExplanation = effectiveWorkstation?.explanation ?? 'Select a symbol, then start or pause the live paper runtime to populate live signal state.';
+  const trendLabel = effectiveWorkstation?.trend_bias ?? (selectedMarket === 'futures' ? 'Using USD-M Futures scanner context.' : 'Start paper runtime to collect live market context.');
+  const workstationDataState = effectiveWorkstation?.data_state ?? (selectedMarket === 'futures' ? 'waiting_for_history' : 'waiting_for_runtime');
+  const workstationStatusMessage = effectiveWorkstation?.status_message ?? (
+    selectedSymbol
+      ? (selectedMarket === 'futures'
+        ? `USD-M Futures analysis for ${selectedSymbol} uses futures candles and scanner simulation context.`
+        : `Start or attach the live runtime for ${selectedSymbol} to populate symbol-scoped workstation data.`)
+      : 'Select one symbol to populate the workstation.'
+  );
+  const signalExplanation = effectiveWorkstation?.explanation ?? (
+    selectedMarket === 'futures'
+      ? 'Futures scanner simulation is paper-only and does not require starting the Spot paper runtime.'
+      : 'Select a symbol, then start or pause the live paper runtime to populate live signal state.'
+  );
   const refreshLabel = autoRefreshSeconds === 0 ? 'Off' : `${autoRefreshSeconds}s`;
   const readiness = effectiveWorkstation?.trade_readiness ?? null;
   const derivedMidPrice = effectiveWorkstation?.feature?.mid_price ?? computeMidPrice(effectiveWorkstation);
@@ -2785,12 +3160,29 @@ function App() {
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="flex flex-wrap items-center gap-2 text-xs text-textSecondary">
                 <span className="rounded-md border border-borderSoft bg-panelBgSoft px-3 py-1">Selected {selectedSymbol || '-'}</span>
-                <span className="rounded-md border border-borderSoft bg-panelBgSoft px-3 py-1">Runtime {botStatus.data.state}</span>
-                <span className="rounded-md border border-borderSoft bg-panelBgSoft px-3 py-1">Profile {selectedTradingProfile}</span>
+                <span className="rounded-md border border-borderSoft bg-panelBgSoft px-3 py-1">Market {selectedMarket.toUpperCase()}</span>
+                <span className="rounded-md border border-borderSoft bg-panelBgSoft px-3 py-1">Runtime {botStatus.data.state}{botStatus.data.symbol ? ` ${botStatus.data.symbol}` : ''}</span>
+                <span className="rounded-md border border-borderSoft bg-panelBgSoft px-3 py-1">Sensitivity {selectedTradingProfile === 'aggressive' ? 'active' : selectedTradingProfile}</span>
+                {selectedSymbol && (workstation.loading || tradingAssistant.loading || fusionSignal.loading) ? (
+                  <span className="rounded-md border border-sky-400/25 bg-sky-400/10 px-3 py-1 text-sky-100">Loading core signal</span>
+                ) : null}
+                {selectedSymbol && !workstation.loading && (aiSignal.loading || marketSentiment.loading || symbolSentiment.loading || patternAnalysis.loading) ? (
+                  <span className="rounded-md border border-violet-400/25 bg-violet-400/10 px-3 py-1 text-violet-100">Advanced details updating</span>
+                ) : null}
+                {selectedSymbol && backfillStatus.data?.status === 'loading' ? (
+                  <span className="rounded-md border border-sky-400/25 bg-sky-400/10 px-3 py-1 text-sky-100">Fetching historical candles</span>
+                ) : null}
+                {selectedSymbol && backfillStatus.data?.status === 'ready' ? (
+                  <span className="rounded-md border border-emerald-400/25 bg-emerald-400/10 px-3 py-1 text-emerald-100">Backfill complete</span>
+                ) : null}
+                {selectedSymbol && backfillStatus.data?.status === 'failed' ? (
+                  <span className="rounded-md border border-rose-400/25 bg-rose-400/10 px-3 py-1 text-rose-100">Backfill failed</span>
+                ) : null}
                 <span className="rounded-md border border-longGreen/25 bg-longGreen/10 px-3 py-1 text-emerald-100">Paper Mode</span>
               </div>
               <div className="flex flex-wrap gap-2">
-                <button type="button" disabled={!selectedSymbol || botActionLoading} onClick={() => void runBotAction(() => startBot(selectedSymbol, selectedTradingProfile))} className="rounded-md border border-emerald-400/30 bg-emerald-400/10 px-3 py-2 text-xs font-semibold text-emerald-100 disabled:cursor-not-allowed disabled:opacity-50">Start</button>
+                <span className="self-center text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Paper Trading Controls</span>
+                <button type="button" disabled={!selectedSymbol || selectedMarket !== 'spot' || botActionLoading} onClick={() => void runBotAction(() => startBot(selectedSymbol, selectedTradingProfile))} className="rounded-md border border-emerald-400/30 bg-emerald-400/10 px-3 py-2 text-xs font-semibold text-emerald-100 disabled:cursor-not-allowed disabled:opacity-50">Start</button>
                 <button type="button" disabled={botStatus.data.state === 'stopped' || botActionLoading} onClick={() => void runBotAction(() => (botStatus.data.state === 'paused' ? resumeBot() : pauseBot()))} className="rounded-md border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs font-semibold text-amber-100 disabled:cursor-not-allowed disabled:opacity-50">{botStatus.data.state === 'paused' ? 'Resume' : 'Pause'}</button>
                 <button type="button" disabled={botStatus.data.state === 'stopped' || botActionLoading} onClick={() => void runBotAction(stopBot)} className="rounded-md border border-rose-400/30 bg-rose-400/10 px-3 py-2 text-xs font-semibold text-rose-100 disabled:cursor-not-allowed disabled:opacity-50">Stop</button>
               </div>
@@ -2813,6 +3205,7 @@ function App() {
             <ErrorBoundary fallbackTitle="Futures paper scanner unavailable">
               <FuturesPaperScannerSection
                 scan={futuresOpportunities.data}
+                scanJob={futuresScanJob}
                 loading={futuresOpportunities.loading}
                 refreshing={futuresOpportunities.refreshing}
                 error={futuresOpportunities.error}
@@ -2830,11 +3223,13 @@ function App() {
                   handleSelectSymbol(symbol);
                   setTab('signal');
                 }}
-                onSimulate={(symbol) => {
-                  handleSelectSymbol(symbol);
+                onSimulate={(signal, livePrice) => {
+                  const draft = futuresSimulationDraftFromSignal(signal, livePrice);
+                  handleSelectSymbol(signal.symbol, 'futures', draft);
                   setTab('simulate');
                 }}
                 onRefresh={() => void refreshFuturesOpportunities()}
+                onCancelScan={() => void cancelFuturesScan()}
               />
             </ErrorBoundary>
           ) : null}
@@ -2895,11 +3290,22 @@ function App() {
           <div className="space-y-5">
             <SimulatePanel
               selectedSymbol={selectedSymbol}
+              selectedMarket={selectedMarket}
+              futuresDraft={selectedFuturesSimulation}
+              futuresStopLoss={futuresSimulationStopLoss}
+              futuresTakeProfit={futuresSimulationTakeProfit}
               workstation={effectiveWorkstation}
               tradingAssistant={effectiveTradingAssistant}
               fusionSignal={effectiveFusionSignal}
               leverage={selectedFuturesLeverage}
               onLeverageChange={setSelectedFuturesLeverage}
+              onFuturesStopLossChange={setFuturesSimulationStopLoss}
+              onFuturesTakeProfitChange={setFuturesSimulationTakeProfit}
+              onFuturesReset={() => {
+                setSelectedFuturesSimulation(null);
+                setFuturesSimulationStopLoss('');
+                setFuturesSimulationTakeProfit('');
+              }}
               actionLoading={botActionLoading}
               actionError={botActionError}
               actionMessage={botActionMessage}

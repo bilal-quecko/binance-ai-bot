@@ -81,10 +81,10 @@ export function explainPrimaryBlocker(readiness) {
       };
     case 'VOL_TOO_LOW':
       return {
-        title: 'Movement is too quiet',
-        happened: 'Current volatility is too weak to activate the setup.',
-        why: 'Low movement often means there is not enough edge to overcome costs.',
-        action: 'Wait for stronger movement or a clearer trend impulse.',
+        title: 'Low volatility without edge',
+        happened: 'No trade because volatility is too low and no clean range edge is confirmed.',
+        why: 'Slow markets need a visible breakout, sweep, continuation, or range-edge setup before paper entries are justified.',
+        action: 'Wait for a cleaner range edge, liquidity sweep, or compression breakout.',
         category: 'setup_quality',
       };
     case 'VOL_TOO_HIGH':

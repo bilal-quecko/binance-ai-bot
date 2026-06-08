@@ -35,6 +35,16 @@ FuturesDirection = Literal["long", "short", "wait", "avoid"]
 FuturesEvidenceStrength = Literal["insufficient", "unvalidated", "weak", "mixed", "promising", "strong"]
 FuturesRiskGrade = Literal["low", "medium", "high"]
 FuturesScanState = Literal["ready", "partial", "insufficient_data", "degraded"]
+MarketSensitivity = Literal["conservative", "balanced", "aggressive"]
+SlowMarketSetup = Literal[
+    "none",
+    "range_breakout",
+    "liquidity_sweep_reversal",
+    "compression_breakout",
+    "mean_reversion_range_edge",
+    "low_volatility_continuation",
+    "low_volatility_no_edge",
+]
 
 MIN_CANDLES_FOR_FUTURES_SIGNAL = 24
 MAX_PAPER_LEVERAGE = 3
@@ -74,6 +84,9 @@ class FuturesPaperSignal:
     eligibility_status: str
     warnings: tuple[str, ...]
     timestamp: datetime
+    market_sensitivity: MarketSensitivity = "balanced"
+    slow_market_setup: SlowMarketSetup = "none"
+    slow_market_reason: str | None = None
     data_source: str = "binance_usdm_futures"
     price_type: str = "futures_last_price"
     liquidity_bias: str = "neutral"
@@ -154,6 +167,7 @@ class FuturesSignalContext:
     open_interest: Decimal | None = None
     oi_trend: str = "neutral"
     liquidation_intelligence: LiquidationIntelligenceSnapshot | None = None
+    market_sensitivity: MarketSensitivity = "balanced"
 
 
 class FuturesOpportunityScanner:
@@ -209,6 +223,7 @@ class FuturesOpportunityScanner:
         regime = context.regime_analysis
         liquidity = _liquidity_snapshot(context)
         market_scores = _market_scores(context.candles, context.higher_timeframe_candles)
+        slow_setup = _slow_market_setup(context, market_scores=market_scores)
         evidence_strength = _evidence_strength(context.similar_setup, context.trade_eligibility)
         validation_score = _validation_score(evidence_strength)
         regime_label = regime.regime_label if regime is not None else None
@@ -235,6 +250,11 @@ class FuturesOpportunityScanner:
         fee_impact = _estimated_fee_impact(context.spread_ratio_pct)
         long_score = _long_score(context, market_scores=market_scores)
         short_score = _short_score(context, market_scores=market_scores)
+        if context.market_sensitivity == "aggressive" and slow_setup.is_clean:
+            if slow_setup.direction_bias == "long":
+                long_score = min(100, long_score + 8)
+            elif slow_setup.direction_bias == "short":
+                short_score = min(100, short_score + 8)
         current_direction_score = max(long_score, short_score)
         opportunity_score = _opportunity_score(
             direction_score=current_direction_score,
@@ -261,6 +281,8 @@ class FuturesOpportunityScanner:
             blocker_reasons=context.blocker_reasons,
             eligibility_status=eligibility_status,
             fee_impact=fee_impact,
+            slow_setup=slow_setup,
+            market_sensitivity=context.market_sensitivity,
         )
         if blocking_reason is not None:
             return _build_signal(
@@ -279,9 +301,13 @@ class FuturesOpportunityScanner:
                 warnings=tuple(warnings),
                 liquidity=liquidity,
                 timestamp=timestamp,
+                slow_setup=slow_setup,
             )
 
-        if opportunity_score >= 70 and long_score >= short_score + 10:
+        action_threshold = _action_threshold(context.market_sensitivity, slow_setup)
+        direction_gap = 8 if context.market_sensitivity == "aggressive" and slow_setup.is_clean else 10
+
+        if opportunity_score >= action_threshold and long_score >= short_score + direction_gap:
             long_confidence = _liquidity_adjusted_confidence(
                 direction="long",
                 liquidity=liquidity,
@@ -304,13 +330,15 @@ class FuturesOpportunityScanner:
                     evidence_strength=evidence_strength,
                     trend=market_scores.trend,
                     momentum=market_scores.momentum,
+                    slow_setup=slow_setup,
                 ),
                 warnings=tuple(warnings),
                 liquidity=liquidity,
                 timestamp=timestamp,
+                slow_setup=slow_setup,
             )
 
-        if opportunity_score >= 70 and short_score >= long_score + 10:
+        if opportunity_score >= action_threshold and short_score >= long_score + direction_gap:
             short_confidence = _liquidity_adjusted_confidence(
                 direction="short",
                 liquidity=liquidity,
@@ -333,13 +361,19 @@ class FuturesOpportunityScanner:
                     evidence_strength=evidence_strength,
                     trend=market_scores.trend,
                     momentum=market_scores.momentum,
+                    slow_setup=slow_setup,
                 ),
                 warnings=tuple(warnings),
                 liquidity=liquidity,
                 timestamp=timestamp,
+                slow_setup=slow_setup,
             )
 
         wait_reason = "No high-quality LONG/SHORT candidate found for this symbol under current structure."
+        if slow_setup.setup == "low_volatility_no_edge":
+            wait_reason = "No trade: low volatility without edge."
+        elif slow_setup.is_clean:
+            wait_reason = slow_setup.reason
         if opportunity_score >= 50:
             wait_reason = "Potential setup is forming, but trend and momentum still need cleaner confirmation."
         return _build_signal(
@@ -358,6 +392,7 @@ class FuturesOpportunityScanner:
             warnings=tuple(warnings),
             liquidity=liquidity,
             timestamp=timestamp,
+            slow_setup=slow_setup,
         )
 
     def build_report(
@@ -436,6 +471,7 @@ def _build_signal(
     warnings: tuple[str, ...],
     liquidity: LiquidityBiasSnapshot | None = None,
     timestamp: datetime,
+    slow_setup: "SlowMarketRead | None" = None,
 ) -> FuturesPaperSignal:
     stop_loss, take_profit = _risk_levels(direction=direction, candles=context.candles, current_price=current_price)
     liquidity_snapshot = liquidity or _liquidity_snapshot(context)
@@ -453,6 +489,7 @@ def _build_signal(
     )
     zone_note = _crowd_note(context.crowd_positioning) or _liquidity_zone_note(direction=direction, zones=liquidity_zones)
     liquidation = context.liquidation_intelligence or NEUTRAL_LIQUIDATION_INTELLIGENCE
+    slow = slow_setup or SlowMarketRead()
     return FuturesPaperSignal(
         symbol=context.symbol,
         direction=direction,
@@ -487,6 +524,9 @@ def _build_signal(
         eligibility_status=_eligibility_status(context.trade_eligibility),
         warnings=tuple(dict.fromkeys((*warnings, *_liquidity_zone_warnings(liquidity_zones)))),
         timestamp=timestamp,
+        market_sensitivity=context.market_sensitivity,
+        slow_market_setup=slow.setup,
+        slow_market_reason=slow.reason,
         liquidity_bias=liquidity_snapshot.liquidity_bias,
         liquidity_pressure=liquidity_snapshot.liquidity_pressure,
         likely_liquidation_direction=liquidity_snapshot.likely_liquidation_direction,
@@ -535,6 +575,14 @@ class MarketOpportunityScores:
     risk_score: int
     bullish_direction_score: int
     bearish_direction_score: int
+
+
+@dataclass(slots=True)
+class SlowMarketRead:
+    setup: SlowMarketSetup = "none"
+    reason: str | None = None
+    direction_bias: Literal["long", "short", "none"] = "none"
+    is_clean: bool = False
 
 
 def _long_score(context: FuturesSignalContext, *, market_scores: MarketOpportunityScores) -> int:
@@ -629,6 +677,8 @@ def _blocking_reason(
     blocker_reasons: Sequence[str],
     eligibility_status: str,
     fee_impact: Decimal | None,
+    slow_setup: "SlowMarketRead",
+    market_sensitivity: MarketSensitivity,
 ) -> str | None:
     if blocker_reasons:
         return "Current blockers are active, so this symbol is AVOID for paper futures."
@@ -638,9 +688,22 @@ def _blocking_reason(
         return "Internal eligibility evidence is negative, so this symbol is AVOID for paper futures."
     if fee_impact is not None and fee_impact >= Decimal("0.45"):
         return "Estimated fee/spread impact is too high for a clean paper futures candidate."
+    if (
+        slow_setup.setup == "low_volatility_no_edge"
+        and market_sensitivity != "aggressive"
+    ):
+        return "No trade: low volatility without edge."
     if risk_grade == "high":
         return "Current volatility, liquidity, or risk conditions are too weak for a paper futures candidate."
     return None
+
+
+def _action_threshold(market_sensitivity: MarketSensitivity, slow_setup: "SlowMarketRead") -> int:
+    if market_sensitivity == "conservative":
+        return 76
+    if market_sensitivity == "aggressive" and slow_setup.is_clean:
+        return 62
+    return 70
 
 
 def _evidence_strength(
@@ -857,6 +920,138 @@ def _market_scores(
     )
 
 
+def _slow_market_setup(
+    context: FuturesSignalContext,
+    *,
+    market_scores: MarketOpportunityScores,
+) -> SlowMarketRead:
+    candles = list(context.candles[-32:])
+    if len(candles) < 24:
+        return SlowMarketRead()
+    current = candles[-1].close
+    if current <= Decimal("0"):
+        return SlowMarketRead()
+    recent_ranges = [
+        ((candle.high - candle.low) / candle.close) * Decimal("100")
+        for candle in candles[-16:]
+        if candle.close > Decimal("0")
+    ]
+    if not recent_ranges:
+        return SlowMarketRead()
+    average_range_pct = _simple_average(recent_ranges)
+    low_volatility = average_range_pct <= Decimal("0.18") or market_scores.volatility_quality_score <= 62
+    if not low_volatility:
+        return SlowMarketRead()
+
+    range_high = max(candle.high for candle in candles[-24:])
+    range_low = min(candle.low for candle in candles[-24:])
+    range_width_pct = ((range_high - range_low) / current) * Decimal("100")
+    if range_width_pct <= Decimal("0"):
+        return SlowMarketRead(setup="low_volatility_no_edge", reason="No trade: low volatility without edge.")
+    upper_distance_pct = ((range_high - current) / current) * Decimal("100")
+    lower_distance_pct = ((current - range_low) / current) * Decimal("100")
+    compression = average_range_pct <= Decimal("0.10") and range_width_pct <= Decimal("1.20")
+    technical = context.technical_analysis
+    liquidity = context.liquidity_bias
+    liquidity_clean = liquidity is None or (
+        liquidity.liquidity_pressure != "high" and liquidity.trap_risk == "low"
+    )
+    trend_clean = market_scores.trend in {"bullish", "bearish"} and market_scores.trend_score >= 48
+    breakout_bias = technical.breakout_bias if technical is not None else None
+    breakout_ready = technical.breakout_readiness in {"medium", "high"} if technical is not None else False
+    if market_scores.trend_score < 35 and market_scores.momentum_score < 25:
+        return SlowMarketRead(
+            setup="low_volatility_no_edge",
+            reason="No trade: low volatility without edge.",
+            direction_bias="none",
+            is_clean=False,
+        )
+
+    if compression and trend_clean and liquidity_clean:
+        if market_scores.bullish_direction_score >= market_scores.bearish_direction_score:
+            return SlowMarketRead(
+                setup="low_volatility_continuation",
+                reason="Slow market: low-volatility continuation setup.",
+                direction_bias="long",
+                is_clean=True,
+            )
+        return SlowMarketRead(
+            setup="low_volatility_continuation",
+            reason="Slow market: low-volatility continuation setup.",
+            direction_bias="short",
+            is_clean=True,
+        )
+
+    if compression:
+        if not breakout_ready:
+            return SlowMarketRead(
+                setup="low_volatility_no_edge",
+                reason="No trade: low volatility without edge.",
+                direction_bias="none",
+                is_clean=False,
+            )
+        return SlowMarketRead(
+            setup="compression_breakout",
+            reason="Slow market: compression building.",
+            direction_bias="none",
+            is_clean=liquidity_clean,
+        )
+
+    if breakout_ready and breakout_bias == "upside" and upper_distance_pct <= Decimal("0.35") and liquidity_clean:
+        return SlowMarketRead(
+            setup="range_breakout",
+            reason="Slow market: range breakout candidate.",
+            direction_bias="long",
+            is_clean=True,
+        )
+    if breakout_ready and breakout_bias == "downside" and lower_distance_pct <= Decimal("0.35") and liquidity_clean:
+        return SlowMarketRead(
+            setup="range_breakout",
+            reason="Slow market: range breakout candidate.",
+            direction_bias="short",
+            is_clean=True,
+        )
+
+    if liquidity is not None and liquidity.trap_risk == "short_trap" and lower_distance_pct <= Decimal("0.40"):
+        return SlowMarketRead(
+            setup="liquidity_sweep_reversal",
+            reason="Slow market: liquidity sweep reversal candidate.",
+            direction_bias="long",
+            is_clean=liquidity.liquidity_pressure != "high",
+        )
+    if liquidity is not None and liquidity.trap_risk == "long_trap" and upper_distance_pct <= Decimal("0.40"):
+        return SlowMarketRead(
+            setup="liquidity_sweep_reversal",
+            reason="Slow market: liquidity sweep reversal candidate.",
+            direction_bias="short",
+            is_clean=liquidity.liquidity_pressure != "high",
+        )
+
+    near_upper_edge = upper_distance_pct <= Decimal("0.30")
+    near_lower_edge = lower_distance_pct <= Decimal("0.30")
+    if near_lower_edge and market_scores.bearish_direction_score < market_scores.bullish_direction_score + 15 and liquidity_clean:
+        return SlowMarketRead(
+            setup="mean_reversion_range_edge",
+            reason="Slow market: mean reversion from range edge.",
+            direction_bias="long",
+            is_clean=True,
+        )
+    if near_upper_edge and market_scores.bullish_direction_score < market_scores.bearish_direction_score + 15 and liquidity_clean:
+        return SlowMarketRead(
+            setup="mean_reversion_range_edge",
+            reason="Slow market: mean reversion from range edge.",
+            direction_bias="short",
+            is_clean=True,
+        )
+
+    return SlowMarketRead(
+        setup="low_volatility_no_edge",
+        reason="No trade: low volatility without edge.",
+        direction_bias="none",
+        is_clean=False,
+    )
+
+
 def _simple_average(values: Sequence[Decimal]) -> Decimal:
     if not values:
         return Decimal("0")
@@ -975,7 +1170,10 @@ def _direction_reason(
     evidence_strength: FuturesEvidenceStrength,
     trend: str,
     momentum: str,
+    slow_setup: "SlowMarketRead | None" = None,
 ) -> str:
+    if slow_setup is not None and slow_setup.is_clean and slow_setup.reason:
+        return slow_setup.reason
     validation_note = ""
     if evidence_strength in {"insufficient", "unvalidated", "weak"}:
         validation_note = " Internal validation is still limited, so treat this as weakly validated."

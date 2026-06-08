@@ -13,6 +13,9 @@ This project is a paper-mode signal intelligence workstation for Binance symbols
 - Signal validation, regime analysis, similar setup outcomes, trade eligibility, and adaptive recommendations exist.
 - A paper-only Futures Long/Short Opportunity Scanner is available for advisory ranking only.
 - The futures scanner can scan up to 100 symbols and includes a display-only paper leverage risk simulator.
+- Selected-symbol analysis loads separately from paper trading runtime controls; Start, Pause, Resume, and Stop control only paper runtime.
+- Sidebar selections use Spot analysis/simulation by default, while Futures scanner Simulate opens a separate USD-M Futures paper simulation flow.
+- Market Sensitivity supports Conservative, Balanced, and Active paper modes. Active mode is paper-only and only surfaces smaller slow-market setups when deterministic structure, liquidity, invalidation, and cost checks remain acceptable.
 - LONG futures scanner candidates should render green, SHORT candidates red, and WAIT/AVOID candidates neutral.
 
 ## Safety Baseline
@@ -99,12 +102,15 @@ npm run build
 - Similar setup engine: compares current setups against stored historical outcomes when sample size is sufficient.
 - Trade eligibility gate: advisory evidence-based gate for paper automation consideration.
 - Adaptive recommendations: report-only threshold and rule suggestions from measured outcomes.
-- Paper futures scanner: advisory LONG/SHORT/WAIT/AVOID opportunity ranking without execution, with 20/50/100-symbol scan sizes, display-only leverage-risk simulation, and event-based liquidation intelligence fields.
+- Paper futures scanner: advisory LONG/SHORT/WAIT/AVOID opportunity ranking without execution, with async progressive scan jobs, 20/50/100-symbol scan sizes, display-only leverage-risk simulation, and event-based liquidation intelligence fields.
+- Slow-market opportunity detection: range breakout, liquidity sweep reversal, compression breakout, mean reversion from range edge, low-volatility continuation, and low-volatility no-edge blocking are labeled for paper-only review.
 - Liquidation event intelligence: interprets recent Binance force-order events into cascade, exhaustion, sweep-confirmation, noise, and no-activity context. This uses observed liquidation events only; it does not fabricate predictive liquidation levels.
 
 ## Main UI
 
 The primary screen is designed as a premium dark trading dashboard for a selected symbol. It keeps top navigation, compact market sidebars, a central AI Trading Assistant decision card, chart context, key insight cards, and paper-mode safety labels visible without requiring the operator to read every advanced module.
+
+Selecting a symbol starts analysis and historical-candle backfill for that symbol without starting paper runtime. Paper Trading Controls affect only paper session state and paper execution readiness; they do not force the selected analysis symbol to follow the runtime symbol. Sidebar/watchlist selections default to Spot context; Futures scanner simulation selections use USD-M Futures candles and scanner-provided paper simulation parameters.
 
 ## Advanced Details - Pro
 

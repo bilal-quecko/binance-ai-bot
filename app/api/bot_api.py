@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 import json
 import logging
+from threading import RLock, Thread
 import time
 from typing import Annotated, Literal
 from uuid import uuid4
@@ -121,6 +122,7 @@ LOGGER = logging.getLogger(__name__)
 
 DataState = Literal["ready", "waiting_for_runtime", "waiting_for_history", "degraded_storage"]
 ChartTimeframe = Literal["1m", "5m", "15m", "1h"]
+SelectedMarket = Literal["spot", "futures"]
 FuturesSymbolUniverseSource = Literal["live", "cache", "fallback", "unavailable"]
 FUTURES_SYMBOL_UNIVERSE_CACHE_TTL = timedelta(minutes=20)
 FUTURES_SCANNER_FALLBACK_SYMBOLS = (
@@ -484,6 +486,17 @@ class FuturesPaperSignalResponse(BaseModel):
     risk_grade: Literal["low", "medium", "high"]
     regime: str | None = None
     current_price: Decimal | None = None
+    market_sensitivity: Literal["conservative", "balanced", "aggressive"] = "balanced"
+    slow_market_setup: Literal[
+        "none",
+        "range_breakout",
+        "liquidity_sweep_reversal",
+        "compression_breakout",
+        "mean_reversion_range_edge",
+        "low_volatility_continuation",
+        "low_volatility_no_edge",
+    ] = "none"
+    slow_market_reason: str | None = None
     data_source: Literal["binance_usdm_futures"] = "binance_usdm_futures"
     price_type: Literal["mark_price", "futures_last_price"] = "futures_last_price"
     reason: str
@@ -586,6 +599,135 @@ class FuturesOpportunityScanResponse(BaseModel):
     latest_scanner_error: str | None = None
     persisted_candidate_count: int = 0
     fallback_symbol_count: int = 0
+
+
+FuturesScannerJobStatus = Literal["queued", "running", "partial", "completed", "failed", "cancelled"]
+
+
+class FuturesOpportunityScanStartRequest(BaseModel):
+    """Request body for an async paper-only futures scanner job."""
+
+    quote_asset: str = "USDT"
+    limit: int | None = Field(default=None, ge=1)
+    max_symbols: int | None = Field(default=None, ge=1)
+    concurrency: int = Field(default=5, ge=1, le=10)
+    batch_size: int = Field(default=8, ge=5, le=10)
+    symbol_timeout_seconds: float = Field(default=7.0, ge=1, le=8)
+    scan_timeout_seconds: float = Field(default=45.0, ge=5, le=90)
+    horizon: str = "7d"
+    min_opportunity_score: int = Field(default=0, ge=0, le=100)
+    min_confidence: int = Field(default=0, ge=0, le=100)
+    include_weak_evidence: bool = True
+    include_avoid: bool = True
+    market_sensitivity: Literal["conservative", "balanced", "aggressive"] = "balanced"
+
+
+class FuturesOpportunityScanJobResponse(BaseModel):
+    """Progress snapshot for an async futures scanner job."""
+
+    scan_id: str
+    status: FuturesScannerJobStatus
+    total_symbols: int = 0
+    scanned_symbols: int = 0
+    current_symbol: str | None = None
+    current_phase: str = "queued"
+    started_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
+    scan: FuturesOpportunityScanResponse | None = None
+    warnings: list[str] = Field(default_factory=list)
+    failed_symbols: list[str] = Field(default_factory=list)
+    latest_error: str | None = None
+
+
+@dataclass(slots=True)
+class FuturesScannerJob:
+    """Mutable in-memory state for one async futures scanner run."""
+
+    scan_id: str
+    request: FuturesOpportunityScanStartRequest
+    status: FuturesScannerJobStatus = "queued"
+    total_symbols: int = 0
+    scanned_symbols: int = 0
+    current_symbol: str | None = None
+    current_phase: str = "queued"
+    started_at: datetime = dataclass_field(default_factory=now_utc)
+    updated_at: datetime = dataclass_field(default_factory=now_utc)
+    completed_at: datetime | None = None
+    long_candidates: list[FuturesPaperSignal] = dataclass_field(default_factory=list)
+    short_candidates: list[FuturesPaperSignal] = dataclass_field(default_factory=list)
+    neutral_candidates: list[FuturesPaperSignal] = dataclass_field(default_factory=list)
+    warnings: list[str] = dataclass_field(default_factory=list)
+    failed_symbols: list[str] = dataclass_field(default_factory=list)
+    response: FuturesOpportunityScanResponse | None = None
+    latest_error: str | None = None
+    cancel_requested: bool = False
+    task: asyncio.Task[None] | None = None
+    thread: Thread | None = None
+
+
+class FuturesScannerJobManager:
+    """Small process-local async scanner job registry."""
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._jobs: dict[str, FuturesScannerJob] = {}
+
+    def create(self, request: FuturesOpportunityScanStartRequest) -> FuturesScannerJob:
+        job = FuturesScannerJob(scan_id=uuid4().hex, request=request)
+        with self._lock:
+            self._jobs[job.scan_id] = job
+        return job
+
+    def set_task(self, scan_id: str, task: asyncio.Task[None]) -> None:
+        with self._lock:
+            job = self._jobs.get(scan_id)
+            if job is not None:
+                job.task = task
+                job.updated_at = now_utc()
+
+    def set_thread(self, scan_id: str, thread: Thread) -> None:
+        with self._lock:
+            job = self._jobs.get(scan_id)
+            if job is not None:
+                job.thread = thread
+                job.updated_at = now_utc()
+
+    def get(self, scan_id: str) -> FuturesScannerJob | None:
+        with self._lock:
+            return self._jobs.get(scan_id)
+
+    def update(self, scan_id: str, **updates: object) -> FuturesScannerJob | None:
+        with self._lock:
+            job = self._jobs.get(scan_id)
+            if job is None:
+                return None
+            if job.status == "cancelled" and updates.get("status") != "cancelled":
+                return job
+            for key, value in updates.items():
+                setattr(job, key, value)
+            job.updated_at = now_utc()
+            return job
+
+    def cancel(self, scan_id: str) -> FuturesScannerJob | None:
+        with self._lock:
+            job = self._jobs.get(scan_id)
+            if job is None:
+                return None
+            job.cancel_requested = True
+            job.status = "cancelled"
+            job.current_phase = "cancel_requested"
+            job.completed_at = now_utc()
+            job.latest_error = "Scan cancelled by user."
+            job.warnings = ["Scan cancelled. Partial results remain advisory-only."] if job.response is not None else ["Scan cancelled."]
+            job.updated_at = now_utc()
+            task = job.task
+        if task is not None and not task.done():
+            task.cancel()
+        return job
+
+
+_FUTURES_SCANNER_JOB_MANAGER = FuturesScannerJobManager()
 
 
 class FuturesLivePriceItemResponse(BaseModel):
@@ -1864,6 +2006,115 @@ def _load_merged_candle_series(
         live_candles=live,
         interval=interval,
         limit=limit,
+    )
+
+
+def _load_futures_candle_series(
+    *,
+    repository: StorageRepository,
+    symbol: str,
+    interval: ChartTimeframe = "1m",
+    limit: int | None = None,
+):
+    """Load stored USD-M Futures candles for selected-symbol charting."""
+
+    end_time = now_utc()
+    start_time = end_time - timedelta(days=7)
+    stored = [
+        _historical_record_to_candle(record)
+        for record in repository.get_futures_historical_candles(
+            symbol=symbol,
+            interval=interval,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    ]
+    if limit is not None:
+        stored = stored[-limit:]
+    return merge_candles(
+        stored_candles=stored,
+        live_candles=[],
+        interval=interval,
+        limit=limit,
+    )
+
+
+def _futures_backfill_status(
+    *,
+    repository: StorageRepository,
+    symbol: str,
+    interval: ChartTimeframe,
+    lookback_days: int,
+    loading: bool = False,
+    failed_message: str | None = None,
+) -> CandleBackfillStatus:
+    """Return USD-M Futures selected-symbol candle coverage."""
+
+    end_time = now_utc()
+    start_time = end_time - timedelta(days=lookback_days)
+    candles = [
+        _historical_record_to_candle(record)
+        for record in repository.get_futures_historical_candles(
+            symbol=symbol,
+            interval=interval,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    ]
+    if not candles:
+        status = "failed" if failed_message else ("loading" if loading else "not_started")
+        return CandleBackfillStatus(
+            symbol=symbol,
+            requested_interval=interval,
+            requested_lookback_days=lookback_days,
+            available_from=None,
+            available_to=None,
+            candle_count=0,
+            coverage_pct=Decimal("0"),
+            status=status,
+            message=failed_message or (
+                f"USD-M Futures {interval} candles for {symbol} are loading."
+                if loading
+                else f"USD-M Futures {interval} candles for {symbol} have not been loaded yet."
+            ),
+            last_backfilled_at=None,
+            effective_interval=interval,
+        )
+
+    latest = candles[-1]
+    earliest = candles[0]
+    requested_span = timedelta(days=lookback_days)
+    actual_span = max(latest.close_time - earliest.open_time, timedelta(0))
+    coverage_pct = min(
+        Decimal("100"),
+        (Decimal(actual_span.total_seconds()) / Decimal(requested_span.total_seconds())) * Decimal("100")
+        if requested_span.total_seconds() > 0
+        else Decimal("0"),
+    ).quantize(Decimal("0.01"))
+    if failed_message:
+        status = "failed"
+        message = failed_message
+    elif loading:
+        status = "partial"
+        message = f"USD-M Futures {interval} candles for {symbol} are still loading."
+    elif coverage_pct >= Decimal("50"):
+        status = "ready"
+        message = f"USD-M Futures {interval} candles are ready for {symbol}."
+    else:
+        status = "partial"
+        message = f"USD-M Futures {interval} candles for {symbol} are only partially backfilled."
+    return CandleBackfillStatus(
+        symbol=symbol,
+        requested_interval=interval,
+        requested_lookback_days=lookback_days,
+        available_from=earliest.open_time,
+        available_to=latest.close_time,
+        candle_count=len(candles),
+        coverage_pct=coverage_pct,
+        status=status,
+        message=message,
+        last_backfilled_at=latest.event_time,
+        effective_interval=interval,
     )
 
 
@@ -3312,6 +3563,9 @@ def _to_futures_signal_response(signal: FuturesPaperSignal) -> FuturesPaperSigna
         risk_grade=signal.risk_grade,
         regime=signal.regime,
         current_price=signal.current_price,
+        market_sensitivity=signal.market_sensitivity,
+        slow_market_setup=signal.slow_market_setup,
+        slow_market_reason=signal.slow_market_reason,
         data_source="binance_usdm_futures",
         price_type=signal.price_type,
         reason=signal.reason,
@@ -3891,6 +4145,432 @@ def _empty_degraded_scanner_response(
     )
 
 
+def _to_futures_scan_job_response(job: FuturesScannerJob) -> FuturesOpportunityScanJobResponse:
+    return FuturesOpportunityScanJobResponse(
+        scan_id=job.scan_id,
+        status=job.status,
+        total_symbols=job.total_symbols,
+        scanned_symbols=job.scanned_symbols,
+        current_symbol=job.current_symbol,
+        current_phase=job.current_phase,
+        started_at=job.started_at,
+        updated_at=job.updated_at,
+        completed_at=job.completed_at,
+        scan=job.response,
+        warnings=list(job.warnings),
+        failed_symbols=list(job.failed_symbols),
+        latest_error=job.latest_error,
+    )
+
+
+def _build_async_futures_scan_report(
+    *,
+    scanner: FuturesOpportunityScanner,
+    signals: list[FuturesPaperSignal],
+    failed_symbols: list[str],
+    include_avoid: bool,
+    universe_source: FuturesSymbolUniverseSource,
+    symbol_count: int,
+    scanned_symbols: int,
+    last_successful_fetch_at: datetime | None,
+    latest_error: str | None,
+    universe_warnings: list[str],
+    partial: bool,
+) -> FuturesOpportunityScanReport:
+    report = scanner.build_report(
+        signals=signals,
+        failed_symbols=failed_symbols,
+        include_avoid=include_avoid,
+    )
+    report.scanned_count = scanned_symbols
+    report.futures_symbol_universe_source = universe_source
+    report.symbol_count = symbol_count
+    report.last_successful_fetch_at = last_successful_fetch_at
+    report.latest_error = latest_error
+    report.warnings.extend(universe_warnings)
+    if partial:
+        report.scan_state = "partial"
+        if "Scanner is still running; partial results are shown." not in report.warnings:
+            report.warnings.append("Scanner is still running; partial results are shown.")
+    elif universe_source in {"cache", "fallback"} and report.scan_state == "ready":
+        report.scan_state = "partial"
+    return report
+
+
+async def _run_futures_opportunity_scan_job(
+    *,
+    scan_id: str,
+    settings: Settings,
+    rest_client: BinanceRestClient | None,
+) -> None:
+    job = _FUTURES_SCANNER_JOB_MANAGER.get(scan_id)
+    if job is None:
+        return
+
+    request = job.request
+    normalized_quote = request.quote_asset.strip().upper() or "USDT"
+    scan_limit = min(
+        request.max_symbols if request.max_symbols is not None else request.limit if request.limit is not None else 50,
+        100,
+    )
+    fallback_symbol_count = len(_manual_futures_symbol_fallback(normalized_quote))
+    try:
+        normalized_horizon = _normalize_futures_scanner_horizon(request.horizon)
+    except ValueError as exc:
+        _FUTURES_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            status="failed",
+            current_phase="failed",
+            completed_at=now_utc(),
+            latest_error=str(exc),
+            warnings=[str(exc)],
+        )
+        return
+
+    scanner = FuturesOpportunityScanner()
+    total_started_at = time.perf_counter()
+    worker_rest_client = rest_client or BinanceRestClient(settings)
+    close_worker_rest_client = rest_client is None
+    repository = StorageRepository(settings.database_url)
+    signals: list[FuturesPaperSignal] = []
+    failed_symbols: list[str] = []
+    candle_cache: dict[tuple[str, SupportedInterval], list[Candle]] = {}
+    semaphore = asyncio.Semaphore(request.concurrency)
+    threshold_floor = 60 if request.market_sensitivity == "aggressive" else 0
+    sensitivity_discount = 8 if request.market_sensitivity == "aggressive" else 0
+    current_threshold = max(threshold_floor, max(request.min_opportunity_score, request.min_confidence) - sensitivity_discount)
+
+    async def scan_symbol(record: SpotSymbolRecord) -> FuturesPaperSignal | None:
+        async with semaphore:
+            current_job = _FUTURES_SCANNER_JOB_MANAGER.get(scan_id)
+            if current_job is not None and current_job.cancel_requested:
+                return None
+            symbol_started_at = time.perf_counter()
+            _FUTURES_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                current_symbol=record.symbol,
+                current_phase="futures_candle_fetch",
+            )
+            try:
+                signal = await asyncio.wait_for(
+                    _build_market_wide_futures_signal_for_symbol(
+                        scanner=scanner,
+                        symbol=record.symbol,
+                        horizon=normalized_horizon,
+                        repository=repository,
+                        rest_client=worker_rest_client,
+                        settings=settings,
+                        candle_cache=candle_cache,
+                        market_sensitivity=request.market_sensitivity,
+                    ),
+                    timeout=request.symbol_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                LOGGER.warning(
+                    "Timed out futures-paper async scan; scan_id=%s phase=symbol_scan symbol=%s endpoint=/fapi/v1/klines exception_type=TimeoutError timeout_seconds=%.1f",
+                    scan_id,
+                    record.symbol,
+                    request.symbol_timeout_seconds,
+                )
+                failed_symbols.append(record.symbol)
+                return None
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception(
+                    "Failed to scan async paper futures opportunity; scan_id=%s phase=symbol_scan symbol=%s endpoint=/fapi/v1/klines",
+                    scan_id,
+                    record.symbol,
+                )
+                failed_symbols.append(record.symbol)
+                return None
+            finally:
+                LOGGER.debug(
+                    "Async futures scanner symbol %s finished in %.3fs.",
+                    record.symbol,
+                    time.perf_counter() - symbol_started_at,
+                )
+
+            weak_validation = signal.evidence_strength in {"insufficient", "unvalidated", "weak"}
+            if signal.direction in {"long", "short"}:
+                if signal.opportunity_score < current_threshold:
+                    return None
+                if weak_validation and not request.include_weak_evidence:
+                    return None
+                return signal
+            if signal.direction == "wait" or request.include_avoid:
+                return signal
+            return None
+
+    try:
+        _FUTURES_SCANNER_JOB_MANAGER.update(scan_id, status="running", current_phase="loading_universe")
+        universe_started_at = time.perf_counter()
+        universe = await _load_futures_symbol_universe(
+            rest_client=worker_rest_client,
+            quote_asset=normalized_quote,
+            limit=scan_limit,
+        )
+        LOGGER.info(
+            "Async futures scanner universe load %.3fs source=%s symbols=%d scan_id=%s.",
+            time.perf_counter() - universe_started_at,
+            universe.source,
+            len(universe.records),
+            scan_id,
+        )
+        candidates = universe.records
+        _FUTURES_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            total_symbols=len(candidates),
+            current_phase="symbol_universe_ready",
+        )
+        if universe.source == "unavailable" or not candidates:
+            latest_error = universe.latest_error or "No USD-M Futures symbol universe is available."
+            cached_response = _latest_successful_scanner_response(
+                repository=repository,
+                quote_asset=normalized_quote,
+                horizon=normalized_horizon,
+                latest_error=latest_error,
+                universe_source=universe.source,
+                fallback_symbol_count=fallback_symbol_count,
+            )
+            response = cached_response or _empty_degraded_scanner_response(
+                universe_source=universe.source,
+                latest_error=latest_error,
+                fallback_symbol_count=fallback_symbol_count,
+            )
+            _FUTURES_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                status="failed",
+                current_phase="failed",
+                completed_at=now_utc(),
+                response=response,
+                latest_error=latest_error,
+                warnings=["Scanner failed. Last successful results are still shown."],
+            )
+            return
+
+        universe_warnings: list[str] = []
+        if universe.source == "cache":
+            universe_warnings.append(
+                "Using cached USD-M Futures symbol universe because live Binance exchangeInfo is unavailable or recently cached."
+            )
+        elif universe.source == "fallback":
+            universe_warnings.append("Live USD-M symbol universe unavailable; using curated fallback list.")
+
+        deadline = time.perf_counter() + request.scan_timeout_seconds
+        batch_size = min(10, max(5, request.batch_size))
+        scan_started_at = time.perf_counter()
+        for start_index in range(0, len(candidates), batch_size):
+            current_job = _FUTURES_SCANNER_JOB_MANAGER.get(scan_id)
+            if current_job is None or current_job.cancel_requested:
+                raise asyncio.CancelledError()
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                remaining_symbols = [record.symbol for record in candidates[start_index:]]
+                failed_symbols.extend(remaining_symbols)
+                break
+            batch = candidates[start_index:start_index + batch_size]
+            _FUTURES_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                status="running" if not signals else "partial",
+                current_symbol=batch[0].symbol if batch else None,
+                current_phase="scanning_batch",
+            )
+            task_by_symbol = {
+                asyncio.create_task(scan_symbol(record), name=f"futures-scan-job-{scan_id}-{record.symbol}"): record.symbol
+                for record in batch
+            }
+            done, pending = await asyncio.wait(task_by_symbol.keys(), timeout=max(0.1, remaining))
+            for task in pending:
+                symbol = task_by_symbol[task]
+                task.cancel()
+                failed_symbols.append(symbol)
+                LOGGER.warning(
+                    "Async futures scanner request timed out; scan_id=%s phase=scan_timeout symbol=%s endpoint=/bot/futures-opportunities/scan exception_type=TimeoutError timeout_seconds=%.1f",
+                    scan_id,
+                    symbol,
+                    request.scan_timeout_seconds,
+                )
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            current_job = _FUTURES_SCANNER_JOB_MANAGER.get(scan_id)
+            if current_job is None or current_job.cancel_requested:
+                raise asyncio.CancelledError()
+            for task in done:
+                result = task.result()
+                if result is not None:
+                    signals.append(result)
+
+            scanned_symbols = min(start_index + len(batch), len(candidates))
+            partial = scanned_symbols < len(candidates)
+            _FUTURES_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                scanned_symbols=scanned_symbols,
+                failed_symbols=list(failed_symbols),
+                current_phase="ranking_partial" if partial else "ranking_final",
+            )
+            ranking_started_at = time.perf_counter()
+            report = _build_async_futures_scan_report(
+                scanner=scanner,
+                signals=signals,
+                failed_symbols=failed_symbols,
+                include_avoid=request.include_avoid,
+                universe_source=universe.source,
+                symbol_count=len(candidates),
+                scanned_symbols=scanned_symbols,
+                last_successful_fetch_at=universe.last_successful_fetch_at,
+                latest_error=universe.latest_error,
+                universe_warnings=universe_warnings,
+                partial=partial,
+            )
+            response = _to_futures_scan_response(report)
+            LOGGER.info(
+                "Async futures scanner ranking %.3fs scan_id=%s scanned=%d/%d candidates=%d.",
+                time.perf_counter() - ranking_started_at,
+                scan_id,
+                scanned_symbols,
+                len(candidates),
+                len(signals),
+            )
+            _FUTURES_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                status="partial" if partial else "running",
+                response=response,
+                long_candidates=list(report.long_candidates),
+                short_candidates=list(report.short_candidates),
+                neutral_candidates=list(report.neutral_candidates),
+                warnings=list(report.warnings),
+            )
+            if pending:
+                break
+
+        LOGGER.info(
+            "Async futures scanner analyzed %d/%d symbols in %.3fs with concurrency=%d scan_id=%s.",
+            len(signals),
+            len(candidates),
+            time.perf_counter() - scan_started_at,
+            request.concurrency,
+            scan_id,
+        )
+        current_job = _FUTURES_SCANNER_JOB_MANAGER.get(scan_id)
+        if current_job is None or current_job.cancel_requested:
+            raise asyncio.CancelledError()
+        scanned_total = current_job.scanned_symbols
+        report = _build_async_futures_scan_report(
+            scanner=scanner,
+            signals=signals,
+            failed_symbols=failed_symbols,
+            include_avoid=request.include_avoid,
+            universe_source=universe.source,
+            symbol_count=len(candidates),
+            scanned_symbols=min(len(candidates), scanned_total),
+            last_successful_fetch_at=universe.last_successful_fetch_at,
+            latest_error=universe.latest_error,
+            universe_warnings=universe_warnings,
+            partial=bool(failed_symbols) and len(signals) > 0,
+        )
+        if not signals and failed_symbols:
+            latest_error = universe.latest_error or "futures_klines_unavailable: no requested futures symbols returned candles."
+            cached_response = _latest_successful_scanner_response(
+                repository=repository,
+                quote_asset=normalized_quote,
+                horizon=normalized_horizon,
+                latest_error=latest_error,
+                universe_source=universe.source,
+                fallback_symbol_count=fallback_symbol_count,
+            )
+            response = cached_response or _empty_degraded_scanner_response(
+                universe_source=universe.source,
+                latest_error=latest_error,
+                fallback_symbol_count=fallback_symbol_count,
+                failed_symbols=failed_symbols,
+            )
+        else:
+            response = _to_futures_scan_response(report)
+            _FUTURES_SCANNER_JOB_MANAGER.update(scan_id, current_phase="persisting_completed")
+            try:
+                _persist_scanner_run_candidates(
+                    repository=repository,
+                    scan_id=scan_id,
+                    report=report,
+                    response=response,
+                    quote_asset=normalized_quote,
+                    horizon=normalized_horizon,
+                    max_symbols=scan_limit,
+                    min_opportunity_score=request.min_opportunity_score,
+                )
+            except Exception:
+                LOGGER.exception("Failed to persist async futures scanner run candidates.")
+                response.warnings.append("Scanner candidate persistence failed; visible results are still usable for this session.")
+            try:
+                persist_scanner_validation_snapshots(repository=repository, report=report, scan_id=scan_id)
+            except Exception:
+                LOGGER.exception("Failed to persist async futures scanner validation snapshots.")
+                response.warnings.append(
+                    "Scanner validation snapshot persistence failed; this scan will not be included in paper validation reports."
+                )
+            _persist_scanner_outcome_snapshots(repository=repository, report=report)
+
+        completed_at = now_utc()
+        _FUTURES_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            status="completed",
+            scanned_symbols=response.scanned_count,
+            current_symbol=None,
+            current_phase="completed",
+            completed_at=completed_at,
+            response=response,
+            long_candidates=list(report.long_candidates) if signals else [],
+            short_candidates=list(report.short_candidates) if signals else [],
+            neutral_candidates=list(report.neutral_candidates) if signals else [],
+            failed_symbols=list(failed_symbols),
+            warnings=list(response.warnings),
+            latest_error=response.latest_error,
+        )
+        LOGGER.info("Async futures scanner total scan time %.3fs scan_id=%s.", time.perf_counter() - total_started_at, scan_id)
+    except asyncio.CancelledError:
+        current = _FUTURES_SCANNER_JOB_MANAGER.get(scan_id)
+        _FUTURES_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            status="cancelled",
+            current_symbol=None,
+            current_phase="cancelled",
+            completed_at=now_utc(),
+            response=current.response if current is not None else None,
+            latest_error="Scan cancelled by user.",
+            warnings=["Scan cancelled. Partial results remain advisory-only."] if current is not None and current.response is not None else ["Scan cancelled."],
+        )
+    except Exception as exc:
+        LOGGER.exception("Async futures scanner job failed; scan_id=%s.", scan_id)
+        latest_error = f"{type(exc).__name__}: {exc}"
+        cached_response = None
+        try:
+            cached_response = _latest_successful_scanner_response(
+                repository=repository,
+                quote_asset=normalized_quote,
+                horizon=normalized_horizon,
+                latest_error=latest_error,
+                universe_source="unavailable",
+                fallback_symbol_count=fallback_symbol_count,
+            )
+        except Exception:
+            LOGGER.exception("Failed to load cached scanner response after async scan failure.")
+        _FUTURES_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            status="failed",
+            current_symbol=None,
+            current_phase="failed",
+            completed_at=now_utc(),
+            response=cached_response,
+            latest_error=latest_error,
+            warnings=["Scanner failed. Last successful results are still shown."],
+        )
+    finally:
+        repository.close()
+        if close_worker_rest_client:
+            await worker_rest_client.close()
+
+
 def _assistant_signal_type(decision: str) -> str:
     if decision == "buy":
         return "BUY"
@@ -3928,6 +4608,7 @@ async def _build_market_wide_futures_signal_for_symbol(
     rest_client: BinanceRestClient,
     settings: Settings,
     candle_cache: dict[tuple[str, SupportedInterval], list[Candle]] | None = None,
+    market_sensitivity: Literal["conservative", "balanced", "aggressive"] = "balanced",
 ) -> FuturesPaperSignal:
     """Build one scanner signal from fresh/stored market-wide OHLCV data."""
 
@@ -4015,9 +4696,10 @@ async def _build_market_wide_futures_signal_for_symbol(
             open_interest=derivatives_data.open_interest,
             oi_trend=derivatives_data.oi_trend,
             liquidation_intelligence=liquidation_intelligence,
+            market_sensitivity=market_sensitivity,
         )
     )
-    LOGGER.debug("Futures scanner per-symbol analysis for %s completed in %.3fs.", symbol, time.perf_counter() - started_at)
+    LOGGER.info("Futures scanner analysis completed in %.3fs symbol=%s.", time.perf_counter() - started_at, symbol)
     return signal
 
 
@@ -4048,7 +4730,7 @@ async def _load_or_fetch_futures_scan_candles(
             end_time=end_time,
         )
     ]
-    LOGGER.debug(
+    LOGGER.info(
         "Futures scanner candle cache read for %s %s returned %d rows in %.3fs.",
         symbol,
         interval,
@@ -4069,7 +4751,7 @@ async def _load_or_fetch_futures_scan_candles(
         end_time_ms=int(end_time.timestamp() * 1000),
         limit=min(1000, max(MIN_CANDLES_FOR_FUTURES_SIGNAL, expected_limit)),
     )
-    LOGGER.debug(
+    LOGGER.info(
         "Futures scanner Binance USD-M candle fetch for %s %s returned %d rows in %.3fs.",
         symbol,
         interval,
@@ -4653,14 +5335,30 @@ async def manual_close_position(
 def get_backfill_status(
     symbol: Annotated[str, Query(min_length=1)],
     backfill_service: Annotated[HistoricalBackfillService, Depends(get_backfill_service)],
+    settings: Annotated[Settings, Depends(get_settings_dependency)],
     interval: ChartTimeframe = "1m",
     lookback_days: Annotated[int, Query(ge=1, le=30)] = 7,
+    market: SelectedMarket = "spot",
 ) -> BackfillStatusResponse:
     """Return stored historical-candle coverage for one selected symbol."""
 
+    normalized_symbol = symbol.strip().upper()
+    if market == "futures":
+        repository = StorageRepository(settings.database_url)
+        try:
+            return _to_backfill_status_response(
+                _futures_backfill_status(
+                    repository=repository,
+                    symbol=normalized_symbol,
+                    interval=interval,
+                    lookback_days=lookback_days,
+                )
+            )
+        finally:
+            repository.close()
     return _to_backfill_status_response(
         backfill_service.status(
-            symbol=symbol.strip().upper(),
+            symbol=normalized_symbol,
             interval=interval,
             lookback_days=lookback_days,
         )
@@ -4671,14 +5369,50 @@ def get_backfill_status(
 async def trigger_backfill(
     symbol: Annotated[str, Query(min_length=1)],
     backfill_service: Annotated[HistoricalBackfillService, Depends(get_backfill_service)],
+    settings: Annotated[Settings, Depends(get_settings_dependency)],
+    rest_client: Annotated[BinanceRestClient, Depends(get_rest_client)],
     interval: ChartTimeframe = "1m",
     lookback_days: Annotated[int, Query(ge=1, le=30)] = 7,
+    market: SelectedMarket = "spot",
 ) -> BackfillStatusResponse:
     """Trigger or refresh historical-candle backfill for one selected symbol."""
 
+    normalized_symbol = symbol.strip().upper()
+    if market == "futures":
+        repository = StorageRepository(settings.database_url)
+        try:
+            try:
+                await _load_or_fetch_futures_scan_candles(
+                    repository=repository,
+                    rest_client=rest_client,
+                    symbol=normalized_symbol,
+                    interval=interval,
+                    lookback_days=lookback_days,
+                )
+            except Exception as exc:
+                LOGGER.exception("USD-M Futures selected-symbol backfill failed for %s %s.", normalized_symbol, interval)
+                return _to_backfill_status_response(
+                    _futures_backfill_status(
+                        repository=repository,
+                        symbol=normalized_symbol,
+                        interval=interval,
+                        lookback_days=lookback_days,
+                        failed_message=f"Symbol not available on selected market. {type(exc).__name__}: {exc}",
+                    )
+                )
+            return _to_backfill_status_response(
+                _futures_backfill_status(
+                    repository=repository,
+                    symbol=normalized_symbol,
+                    interval=interval,
+                    lookback_days=lookback_days,
+                )
+            )
+        finally:
+            repository.close()
     return _to_backfill_status_response(
         await backfill_service.ensure_recent_history(
-            symbol=symbol.strip().upper(),
+            symbol=normalized_symbol,
             interval=interval,
             lookback_days=lookback_days,
         )
@@ -4717,6 +5451,7 @@ def get_candles(
     symbol: Annotated[str, Query(min_length=1)],
     timeframe: Annotated[ChartTimeframe, Query()] = "1m",
     limit: Annotated[int, Query(ge=20, le=240)] = 120,
+    market: SelectedMarket = "spot",
     runtime: Annotated[PaperBotRuntime, Depends(get_bot_runtime)] = None,
     settings: Annotated[Settings, Depends(get_settings_dependency)] = None,
 ) -> CandleHistoryResponse:
@@ -4727,20 +5462,28 @@ def get_candles(
     runtime_active = _runtime_matches_symbol(status, normalized_symbol)
     repository = StorageRepository(settings.database_url)
     try:
-        merged = _load_merged_candle_series(
-            repository=repository,
-            runtime=runtime,
-            symbol=normalized_symbol,
-            interval=timeframe,
-            limit=limit,
-        )
+        if market == "futures":
+            merged = _load_futures_candle_series(
+                repository=repository,
+                symbol=normalized_symbol,
+                interval=timeframe,
+                limit=limit,
+            )
+        else:
+            merged = _load_merged_candle_series(
+                repository=repository,
+                runtime=runtime,
+                symbol=normalized_symbol,
+                interval=timeframe,
+                limit=limit,
+            )
         return _to_candle_history_response(
             symbol=normalized_symbol,
             timeframe=timeframe,
             candles=merged.candles,
             source_timeframe=merged.source_interval,
             derived_from_lower_timeframe=merged.derived_from_lower_timeframe,
-            runtime_active=runtime_active,
+            runtime_active=runtime_active or market == "futures",
             limit=limit,
         )
     except Exception:
@@ -5416,6 +6159,56 @@ async def get_opportunities(
         repository.close()
 
 
+@router.post("/bot/futures-opportunities/scan", response_model=FuturesOpportunityScanJobResponse)
+async def start_futures_opportunity_scan(
+    payload: FuturesOpportunityScanStartRequest,
+    settings: Annotated[Settings, Depends(get_settings_dependency)] = None,
+    rest_client: Annotated[BinanceRestClient, Depends(get_rest_client)] = None,
+) -> FuturesOpportunityScanJobResponse:
+    """Start a background paper-only futures opportunity scan."""
+
+    try:
+        _normalize_futures_scanner_horizon(payload.horizon)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    job = _FUTURES_SCANNER_JOB_MANAGER.create(payload)
+    worker_rest_client = None if isinstance(rest_client, BinanceRestClient) else rest_client
+    thread = Thread(
+        target=lambda: asyncio.run(
+            _run_futures_opportunity_scan_job(
+                scan_id=job.scan_id,
+                settings=settings,
+                rest_client=worker_rest_client,
+            )
+        ),
+        name=f"futures-opportunity-scan-{job.scan_id}",
+        daemon=True,
+    )
+    _FUTURES_SCANNER_JOB_MANAGER.set_thread(job.scan_id, thread)
+    thread.start()
+    return _to_futures_scan_job_response(job)
+
+
+@router.get("/bot/futures-opportunities/scan/{scan_id}", response_model=FuturesOpportunityScanJobResponse)
+async def get_futures_opportunity_scan_job(scan_id: str) -> FuturesOpportunityScanJobResponse:
+    """Return the latest progress snapshot for a background futures opportunity scan."""
+
+    job = _FUTURES_SCANNER_JOB_MANAGER.get(scan_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Scanner job not found.")
+    return _to_futures_scan_job_response(job)
+
+
+@router.post("/bot/futures-opportunities/scan/{scan_id}/cancel", response_model=FuturesOpportunityScanJobResponse)
+async def cancel_futures_opportunity_scan_job(scan_id: str) -> FuturesOpportunityScanJobResponse:
+    """Cancel a running background futures opportunity scan."""
+
+    job = _FUTURES_SCANNER_JOB_MANAGER.cancel(scan_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Scanner job not found.")
+    return _to_futures_scan_job_response(job)
+
+
 @router.get("/bot/futures-opportunities", response_model=FuturesOpportunityScanResponse)
 async def get_futures_opportunities(
     quote_asset: str = "USDT",
@@ -5429,6 +6222,7 @@ async def get_futures_opportunities(
     min_confidence: Annotated[int, Query(ge=0, le=100)] = 0,
     include_weak_evidence: bool = True,
     include_avoid: bool = True,
+    market_sensitivity: Literal["conservative", "balanced", "aggressive"] = "balanced",
     settings: Annotated[Settings, Depends(get_settings_dependency)] = None,
     rest_client: Annotated[BinanceRestClient, Depends(get_rest_client)] = None,
 ) -> FuturesOpportunityScanResponse:
@@ -5449,13 +6243,23 @@ async def get_futures_opportunities(
     failed_symbols: list[str] = []
     candle_cache: dict[tuple[str, SupportedInterval], list[Candle]] = {}
     semaphore = asyncio.Semaphore(concurrency)
-    current_threshold = max(min_opportunity_score, min_confidence)
+    threshold_floor = 60 if market_sensitivity == "aggressive" else 0
+    sensitivity_discount = 8 if market_sensitivity == "aggressive" else 0
+    current_threshold = max(threshold_floor, max(min_opportunity_score, min_confidence) - sensitivity_discount)
     fallback_symbol_count = len(_manual_futures_symbol_fallback(normalized_quote))
 
+    universe_started_at = time.perf_counter()
     universe = await _load_futures_symbol_universe(
         rest_client=rest_client,
         quote_asset=normalized_quote,
         limit=scan_limit,
+    )
+    LOGGER.info(
+        "Futures scanner universe load %.3fs source=%s symbols=%d scan_id=%s.",
+        time.perf_counter() - universe_started_at,
+        universe.source,
+        len(universe.records),
+        scan_id,
     )
     candidates = universe.records
     if universe.source == "unavailable" or not candidates:
@@ -5504,6 +6308,7 @@ async def get_futures_opportunities(
                         rest_client=rest_client,
                         settings=settings,
                         candle_cache=candle_cache,
+                        market_sensitivity=market_sensitivity,
                     ),
                     timeout=symbol_timeout_seconds,
                 )
@@ -5574,10 +6379,17 @@ async def get_futures_opportunities(
             concurrency,
             scan_id,
         )
+        ranking_started_at = time.perf_counter()
         report = scanner.build_report(
             signals=signals,
             failed_symbols=failed_symbols,
             include_avoid=include_avoid,
+        )
+        LOGGER.info(
+            "Futures scanner ranking completed in %.3fs scan_id=%s candidates=%d.",
+            time.perf_counter() - ranking_started_at,
+            scan_id,
+            len(signals),
         )
         report.warnings.extend(universe_warnings)
         report.futures_symbol_universe_source = universe.source

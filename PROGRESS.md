@@ -2,6 +2,135 @@
 
 Chronological implementation checkpoints for Binance AI Bot.
 
+## No. 40 - Selected Symbol Analysis + Spot/Futures Paper Simulation Flow
+
+- Status: Completed
+- Scope:
+  - added selected market context (`spot` / `futures`) to keep sidebar Spot selections separate from Futures scanner simulation selections
+  - improved selected-symbol backfill flow so backfill starts while runtime is stopped, status is shown, and analysis refreshes again when candles become available
+  - added market-aware selected-symbol candle/backfill API support for USD-M Futures via futures klines without changing scanner scoring or validation formulas
+  - split the Simulate tab into Spot Paper Simulation and Futures Paper Simulation flows
+- Frontend:
+  - sidebar/watchlist selections default to Spot context and clear prior Futures simulation drafts
+  - Futures scanner Simulate stores scanner candidate context: symbol, direction, entry/live price, stop, take profit, leverage guidance, confidence, opportunity score, reason, and risk grade
+  - Futures Paper Simulation pre-fills scanner values and makes stop loss/take profit editable before simulation review
+  - Spot Paper Simulation uses existing manual spot paper trade controls and shows readable blockers for waiting candles, missing entry, missing stop, missing take profit, and ineligible signals
+- Backend:
+  - `GET /bot/candles` accepts `market=spot|futures`
+  - `GET /bot/backfill-status` accepts `market=spot|futures`
+  - `POST /bot/backfill` accepts `market=spot|futures`
+  - futures selected-symbol backfill uses USD-M Futures klines and returns “Symbol not available on selected market.” when futures candles cannot be loaded
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `tests/test_bot_api.py`
+  - `README.md`
+  - `ROADMAP.md`
+  - `PROGRESS.md`
+- Validation Run:
+  - `npx tsc -b` from `frontend/` passed
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py -k "selected_futures_backfill" -q` passed (`2 passed`)
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py -q` passed (`50 passed`)
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_futures_opportunity_scanner.py -q` passed (`16 passed`)
+  - `.\.venv\Scripts\python.exe -m ruff check app\api\bot_api.py tests\test_bot_api.py` passed; Ruff cache write warnings were sandbox-related
+  - `npm run build` from `frontend/` passed after sandbox escalation for Vite/esbuild worker spawning
+- Safety:
+  - no live trading, real futures execution, Binance order placement, scanner scoring changes, signal formula changes, or validation formula changes were added
+  - Futures Paper Simulation is frontend-only review state in this slice and does not call the Spot manual paper order path
+- Remaining Limitations:
+  - persistent backend futures paper positions were not added in this reviewable slice
+  - Futures selected-symbol analysis currently uses futures candles/backfill plus scanner candidate context; deeper selected-symbol futures technical/advisory modules remain a later backend expansion
+
+## Latest - Async Progressive Futures Scanner Jobs
+
+- Status: Completed
+- Scope:
+  - added process-local background Futures Paper Scanner jobs with `queued`, `running`, `partial`, `completed`, `failed`, and `cancelled` state
+  - added progressive scan progress fields: scanned/total symbols, current phase, current symbol, warnings, failed symbols, timestamps, and partial candidate payloads
+  - kept the old `GET /bot/futures-opportunities` endpoint intact for backward compatibility
+  - preserved existing scanner scoring, LONG/SHORT/WAIT/AVOID classification, validation formulas, USD-M Futures data-source boundaries, and paper-only/advisory-only behavior
+- Backend:
+  - added `POST /bot/futures-opportunities/scan`
+  - added `GET /bot/futures-opportunities/scan/{scan_id}`
+  - added `POST /bot/futures-opportunities/scan/{scan_id}/cancel`
+  - processes symbols in 5-10 symbol batches, updates partial reports after each batch, skips failed symbols, and persists scanner run candidates plus validation snapshots only once after completion
+- Frontend:
+  - Refresh now starts an async scan job and polls every 1.5 seconds
+  - prior completed results stay visible until new partial or final results arrive
+  - progress shows scanned X/Y, current phase, current symbol, and a progress bar
+  - Cancel Scan is available while the scanner job is active
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_bot_api.py`
+  - `README.md`
+  - `ROADMAP.md`
+  - `PROGRESS.md`
+- Validation Run:
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py -k "async_futures_scan" -q` passed (`6 passed`)
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_futures_opportunity_scanner.py tests\test_scanner_validation_report.py -q` passed (`22 passed`)
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py -q` passed (`48 passed`)
+  - `.\.venv\Scripts\python.exe -m ruff check app\api\bot_api.py tests\test_bot_api.py` passed; Ruff cache write warnings were sandbox-related
+  - `npm run build` from `frontend/` passed after sandbox escalation for Vite/esbuild worker spawning
+- Safety:
+  - no live trading, real futures execution, Binance order placement, autonomous AI execution, or profitability claim was added
+  - scanner score/classification logic and validation formulas were not changed in this slice
+- Remaining Limitations:
+  - scanner jobs are in-memory process-local state; jobs are not recoverable across backend restarts
+  - cancellation is cooperative and stops persistence/finalization, but an already-running per-symbol fetch may finish before the worker notices the cancel flag
+
+## Latest - Analysis Runtime Separation and Slow-Market Scanner Sensitivity
+
+- Status: Completed
+- Scope:
+  - separated selected-symbol analysis from paper trading runtime controls in the frontend
+  - added paper-only Market Sensitivity labeling, with Active mode mapped to the existing aggressive paper profile
+  - added deterministic slow-market setup detection to the Futures Paper Scanner without adding live trading or futures execution
+  - improved scanner timing logs and verified USD-M Futures candle cache usage before Binance fetches
+  - improved readable no-trade blocker wording for low volatility, weak liquidity, and fee/slippage edge failures
+- Frontend:
+  - `Start`, `Pause`, `Resume`, and `Stop` no longer overwrite the selected analysis symbol with the backend runtime symbol after a runtime action
+  - selected-symbol UI now labels `Analyze Symbol`, `Paper Trading Controls`, `Loading core signal`, and `Advanced details updating`
+  - Futures Paper Scanner keeps prior results visible during refresh and exposes Market Sensitivity plus slow-market setup details on candidate cards
+- Backend:
+  - Futures scanner accepts `market_sensitivity=conservative|balanced|aggressive`
+  - Active sensitivity can surface smaller slow-market paper candidates only when deterministic structure is clean
+  - slow-market setup labels include range breakout, liquidity sweep reversal, compression breakout, mean reversion from range edge, low-volatility continuation, and low-volatility no-edge
+  - scanner remains USD-M Futures only for candles and live scanner prices
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `app/monitoring/futures_opportunity_scanner.py`
+  - `app/runner/strategy_runner.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/BotControlPanel.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/blocker-explanations.js`
+  - `frontend/src/lib/types.ts`
+  - `frontend/tests/blocker-explanations.test.mjs`
+  - `tests/test_bot_api.py`
+  - `tests/test_futures_opportunity_scanner.py`
+- Validation Run:
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_futures_opportunity_scanner.py -q` passed (`16 passed`)
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py::test_futures_opportunities_response_shape_and_safety_flags tests\test_bot_api.py::test_futures_opportunities_uses_cached_usdm_candles_before_fetching tests\test_bot_api.py::test_futures_opportunities_returns_partial_when_symbol_scan_fails -q` passed (`3 passed`)
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_strategy_runner.py tests\test_trend_following_strategy.py -q` passed (`10 passed`)
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py tests\test_futures_opportunity_scanner.py tests\test_trade_eligibility.py tests\test_scanner_validation_report.py -q` passed (`74 passed`)
+  - `node --test frontend\tests` passed after sandbox escalation for Node worker spawning (`5 passed`)
+  - `npm run build` from `frontend/` passed after sandbox escalation for Vite/esbuild worker spawning
+  - Ruff on touched Python paths passed; pytest/Ruff cache write warnings were sandbox-related
+- Safety:
+  - no live trading, real futures execution, Binance order placement, autonomous AI execution, or profitability claim was added
+  - paper runtime controls remain paper-only and deterministic
+  - scanner scoring inputs, validation snapshots, funding/OI, heatmap, liquidation intelligence, and USD-M Futures data-source boundaries were preserved
+- Remaining Limitations:
+  - scanner HTTP responses still return when the backend request completes; existing visible results stay on screen during refresh, and partial backend results appear when slower symbols time out
+  - Active sensitivity is intentionally conservative: it can surface watch/eligible slow-market candidates, but it does not force paper trades or bypass risk/liquidity/cost gates
+
 ## Latest - Futures Scanner Fallback Bootstrap
 
 - Status: Completed

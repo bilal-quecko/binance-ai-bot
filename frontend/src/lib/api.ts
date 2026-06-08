@@ -14,6 +14,7 @@
   FillItem,
   FuturesLivePriceResponse,
   FuturesLiveSubscriptionResponse,
+  FuturesOpportunityScanJobResponse,
   FuturesOpportunityScanResponse,
   HealthResponse,
   HistoryFilters,
@@ -87,6 +88,8 @@ export interface ApiRequestOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
 }
+
+export type SelectedMarket = 'spot' | 'futures';
 
 function buildUrl(path: string, params?: URLSearchParams): string {
   const suffix = params && params.toString().length > 0 ? `?${params.toString()}` : '';
@@ -394,22 +397,24 @@ export function getCandles(
   timeframe: '1m' | '5m' | '15m' | '1h',
   limit = 120,
   options?: ApiRequestOptions,
+  market: SelectedMarket = 'spot',
 ): Promise<CandleHistoryResponse> {
   const params = new URLSearchParams({
     symbol: symbol.trim().toUpperCase(),
     timeframe,
     limit: String(limit),
+    market,
   });
   return requestJson<CandleHistoryResponse>('/bot/candles', params, requestOptions(options));
 }
 
-export function getBackfillStatus(symbol: string, options?: ApiRequestOptions): Promise<BackfillStatusResponse> {
-  const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
+export function getBackfillStatus(symbol: string, options?: ApiRequestOptions, market: SelectedMarket = 'spot'): Promise<BackfillStatusResponse> {
+  const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase(), market });
   return requestJson<BackfillStatusResponse>('/bot/backfill-status', params, requestOptions(options));
 }
 
-export function triggerBackfill(symbol: string, options?: ApiRequestOptions): Promise<BackfillStatusResponse> {
-  const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase() });
+export function triggerBackfill(symbol: string, options?: ApiRequestOptions, market: SelectedMarket = 'spot'): Promise<BackfillStatusResponse> {
+  const params = new URLSearchParams({ symbol: symbol.trim().toUpperCase(), market });
   return requestJson<BackfillStatusResponse>('/bot/backfill', params, {
     method: 'POST',
     signal: options?.signal,
@@ -485,6 +490,7 @@ export interface FuturesOpportunityFilters {
   includeWeakEvidence: boolean;
   horizon: string;
   includeAvoid: boolean;
+  marketSensitivity?: TradingProfile;
 }
 
 export function getFuturesOpportunities(filters: FuturesOpportunityFilters): Promise<FuturesOpportunityScanResponse> {
@@ -494,11 +500,58 @@ export function getFuturesOpportunities(filters: FuturesOpportunityFilters): Pro
     include_weak_evidence: filters.includeWeakEvidence ? 'true' : 'false',
     horizon: filters.horizon,
     include_avoid: filters.includeAvoid ? 'true' : 'false',
+    market_sensitivity: filters.marketSensitivity ?? 'balanced',
     scan_timeout_seconds: '45',
   });
   return requestJson<FuturesOpportunityScanResponse>('/bot/futures-opportunities', params, {
     timeoutMs: FUTURES_SCANNER_TIMEOUT_MS,
   });
+}
+
+function futuresOpportunityScanPayload(filters: FuturesOpportunityFilters) {
+  return {
+    max_symbols: filters.maxSymbols,
+    min_opportunity_score: filters.minOpportunityScore,
+    include_weak_evidence: filters.includeWeakEvidence,
+    horizon: filters.horizon,
+    include_avoid: filters.includeAvoid,
+    market_sensitivity: filters.marketSensitivity ?? 'balanced',
+    batch_size: 8,
+    concurrency: 5,
+    symbol_timeout_seconds: 7,
+    scan_timeout_seconds: 45,
+  };
+}
+
+export function startFuturesOpportunityScan(filters: FuturesOpportunityFilters): Promise<FuturesOpportunityScanJobResponse> {
+  return requestJson<FuturesOpportunityScanJobResponse>(
+    '/bot/futures-opportunities/scan',
+    undefined,
+    {
+      method: 'POST',
+      body: JSON.stringify(futuresOpportunityScanPayload(filters)),
+      timeoutMs: 10_000,
+    },
+  );
+}
+
+export function getFuturesOpportunityScanJob(scanId: string): Promise<FuturesOpportunityScanJobResponse> {
+  return requestJson<FuturesOpportunityScanJobResponse>(
+    `/bot/futures-opportunities/scan/${encodeURIComponent(scanId)}`,
+    undefined,
+    { timeoutMs: 10_000 },
+  );
+}
+
+export function cancelFuturesOpportunityScanJob(scanId: string): Promise<FuturesOpportunityScanJobResponse> {
+  return requestJson<FuturesOpportunityScanJobResponse>(
+    `/bot/futures-opportunities/scan/${encodeURIComponent(scanId)}/cancel`,
+    undefined,
+    {
+      method: 'POST',
+      timeoutMs: 10_000,
+    },
+  );
 }
 
 export function getFuturesLivePrices(symbols: string[]): Promise<FuturesLivePriceResponse> {

@@ -237,6 +237,9 @@ export interface FuturesPaperSignalResponse {
   risk_grade: 'low' | 'medium' | 'high';
   regime: string | null;
   current_price: DecimalString | null;
+  market_sensitivity: TradingProfile;
+  slow_market_setup: 'none' | 'range_breakout' | 'liquidity_sweep_reversal' | 'compression_breakout' | 'mean_reversion_range_edge' | 'low_volatility_continuation' | 'low_volatility_no_edge';
+  slow_market_reason: string | null;
   data_source: 'binance_usdm_futures';
   price_type: 'mark_price' | 'futures_last_price';
   reason: string;
@@ -319,6 +322,22 @@ export interface FuturesOpportunityScanResponse {
   latest_scanner_error: string | null;
   persisted_candidate_count: number;
   fallback_symbol_count: number;
+}
+
+export interface FuturesOpportunityScanJobResponse {
+  scan_id: string;
+  status: 'queued' | 'running' | 'partial' | 'completed' | 'failed' | 'cancelled';
+  total_symbols: number;
+  scanned_symbols: number;
+  current_symbol: string | null;
+  current_phase: string;
+  started_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  scan: FuturesOpportunityScanResponse | null;
+  warnings: string[];
+  failed_symbols: string[];
+  latest_error: string | null;
 }
 
 export interface FuturesLivePriceItemResponse {

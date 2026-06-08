@@ -377,9 +377,9 @@ class StrategyRunner:
             "MISSING_EMA": "Need more candles before trend signals can activate.",
             "REGIME_NOT_TREND": "Trend is not confirmed yet.",
             "MISSING_ATR_CONTEXT": "Need more volatility context before entries can activate.",
-            "VOL_TOO_LOW": "Price movement is too quiet to justify a paper entry yet.",
+            "VOL_TOO_LOW": "No trade because volatility is too low and no clean range edge is confirmed.",
             "VOL_TOO_HIGH": "Volatility is unstable, so the setup stays on hold.",
-            "MICROSTRUCTURE_UNHEALTHY": "Spread or order-book quality is not healthy enough yet.",
+            "MICROSTRUCTURE_UNHEALTHY": "No trade because spread, liquidity, or order-book quality is not healthy enough yet.",
             "EMA_NOT_BULLISH": "Fast EMA is not clearly above the slow EMA yet.",
             "POSITION_OPEN": "An open paper position exists, so the bot is waiting for an exit setup.",
             "NO_POSITION": "No open position, so no exit setup exists.",
@@ -394,8 +394,8 @@ class StrategyRunner:
         """Return trader-facing explanations for risk-engine blocks."""
 
         messages: dict[str, str] = {
-            "EDGE_BELOW_COSTS": f"Expected edge for {symbol} is still too small after fees and slippage.",
-            "EXPECTED_EDGE_TOO_SMALL": "Projected reward is not strong enough for the current paper costs.",
+            "EDGE_BELOW_COSTS": f"No trade because fee and slippage estimates would consume the expected edge for {symbol}.",
+            "EXPECTED_EDGE_TOO_SMALL": "No trade because projected reward is not strong enough for the current paper costs.",
             "DAILY_LOSS_LIMIT": "Daily loss protection is active, so new entries are blocked.",
             "OPEN_POSITION_LIMIT": "The configured open-position limit is already reached.",
             "STOP_DISTANCE_TOO_TIGHT": "The protective stop is too tight relative to current price movement.",

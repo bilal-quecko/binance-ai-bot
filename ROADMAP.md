@@ -98,6 +98,11 @@ Status: Current product direction and implemented paper scanner
 
 - Paper-only scanner ranks Binance quote-asset symbols as LONG, SHORT, WAIT, or AVOID.
 - Scanner supports 20, 50, and 100-symbol market coverage for paper opportunity discovery.
+- Scanner refresh uses async progressive jobs so the UI can show queued/running/partial/completed progress and partial candidates while slower symbols continue.
+- Scanner uses USD-M Futures candles/prices and cache-first reads for scanner candle history.
+- Scanner Simulate opens a separate Futures Paper Simulation flow with scanner-provided direction, entry, stop, target, confidence, risk grade, and editable paper stop/target fields.
+- Market Sensitivity supports Conservative, Balanced, and Active paper modes; Active surfaces smaller slow-market setups only when structure and risk gates remain clean.
+- Slow-market setup labels include range breakout, liquidity sweep reversal, compression breakout, mean reversion from range edge, low-volatility continuation, and low-volatility no-edge.
 - Scanner cards include display-only leverage-risk simulation for paper TP/SL/live return estimates.
 - LONG candidates should render green.
 - SHORT candidates should render red.

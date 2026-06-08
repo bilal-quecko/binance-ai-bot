@@ -44,6 +44,35 @@ def _candles(symbol: str, *, step: Decimal, count: int = 48) -> list[Candle]:
     return candles
 
 
+def _quiet_candles(symbol: str, *, step: Decimal, count: int = 48) -> list[Candle]:
+    base_time = datetime(2024, 3, 9, 10, 0, tzinfo=UTC)
+    price = Decimal("100")
+    candles = []
+    for index in range(count):
+        open_price = price + (Decimal(index) * step)
+        close_price = open_price + step
+        high = max(open_price, close_price) + Decimal("0.02")
+        low = min(open_price, close_price) - Decimal("0.02")
+        candles.append(
+            Candle(
+                symbol=symbol,
+                timeframe="1m",
+                open=open_price,
+                high=high,
+                low=low,
+                close=close_price,
+                volume=Decimal("100"),
+                quote_volume=Decimal("1000000"),
+                open_time=base_time + timedelta(minutes=index),
+                close_time=base_time + timedelta(minutes=index, seconds=59),
+                event_time=base_time + timedelta(minutes=index, seconds=59),
+                trade_count=100,
+                is_closed=True,
+            )
+        )
+    return candles
+
+
 def _technical(symbol: str, *, direction: str, momentum: str, agreement: str, volatility: str = "normal") -> TechnicalAnalysisSnapshot:
     return TechnicalAnalysisSnapshot(
         symbol=symbol,
@@ -271,6 +300,44 @@ def test_mixed_setup_returns_wait() -> None:
 
     assert signal.direction == "wait"
     assert signal.evidence_strength == "mixed"
+
+
+def test_active_sensitivity_surfaces_clean_slow_market_setup() -> None:
+    scanner = FuturesOpportunityScanner()
+
+    signal = scanner.analyze_symbol(
+        FuturesSignalContext(
+            symbol="SLOWUSDT",
+            candles=_quiet_candles("SLOWUSDT", step=Decimal("0.03")),
+            technical_analysis=_technical("SLOWUSDT", direction="bullish", momentum="bullish", agreement="bullish_alignment", volatility="low"),
+            regime_analysis=_regime("SLOWUSDT", "sideways"),
+            market_sensitivity="aggressive",
+        )
+    )
+
+    assert signal.market_sensitivity == "aggressive"
+    assert signal.slow_market_setup in {"low_volatility_continuation", "range_breakout", "compression_breakout"}
+    assert signal.slow_market_reason is not None
+    assert "Slow market:" in signal.slow_market_reason
+    assert signal.direction in {"long", "wait"}
+    assert signal.suggested_stop_loss is not None
+
+
+def test_low_volatility_without_edge_remains_blocked() -> None:
+    scanner = FuturesOpportunityScanner()
+
+    signal = scanner.analyze_symbol(
+        FuturesSignalContext(
+            symbol="DEADUSDT",
+            candles=_quiet_candles("DEADUSDT", step=Decimal("0")),
+            technical_analysis=_technical("DEADUSDT", direction="sideways", momentum="neutral", agreement="mixed", volatility="low"),
+            regime_analysis=_regime("DEADUSDT", "sideways"),
+        )
+    )
+
+    assert signal.direction in {"wait", "avoid"}
+    assert signal.slow_market_setup == "low_volatility_no_edge"
+    assert signal.reason == "No trade: low volatility without edge."
 
 
 def test_choppy_or_low_liquidity_setup_returns_avoid() -> None:

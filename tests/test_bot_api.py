@@ -303,6 +303,52 @@ class SlowFuturesRestClient(FakeFuturesRestClient):
         )
 
 
+class DelayedSymbolFuturesRestClient(FakeFuturesRestClient):
+    def __init__(self, *, delayed_symbol: str, delay_seconds: float, count: int = 6) -> None:
+        super().__init__(count=count)
+        self.delayed_symbol = delayed_symbol
+        self.delay_seconds = delay_seconds
+
+    async def get_futures_klines(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 1000,
+    ):
+        if symbol == self.delayed_symbol:
+            await asyncio.sleep(self.delay_seconds)
+        return await super().get_futures_klines(
+            symbol=symbol,
+            interval=interval,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+            limit=limit,
+        )
+
+
+class VerySlowFuturesRestClient(FakeFuturesRestClient):
+    async def get_futures_klines(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 1000,
+    ):
+        await asyncio.sleep(5)
+        return await super().get_futures_klines(
+            symbol=symbol,
+            interval=interval,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+            limit=limit,
+        )
+
+
 class FakeFuturesHeartbeatService:
     def __init__(self, prices: dict[str, FuturesScannerLivePrice] | None = None) -> None:
         self.prices = prices or {}
@@ -314,6 +360,20 @@ class FakeFuturesHeartbeatService:
     async def update_subscriptions(self, symbols):
         self.subscribed = sanitize_scanner_symbols(symbols, max_symbols=100)
         return self.subscribed
+
+
+def _poll_futures_scan_job(client: TestClient, scan_id: str, predicate, timeout: float = 5.0) -> dict:
+    deadline = time.perf_counter() + timeout
+    latest: dict | None = None
+    while time.perf_counter() < deadline:
+        response = client.get(f'/bot/futures-opportunities/scan/{scan_id}')
+        assert response.status_code == 200
+        latest = response.json()
+        if predicate(latest):
+            return latest
+        time.sleep(0.05)
+    assert latest is not None
+    return latest
 
 
 class FakeRuntime:
@@ -2192,6 +2252,264 @@ def test_futures_opportunities_response_shape_and_safety_flags() -> None:
     assert {'top_long', 'top_short', 'random_baseline'} <= {snapshot.candidate_group for snapshot in snapshots}
     assert all(snapshot.price_at_scan != Decimal('123.45') for snapshot in snapshots if snapshot.price_at_scan is not None)
     assert all(snapshot.data_source == 'binance_usdm_futures' for snapshot in snapshots)
+
+
+def test_async_futures_scan_start_returns_immediately() -> None:
+    settings = Settings(DATABASE_URL=f"sqlite:///{_db_path()}")
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: VerySlowFuturesRestClient(count=5)
+    client = TestClient(app)
+
+    try:
+        started_at = time.perf_counter()
+        response = client.post(
+            '/bot/futures-opportunities/scan',
+            json={'max_symbols': 5, 'batch_size': 5, 'include_avoid': True},
+        )
+        elapsed = time.perf_counter() - started_at
+        assert response.status_code == 200
+        body = response.json()
+        assert elapsed < 1
+        assert body['scan_id']
+        assert body['status'] in {'queued', 'running'}
+        cancel_response = client.post(f"/bot/futures-opportunities/scan/{body['scan_id']}/cancel")
+        assert cancel_response.status_code == 200
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_async_futures_scan_progress_endpoint_returns_running_state() -> None:
+    settings = Settings(DATABASE_URL=f"sqlite:///{_db_path()}")
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: VerySlowFuturesRestClient(count=5)
+    client = TestClient(app)
+
+    try:
+        response = client.post(
+            '/bot/futures-opportunities/scan',
+            json={'max_symbols': 5, 'batch_size': 5, 'include_avoid': True},
+        )
+        assert response.status_code == 200
+        scan_id = response.json()['scan_id']
+        body = _poll_futures_scan_job(
+            client,
+            scan_id,
+            lambda item: item['status'] in {'running', 'partial'} and item['current_phase'] != 'queued',
+        )
+        assert body['scan_id'] == scan_id
+        assert body['status'] in {'running', 'partial'}
+        assert body['current_phase'] in {'loading_universe', 'symbol_universe_ready', 'scanning_batch', 'futures_candle_fetch'}
+        assert client.post(f'/bot/futures-opportunities/scan/{scan_id}/cancel').status_code == 200
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_async_futures_scan_returns_partial_candidates_before_completion() -> None:
+    settings = Settings(DATABASE_URL=f"sqlite:///{_db_path()}")
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: DelayedSymbolFuturesRestClient(
+        delayed_symbol='SYM006USDT',
+        delay_seconds=2,
+        count=6,
+    )
+    client = TestClient(app)
+
+    try:
+        response = client.post(
+            '/bot/futures-opportunities/scan',
+            json={'max_symbols': 6, 'batch_size': 5, 'include_avoid': True, 'scan_timeout_seconds': 10},
+        )
+        assert response.status_code == 200
+        scan_id = response.json()['scan_id']
+        body = _poll_futures_scan_job(
+            client,
+            scan_id,
+            lambda item: item['status'] == 'partial' and item['scanned_symbols'] >= 5 and item['scan'] is not None,
+            timeout=3,
+        )
+        assert body['status'] == 'partial'
+        assert body['scanned_symbols'] >= 5
+        assert body['scanned_symbols'] < body['total_symbols']
+        assert body['scan']['long_candidates'] or body['scan']['short_candidates'] or body['scan']['neutral_candidates']
+        assert client.post(f'/bot/futures-opportunities/scan/{scan_id}/cancel').status_code == 200
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_async_futures_scan_failed_symbols_do_not_fail_job() -> None:
+    settings = Settings(DATABASE_URL=f"sqlite:///{_db_path()}")
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: FakeFuturesRestClient(failing_symbols={'ETHUSDT'}, count=6)
+    client = TestClient(app)
+
+    try:
+        response = client.post(
+            '/bot/futures-opportunities/scan',
+            json={'max_symbols': 6, 'batch_size': 5, 'include_avoid': True},
+        )
+        assert response.status_code == 200
+        scan_id = response.json()['scan_id']
+        body = _poll_futures_scan_job(client, scan_id, lambda item: item['status'] == 'completed')
+    finally:
+        app.dependency_overrides.clear()
+
+    assert body['status'] == 'completed'
+    assert 'ETHUSDT' in body['failed_symbols']
+    assert body['scan'] is not None
+    assert body['scan']['scan_state'] == 'partial'
+
+
+def test_async_futures_scan_cancel_endpoint_works() -> None:
+    settings = Settings(DATABASE_URL=f"sqlite:///{_db_path()}")
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: VerySlowFuturesRestClient(count=5)
+    client = TestClient(app)
+
+    try:
+        response = client.post(
+            '/bot/futures-opportunities/scan',
+            json={'max_symbols': 5, 'batch_size': 5, 'include_avoid': True},
+        )
+        assert response.status_code == 200
+        scan_id = response.json()['scan_id']
+        cancel_response = client.post(f'/bot/futures-opportunities/scan/{scan_id}/cancel')
+        assert cancel_response.status_code == 200
+        body = _poll_futures_scan_job(client, scan_id, lambda item: item['status'] == 'cancelled')
+    finally:
+        app.dependency_overrides.clear()
+
+    assert body['status'] == 'cancelled'
+    assert body['latest_error'] == 'Scan cancelled by user.'
+
+
+def test_async_futures_scan_job_status_does_not_duplicate_validation_snapshots() -> None:
+    settings = Settings(DATABASE_URL=f"sqlite:///{_db_path()}")
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: FakeFuturesRestClient(count=2)
+    client = TestClient(app)
+
+    try:
+        response = client.post(
+            '/bot/futures-opportunities/scan',
+            json={'max_symbols': 2, 'batch_size': 5, 'include_avoid': True},
+        )
+        assert response.status_code == 200
+        scan_id = response.json()['scan_id']
+        body = _poll_futures_scan_job(client, scan_id, lambda item: item['status'] == 'completed')
+        assert body['scan'] is not None
+        repository = StorageRepository(settings.database_url)
+        try:
+            snapshot_count = len(repository.get_scanner_validation_snapshots())
+            assert snapshot_count > 0
+            assert client.get(f'/bot/futures-opportunities/scan/{scan_id}').status_code == 200
+            assert client.get(f'/bot/futures-opportunities/scan/{scan_id}').status_code == 200
+            assert len(repository.get_scanner_validation_snapshots()) == snapshot_count
+        finally:
+            repository.close()
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_futures_opportunities_uses_cached_usdm_candles_before_fetching() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    repository = StorageRepository(settings.database_url)
+    now = datetime.now(tz=UTC).replace(second=0, microsecond=0)
+    for interval, minutes, count, step in (('15m', 15, 48, Decimal('0.20')), ('1h', 60, 36, Decimal('0.60'))):
+        candles = []
+        base_time = now - timedelta(minutes=minutes * (count + 1))
+        for index in range(count):
+            open_price = Decimal('100') + (Decimal(index) * step)
+            close_price = open_price + (step / Decimal('2'))
+            candles.append(
+                Candle(
+                    symbol='BTCUSDT',
+                    timeframe=interval,
+                    open=open_price,
+                    high=close_price + Decimal('0.10'),
+                    low=open_price - Decimal('0.10'),
+                    close=close_price,
+                    volume=Decimal('100'),
+                    quote_volume=Decimal('1000000'),
+                    open_time=base_time + timedelta(minutes=minutes * index),
+                    close_time=base_time + timedelta(minutes=minutes * index + minutes, seconds=-1),
+                    event_time=base_time + timedelta(minutes=minutes * index + minutes, seconds=-1),
+                    trade_count=100,
+                    is_closed=True,
+                )
+            )
+        repository.upsert_futures_historical_candles(candles, source='binance_usdm_futures')
+    repository.close()
+
+    rest_client = FakeFuturesRestClient(count=1)
+    app.dependency_overrides[get_symbol_sentiment_service] = lambda: FakeSymbolSentimentService()
+    app.dependency_overrides[get_bot_runtime] = lambda: NeutralRuntime()
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: rest_client
+    client = TestClient(app)
+
+    try:
+        response = client.get('/bot/futures-opportunities', params={'limit': 1, 'include_avoid': 'true'})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['symbol_count'] == 1
+    assert rest_client.calls == []
+    candidates = body['long_candidates'] + body['short_candidates'] + body['neutral_candidates']
+    assert candidates
+    assert candidates[0]['data_source'] == 'binance_usdm_futures'
+
+
+def test_selected_futures_backfill_and_candles_use_usdm_klines() -> None:
+    settings = Settings(DATABASE_URL=f"sqlite:///{_db_path()}")
+    rest_client = FakeFuturesRestClient(count=1)
+    app.dependency_overrides[get_bot_runtime] = lambda: NeutralRuntime()
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: rest_client
+    client = TestClient(app)
+
+    try:
+        backfill_response = client.post(
+            '/bot/backfill',
+            params={'symbol': 'BTCUSDT', 'market': 'futures', 'interval': '15m', 'lookback_days': 1},
+        )
+        candles_response = client.get(
+            '/bot/candles',
+            params={'symbol': 'BTCUSDT', 'market': 'futures', 'timeframe': '15m', 'limit': 20},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert backfill_response.status_code == 200
+    assert backfill_response.json()['status'] in {'ready', 'partial'}
+    assert ('BTCUSDT', '15m') in rest_client.calls
+    assert candles_response.status_code == 200
+    body = candles_response.json()
+    assert body['symbol'] == 'BTCUSDT'
+    assert body['candles']
+    assert body['current_price'] is not None
+
+
+def test_selected_futures_backfill_reports_unsupported_market_symbol() -> None:
+    settings = Settings(DATABASE_URL=f"sqlite:///{_db_path()}")
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: FakeFuturesRestClient(failing_symbols={'BTCUSDT'}, count=1)
+    client = TestClient(app)
+
+    try:
+        response = client.post(
+            '/bot/backfill',
+            params={'symbol': 'BTCUSDT', 'market': 'futures', 'interval': '15m', 'lookback_days': 1},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['status'] == 'failed'
+    assert 'Symbol not available on selected market' in body['message']
 
 
 def test_futures_opportunities_returns_partial_when_symbol_scan_fails() -> None:

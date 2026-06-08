@@ -6,7 +6,13 @@ import {
   isLastSuccessfulScannerCache,
   scannerCandidateCount,
 } from '../lib/futures-scanner-ux.js';
-import type { FuturesLivePriceItemResponse, FuturesLivePriceResponse, FuturesOpportunityScanResponse, FuturesPaperSignalResponse } from '../lib/types';
+import type {
+  FuturesLivePriceItemResponse,
+  FuturesLivePriceResponse,
+  FuturesOpportunityScanJobResponse,
+  FuturesOpportunityScanResponse,
+  FuturesPaperSignalResponse,
+} from '../lib/types';
 import { AdvancedDetailsPro } from './AdvancedDetailsPro';
 import { StatePanel } from './StatePanel';
 
@@ -16,10 +22,12 @@ interface FuturesScannerFilters {
   includeWeakEvidence: boolean;
   horizon: string;
   includeAvoid: boolean;
+  marketSensitivity: 'conservative' | 'balanced' | 'aggressive';
 }
 
 interface FuturesPaperScannerSectionProps {
   scan: FuturesOpportunityScanResponse | null;
+  scanJob: FuturesOpportunityScanJobResponse | null;
   loading: boolean;
   refreshing: boolean;
   error: string | null;
@@ -34,8 +42,9 @@ interface FuturesPaperScannerSectionProps {
   selectedLeverage?: LeverageOption;
   onSelectedLeverageChange?: (leverage: LeverageOption) => void;
   onViewSignal?: (symbol: string) => void;
-  onSimulate?: (symbol: string) => void;
+  onSimulate?: (signal: FuturesPaperSignalResponse, livePrice?: FuturesLivePriceItemResponse) => void;
   onRefresh: () => void;
+  onCancelScan: () => void;
 }
 
 function humanize(value: string | null | undefined): string {
@@ -239,6 +248,16 @@ function dataSourceLabel(dataSource: string | null | undefined): string {
   return dataSource === 'binance_usdm_futures' ? 'binance_usdm_futures' : (dataSource ?? '-');
 }
 
+function sensitivityLabel(value: FuturesScannerFilters['marketSensitivity']): string {
+  if (value === 'conservative') {
+    return 'Conservative';
+  }
+  if (value === 'aggressive') {
+    return 'Active';
+  }
+  return 'Balanced';
+}
+
 function heatmapTag(signal: FuturesPaperSignalResponse): string | null {
   if (signal.heatmap_alignment === 'confirmed') {
     return 'Heatmap Confirmed';
@@ -353,7 +372,7 @@ function SignalCard({
   livePrice: FuturesLivePriceItemResponse | undefined;
   heartbeatNow: Date;
   onViewSignal: (symbol: string) => void;
-  onSimulate: (symbol: string) => void;
+  onSimulate: (signal: FuturesPaperSignalResponse, livePrice?: FuturesLivePriceItemResponse) => void;
 }) {
   const heartbeat = buildHeartbeat(signal, livePrice, heartbeatNow);
   const showSource = heartbeat.status === 'stale' || heartbeat.source === 'cache' || heartbeat.source === 'unavailable';
@@ -418,7 +437,7 @@ function SignalCard({
         </button>
         <button
           type="button"
-          onClick={() => onSimulate(signal.symbol)}
+          onClick={() => onSimulate(signal, livePrice)}
           className="rounded-md border border-borderSoft bg-panelBgSoft px-3 py-2 text-sm font-medium text-textSecondary transition hover:border-borderMedium hover:text-textPrimary"
         >
           Simulate
@@ -433,6 +452,8 @@ function SignalCard({
             <div><span className="text-slate-500">Momentum</span><p>{humanize(signal.momentum)}</p></div>
             <div><span className="text-slate-500">Best Horizon</span><p>{signal.best_horizon}</p></div>
             <div><span className="text-slate-500">Evidence Level</span><p>{humanize(signal.evidence_strength)}</p></div>
+            <div><span className="text-slate-500">Slow-Market Setup</span><p>{humanize(signal.slow_market_setup)}</p></div>
+            <div><span className="text-slate-500">Market Sensitivity</span><p>{sensitivityLabel(signal.market_sensitivity)}</p></div>
             <div><span className="text-slate-500">Risk</span><p>{signal.risk_grade}</p></div>
             <div><span className="text-slate-500">Signal Age</span><p>{formatDuration(heartbeat.signalAgeSeconds)}</p></div>
             <div><span className="text-slate-500">Stop</span><p>{signal.suggested_stop_loss ? formatDecimal(signal.suggested_stop_loss) : '-'}</p></div>
@@ -492,6 +513,9 @@ function SignalCard({
           <p className="mt-2 text-xs text-slate-400">{signal.liquidity_zone_explanation}</p>
           <p className="mt-2 text-xs text-slate-400">{signal.heatmap_explanation}</p>
           <p className="mt-2 text-xs text-slate-400">{signal.liquidation_explanation}</p>
+          {signal.slow_market_reason ? (
+            <p className="mt-2 text-xs text-sky-200">{signal.slow_market_reason}</p>
+          ) : null}
           {!signal.heatmap_is_real_data ? (
             <p className="mt-2 text-xs text-amber-200">Heatmap data is mock/estimated. Do not treat as real market heatmap.</p>
           ) : null}
@@ -533,7 +557,7 @@ function CandidateGroup({
   livePriceBySymbol: Map<string, FuturesLivePriceItemResponse>;
   heartbeatNow: Date;
   onViewSignal: (symbol: string) => void;
-  onSimulate: (symbol: string) => void;
+  onSimulate: (signal: FuturesPaperSignalResponse, livePrice?: FuturesLivePriceItemResponse) => void;
 }) {
   return (
     <div className="space-y-3">
@@ -561,14 +585,39 @@ function CandidateGroup({
 function ScannerProgress({
   active,
   scan,
+  scanJob,
   maxSymbols,
 }: {
   active: boolean;
   scan: FuturesOpportunityScanResponse | null;
+  scanJob: FuturesOpportunityScanJobResponse | null;
   maxSymbols: number;
 }) {
   if (!active) {
     return null;
+  }
+  if (scanJob && !['completed', 'failed', 'cancelled'].includes(scanJob.status)) {
+    const total = scanJob.total_symbols || maxSymbols;
+    return (
+      <div className="mb-5 rounded-lg border border-sky-400/25 bg-sky-400/10 p-4 text-sm text-sky-100">
+        <div className="flex flex-wrap items-center gap-3">
+          <span className="h-4 w-4 animate-spin rounded-full border-2 border-sky-200 border-t-transparent" />
+          <div>
+            <p className="font-semibold">Scan started</p>
+            <p className="mt-1 text-xs text-sky-200">
+              Scanned {scanJob.scanned_symbols}/{total}
+              {scanJob.current_symbol ? ` - ${scanJob.current_symbol}` : ''} - {humanize(scanJob.current_phase)}
+            </p>
+          </div>
+        </div>
+        <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-900">
+          <div
+            className="h-full rounded-full bg-sky-300 transition-all"
+            style={{ width: `${Math.max(4, Math.min(100, total > 0 ? (scanJob.scanned_symbols / total) * 100 : 4))}%` }}
+          />
+        </div>
+      </div>
+    );
   }
   if (scan) {
     return (
@@ -584,7 +633,7 @@ function ScannerProgress({
         <span className="h-4 w-4 animate-spin rounded-full border-2 border-sky-200 border-t-transparent" />
         <div>
           <p className="font-semibold">Preparing USD-M Futures symbol universe</p>
-          <p className="mt-1 text-xs text-sky-200">Scanning up to {maxSymbols} symbols. Partial results will appear as soon as the scan completes.</p>
+          <p className="mt-1 text-xs text-sky-200">Scanning up to {maxSymbols} symbols. Existing results stay visible while this refresh runs; partial backend results are shown if slower symbols time out.</p>
         </div>
       </div>
       <div className="mt-3 grid gap-2 text-xs text-sky-200 sm:grid-cols-2 lg:grid-cols-4">
@@ -599,6 +648,7 @@ function ScannerProgress({
 
 export function FuturesPaperScannerSection({
   scan,
+  scanJob,
   loading,
   refreshing,
   error,
@@ -613,7 +663,9 @@ export function FuturesPaperScannerSection({
   onViewSignal = () => undefined,
   onSimulate = () => undefined,
   onRefresh,
+  onCancelScan,
 }: FuturesPaperScannerSectionProps) {
+  const scanJobActive = !!scanJob && !['completed', 'failed', 'cancelled'].includes(scanJob.status);
   if (error && !scan) {
     return (
       <section className="rounded-lg border border-slate-800 bg-slate-950/55 p-5 shadow-glow">
@@ -625,7 +677,7 @@ export function FuturesPaperScannerSection({
         <button
           type="button"
           onClick={onRefresh}
-          disabled={refreshing || loading}
+          disabled={refreshing || loading || scanJobActive}
           className="mt-4 rounded-lg border border-sky-400/30 bg-sky-400/10 px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-sky-100 transition hover:border-sky-300 hover:bg-sky-400/20 focus:outline-none focus:ring-2 focus:ring-sky-300/60 disabled:cursor-not-allowed disabled:opacity-50"
         >
           Retry Scanner
@@ -636,8 +688,17 @@ export function FuturesPaperScannerSection({
   if (loading && !scan) {
     return (
       <section className="rounded-lg border border-slate-800 bg-slate-950/55 p-5 shadow-glow">
-        <ScannerProgress active scan={scan} maxSymbols={filters.maxSymbols} />
+        <ScannerProgress active scan={scan} scanJob={scanJob} maxSymbols={filters.maxSymbols} />
         <StatePanel title="Loading futures paper scanner" message="Scanning symbols for advisory long/short paper opportunities." tone="loading" />
+        {scanJobActive ? (
+          <button
+            type="button"
+            onClick={onCancelScan}
+            className="mt-4 rounded-lg border border-amber-400/35 bg-amber-400/10 px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-amber-100 transition hover:border-amber-300 hover:bg-amber-400/20"
+          >
+            Cancel Scan
+          </button>
+        ) : null}
       </section>
     );
   }
@@ -652,7 +713,7 @@ export function FuturesPaperScannerSection({
         <button
           type="button"
           onClick={onRefresh}
-          disabled={refreshing || loading}
+          disabled={refreshing || loading || scanJobActive}
           className="mt-4 rounded-lg border border-sky-400/30 bg-sky-400/10 px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-sky-100 transition hover:border-sky-300 hover:bg-sky-400/20 focus:outline-none focus:ring-2 focus:ring-sky-300/60 disabled:cursor-not-allowed disabled:opacity-50"
         >
           Retry Scanner
@@ -695,11 +756,20 @@ export function FuturesPaperScannerSection({
           <button
             type="button"
             onClick={onRefresh}
-            disabled={refreshing || loading}
+            disabled={refreshing || loading || scanJobActive}
             className="rounded-lg border border-sky-400/30 bg-sky-400/10 px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-sky-100 transition hover:border-sky-300 hover:bg-sky-400/20 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            {refreshing || loading ? 'Scanning...' : 'Refresh'}
+            {scanJobActive || refreshing || loading ? 'Scanning...' : 'Refresh'}
           </button>
+          {scanJobActive ? (
+            <button
+              type="button"
+              onClick={onCancelScan}
+              className="rounded-lg border border-amber-400/35 bg-amber-400/10 px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-amber-100 transition hover:border-amber-300 hover:bg-amber-400/20"
+            >
+              Cancel Scan
+            </button>
+          ) : null}
         </div>
       </div>
 
@@ -751,6 +821,18 @@ export function FuturesPaperScannerSection({
             <option value={15}>Every 15 minutes</option>
           </select>
         </label>
+        <label className="space-y-2">
+          <span className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Market Sensitivity</span>
+          <select
+            value={filters.marketSensitivity ?? 'balanced'}
+            onChange={(event) => onFiltersChange({ ...filters, marketSensitivity: event.target.value as FuturesScannerFilters['marketSensitivity'] })}
+            className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-white"
+          >
+            <option value="conservative">Conservative</option>
+            <option value="balanced">Balanced</option>
+            <option value="aggressive">Active</option>
+          </select>
+        </label>
         <div className="flex flex-col justify-end gap-2">
           <label className="flex items-center gap-2 text-sm text-slate-300">
             <input
@@ -763,7 +845,7 @@ export function FuturesPaperScannerSection({
         </div>
       </div>
 
-      <ScannerProgress active={loading || refreshing} scan={scan} maxSymbols={filters.maxSymbols} />
+      <ScannerProgress active={loading || refreshing || scanJobActive} scan={scan} scanJob={scanJob} maxSymbols={filters.maxSymbols} />
 
       {error ? (
         <div className="mb-5 rounded-lg border border-amber-500/25 bg-amber-500/10 p-4 text-sm text-amber-100">

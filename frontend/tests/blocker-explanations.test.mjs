@@ -26,3 +26,15 @@ const waitingForHistory = explainPrimaryBlocker({
 
 assert.equal(waitingForHistory.title, 'Waiting for more candles');
 assert.equal(waitingForHistory.category, 'data_requirement');
+
+const lowVolatility = explainPrimaryBlocker({
+  runtime_active: true,
+  enough_candle_history: true,
+  risk_reason_codes: [],
+  signal_reason_codes: ['VOL_TOO_LOW'],
+  blocking_reasons: ['No trade because volatility is too low and no clean range edge is confirmed.'],
+  reason_if_not_trading: 'No trade because volatility is too low and no clean range edge is confirmed.',
+});
+
+assert.equal(lowVolatility.title, 'Low volatility without edge');
+assert.match(lowVolatility.happened, /no clean range edge/i);
