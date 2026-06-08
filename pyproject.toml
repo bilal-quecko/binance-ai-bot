@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "binance-ai-bot"
 version = "0.1.0"
-description = "Starter scaffold for a Binance Spot trading bot with optional AI-assisted analysis"
+description = "AI-assisted Binance Spot signal-intelligence platform with paper-mode trading controls"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
