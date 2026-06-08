@@ -2,6 +2,49 @@
 
 Chronological implementation checkpoints for Binance AI Bot.
 
+## No. 41 - Spot Paper Opportunity Scanner
+
+- Status: Completed
+- Scope:
+  - added a dedicated paper-only Spot Opportunity Scanner service for Binance Spot USDT symbols
+  - ranked Spot symbols as `buy_candidate`, `watch`, `exit_watch`, or `avoid` instead of Futures-style LONG/SHORT
+  - scored candidates using Spot candles, technical trend, momentum, volatility, liquidity, support/resistance structure, regime analysis, validation evidence, and trade-eligibility evidence
+  - added async progressive Spot scan jobs with start, status, and cancel endpoints
+  - persisted completed Spot scanner runs, candidate rows, scanner-validation snapshots, and post-signal outcome snapshots for later usefulness measurement
+  - added a Discover-tab Spot scanner UI with candidate groups, filters, progress, cancel, and `Simulate Spot Paper Trade` handoff into the existing Spot paper simulation flow
+- Backend:
+  - added `app/monitoring/spot_opportunity_scanner.py`
+  - added `POST /bot/spot-opportunities/scan`
+  - added `GET /bot/spot-opportunities/scan/{scan_id}`
+  - added `POST /bot/spot-opportunities/scan/{scan_id}/cancel`
+  - reused existing scanner persistence tables under a Spot-specific quote key (`SPOT:USDT`) so Futures scanner cache/replay remains separate
+- Frontend:
+  - added typed Spot scanner API helpers and response types
+  - added `SpotPaperScannerSection` to the Discover tab above the Futures Paper Scanner
+  - `Simulate Spot Paper Trade` selects the candidate symbol in Spot context and opens the Spot Paper Simulation tab
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `app/monitoring/spot_opportunity_scanner.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/SpotPaperScannerSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_bot_api.py`
+  - `README.md`
+  - `ROADMAP.md`
+  - `PROGRESS.md`
+- Validation Run:
+  - `.\.venv\Scripts\python.exe -m ruff check app\api\bot_api.py app\monitoring\spot_opportunity_scanner.py tests\test_bot_api.py` passed
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py -q` passed (`52 passed`)
+  - `npm run build` from `frontend/` passed
+- Safety:
+  - no live trading, Spot shorting, real futures execution, Binance order placement, autonomous AI execution, or profitability claim was added
+  - Spot scanner output is advisory-only and paper-only
+  - manual Spot paper execution remains behind the existing deterministic paper trade controls
+- Remaining Limitations:
+  - Spot scan jobs are in-memory process-local state and are not recoverable across backend restarts
+  - Spot scanner simulation handoff opens the existing Spot paper simulation flow; it does not create persistent scanner-owned Spot simulation drafts
+
 ## No. 40 - Selected Symbol Analysis + Spot/Futures Paper Simulation Flow
 
 - Status: Completed

@@ -24,6 +24,7 @@ import { RegimeAnalysisSection } from './components/RegimeAnalysisSection';
 import { SectionCard } from './components/SectionCard';
 import { ScannerValidationReportSection } from './components/ScannerValidationReportSection';
 import { SignalValidationSection } from './components/SignalValidationSection';
+import { SpotPaperScannerSection } from './components/SpotPaperScannerSection';
 import { StatePanel } from './components/StatePanel';
 import { SymbolCandlestickChart } from './components/SymbolCandlestickChart';
 import { SymbolSentimentSection } from './components/SymbolSentimentSection';
@@ -44,6 +45,7 @@ import {
   getFusionSignal,
   getFuturesLivePrices,
   getFuturesOpportunityScanJob,
+  getSpotOpportunityScanJob,
   updateFuturesLiveSubscriptions,
   getHealth,
   getEdgeReport,
@@ -70,6 +72,7 @@ import {
   getTradingAssistant,
   getWorkstation,
   cancelFuturesOpportunityScanJob,
+  cancelSpotOpportunityScanJob,
   evaluateScannerValidation,
   manualBuyMarket,
   manualClosePosition,
@@ -79,6 +82,7 @@ import {
   resumeBot,
   startBot,
   startFuturesOpportunityScan,
+  startSpotOpportunityScan,
   stopBot,
   triggerBackfill,
   ApiRequestError,
@@ -128,6 +132,9 @@ import type {
   ScannerValidationReportResponse,
   SignalValidationResponse,
   SimilarSetupResponse,
+  SpotOpportunityScanJobResponse,
+  SpotOpportunityScanResponse,
+  SpotOpportunitySignalResponse,
   SpotSymbolItem,
   SymbolSentimentResponse,
   TechnicalAnalysisResponse,
@@ -201,6 +208,7 @@ const INITIAL_REGIME_ANALYSIS: RegimeAnalysisResponse | null = null;
 const INITIAL_FUSION_SIGNAL: FusionSignalResponse | null = null;
 const INITIAL_TRADING_ASSISTANT: TradingAssistantResponse | null = null;
 const INITIAL_OPPORTUNITIES: OpportunityResponse[] = [];
+const INITIAL_SPOT_OPPORTUNITIES: SpotOpportunityScanResponse | null = null;
 const INITIAL_FUTURES_OPPORTUNITIES: FuturesOpportunityScanResponse | null = null;
 const INITIAL_FUTURES_LIVE_PRICES: FuturesLivePriceResponse | null = null;
 const INITIAL_PERFORMANCE: PerformanceAnalyticsResponse | null = null;
@@ -288,6 +296,10 @@ function futuresScannerErrorMessage(error: unknown): string {
 }
 
 function isTerminalFuturesScanJob(job: FuturesOpportunityScanJobResponse | null): boolean {
+  return job ? ['completed', 'failed', 'cancelled'].includes(job.status) : true;
+}
+
+function isTerminalSpotScanJob(job: SpotOpportunityScanJobResponse | null): boolean {
   return job ? ['completed', 'failed', 'cancelled'].includes(job.status) : true;
 }
 
@@ -2024,6 +2036,8 @@ function App() {
   const [fusionSignal, setFusionSignal] = useState<RemoteState<FusionSignalResponse | null>>(createRemoteState(INITIAL_FUSION_SIGNAL));
   const [tradingAssistant, setTradingAssistant] = useState<RemoteState<TradingAssistantResponse | null>>(createRemoteState(INITIAL_TRADING_ASSISTANT));
   const [opportunities, setOpportunities] = useState<RemoteState<OpportunityResponse[]>>(createRemoteState(INITIAL_OPPORTUNITIES));
+  const [spotOpportunities, setSpotOpportunities] = useState<RemoteState<SpotOpportunityScanResponse | null>>(createRemoteState(INITIAL_SPOT_OPPORTUNITIES));
+  const [spotScanJob, setSpotScanJob] = useState<SpotOpportunityScanJobResponse | null>(null);
   const [futuresOpportunities, setFuturesOpportunities] = useState<RemoteState<FuturesOpportunityScanResponse | null>>(createRemoteState(INITIAL_FUTURES_OPPORTUNITIES));
   const [futuresScanJob, setFuturesScanJob] = useState<FuturesOpportunityScanJobResponse | null>(null);
   const [futuresLivePrices, setFuturesLivePrices] = useState<RemoteState<FuturesLivePriceResponse | null>>(createRemoteState(INITIAL_FUTURES_LIVE_PRICES));
@@ -2059,6 +2073,13 @@ function App() {
     horizon: '7d',
     includeAvoid: true,
     marketSensitivity: 'balanced' as TradingProfile,
+  });
+  const [spotScannerFilters, setSpotScannerFilters] = useState({
+    maxSymbols: 50,
+    minOpportunityScore: 70,
+    minConfidence: 60,
+    horizon: '7d',
+    includeAvoid: true,
   });
   const [selectedFuturesLeverage, setSelectedFuturesLeverage] = useState<LeverageOption>(5);
   const [futuresAutoRescanMinutes, setFuturesAutoRescanMinutes] = useState<0 | 5 | 15>(0);
@@ -2116,6 +2137,54 @@ function App() {
       setOpportunities((current) => ({ ...current, loading: false, refreshing: false, error: message }));
     }
   }, []);
+
+  const refreshSpotOpportunities = useCallback(async () => {
+    setSpotOpportunities((current) => setPending(current));
+    try {
+      const job = await startSpotOpportunityScan(spotScannerFilters);
+      setSpotScanJob(job);
+      setSpotOpportunities((current) => ({
+        data: job.scan ?? current.data,
+        loading: !job.scan && current.data === null,
+        refreshing: !job.scan && current.data !== null,
+        error: null,
+      }));
+      setLastUpdatedAt(new Date());
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to refresh Spot paper scanner.';
+      setSpotOpportunities((current) => ({
+        ...current,
+        data: current.data,
+        loading: false,
+        refreshing: false,
+        error: message,
+      }));
+    }
+  }, [spotScannerFilters]);
+
+  const cancelSpotScan = useCallback(async () => {
+    if (!spotScanJob || isTerminalSpotScanJob(spotScanJob)) {
+      return;
+    }
+    try {
+      const job = await cancelSpotOpportunityScanJob(spotScanJob.scan_id);
+      setSpotScanJob(job);
+      setSpotOpportunities((current) => ({
+        data: job.scan ?? current.data,
+        loading: false,
+        refreshing: false,
+        error: job.status === 'cancelled' ? null : current.error,
+      }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to cancel Spot paper scanner.';
+      setSpotOpportunities((current) => ({
+        ...current,
+        loading: false,
+        refreshing: false,
+        error: message,
+      }));
+    }
+  }, [spotScanJob]);
 
   const refreshFuturesOpportunities = useCallback(async () => {
     setFuturesOpportunities((current) => setPending(current));
@@ -2542,8 +2611,73 @@ function App() {
   }, [refreshOpportunities]);
 
   useEffect(() => {
+    void refreshSpotOpportunities();
+  }, [refreshSpotOpportunities]);
+
+  useEffect(() => {
     void refreshFuturesOpportunities();
   }, [refreshFuturesOpportunities]);
+
+  useEffect(() => {
+    if (!spotScanJob || isTerminalSpotScanJob(spotScanJob)) {
+      return undefined;
+    }
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const job = await getSpotOpportunityScanJob(spotScanJob.scan_id);
+        if (cancelled) {
+          return;
+        }
+        setSpotScanJob(job);
+        if (job.scan) {
+          setSpotOpportunities({
+            data: job.scan,
+            loading: false,
+            refreshing: !isTerminalSpotScanJob(job),
+            error: null,
+          });
+          if (job.status === 'completed') {
+            setLastUpdatedAt(new Date());
+          }
+        } else if (job.status === 'failed') {
+          setSpotOpportunities((current) => ({
+            ...current,
+            loading: false,
+            refreshing: false,
+            error: 'Spot scanner failed. Last successful results are still shown.',
+          }));
+        }
+        if (job.status === 'cancelled') {
+          setSpotOpportunities((current) => ({
+            ...current,
+            loading: false,
+            refreshing: false,
+            error: null,
+          }));
+        }
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        const message = error instanceof Error ? error.message : 'Unable to poll Spot paper scanner.';
+        setSpotOpportunities((current) => ({
+          ...current,
+          loading: false,
+          refreshing: false,
+          error: message,
+        }));
+      }
+    };
+    void poll();
+    const intervalId = window.setInterval(() => {
+      void poll();
+    }, 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [spotScanJob?.scan_id, spotScanJob?.status]);
 
   useEffect(() => {
     if (!futuresScanJob || isTerminalFuturesScanJob(futuresScanJob)) {
@@ -3202,36 +3336,59 @@ function App() {
           ) : null}
 
           {tab === 'discover' ? (
-            <ErrorBoundary fallbackTitle="Futures paper scanner unavailable">
-              <FuturesPaperScannerSection
-                scan={futuresOpportunities.data}
-                scanJob={futuresScanJob}
-                loading={futuresOpportunities.loading}
-                refreshing={futuresOpportunities.refreshing}
-                error={futuresOpportunities.error}
-                livePrices={futuresLivePrices.data}
-                livePricesLoading={futuresLivePrices.loading || futuresLivePrices.refreshing}
-                livePricesError={futuresLivePrices.error ?? futuresLiveSubscriptionWarning}
-                heartbeatNow={heartbeatNow}
-                filters={futuresScannerFilters}
-                onFiltersChange={setFuturesScannerFilters}
-                autoRescanMinutes={futuresAutoRescanMinutes}
-                onAutoRescanChange={setFuturesAutoRescanMinutes}
-                selectedLeverage={selectedFuturesLeverage}
-                onSelectedLeverageChange={setSelectedFuturesLeverage}
-                onViewSignal={(symbol) => {
-                  handleSelectSymbol(symbol);
-                  setTab('signal');
-                }}
-                onSimulate={(signal, livePrice) => {
-                  const draft = futuresSimulationDraftFromSignal(signal, livePrice);
-                  handleSelectSymbol(signal.symbol, 'futures', draft);
-                  setTab('simulate');
-                }}
-                onRefresh={() => void refreshFuturesOpportunities()}
-                onCancelScan={() => void cancelFuturesScan()}
-              />
-            </ErrorBoundary>
+            <div className="space-y-5">
+              <ErrorBoundary fallbackTitle="Spot paper scanner unavailable">
+                <SpotPaperScannerSection
+                  scan={spotOpportunities.data}
+                  scanJob={spotScanJob}
+                  loading={spotOpportunities.loading}
+                  refreshing={spotOpportunities.refreshing}
+                  error={spotOpportunities.error}
+                  filters={spotScannerFilters}
+                  onFiltersChange={setSpotScannerFilters}
+                  onViewSignal={(symbol) => {
+                    handleSelectSymbol(symbol, 'spot');
+                    setTab('signal');
+                  }}
+                  onSimulate={(signal: SpotOpportunitySignalResponse) => {
+                    handleSelectSymbol(signal.symbol, 'spot');
+                    setTab('simulate');
+                  }}
+                  onRefresh={() => void refreshSpotOpportunities()}
+                  onCancelScan={() => void cancelSpotScan()}
+                />
+              </ErrorBoundary>
+              <ErrorBoundary fallbackTitle="Futures paper scanner unavailable">
+                <FuturesPaperScannerSection
+                  scan={futuresOpportunities.data}
+                  scanJob={futuresScanJob}
+                  loading={futuresOpportunities.loading}
+                  refreshing={futuresOpportunities.refreshing}
+                  error={futuresOpportunities.error}
+                  livePrices={futuresLivePrices.data}
+                  livePricesLoading={futuresLivePrices.loading || futuresLivePrices.refreshing}
+                  livePricesError={futuresLivePrices.error ?? futuresLiveSubscriptionWarning}
+                  heartbeatNow={heartbeatNow}
+                  filters={futuresScannerFilters}
+                  onFiltersChange={setFuturesScannerFilters}
+                  autoRescanMinutes={futuresAutoRescanMinutes}
+                  onAutoRescanChange={setFuturesAutoRescanMinutes}
+                  selectedLeverage={selectedFuturesLeverage}
+                  onSelectedLeverageChange={setSelectedFuturesLeverage}
+                  onViewSignal={(symbol) => {
+                    handleSelectSymbol(symbol);
+                    setTab('signal');
+                  }}
+                  onSimulate={(signal, livePrice) => {
+                    const draft = futuresSimulationDraftFromSignal(signal, livePrice);
+                    handleSelectSymbol(signal.symbol, 'futures', draft);
+                    setTab('simulate');
+                  }}
+                  onRefresh={() => void refreshFuturesOpportunities()}
+                  onCancelScan={() => void cancelFuturesScan()}
+                />
+              </ErrorBoundary>
+            </div>
           ) : null}
 
           {tab === 'signal' ? (

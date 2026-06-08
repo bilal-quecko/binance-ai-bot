@@ -46,6 +46,8 @@
   RegimeAnalysisResponse,
   ScannerValidationEvaluateResponse,
   ScannerValidationReportResponse,
+  SpotOpportunityScanJobResponse,
+  SpotOpportunityScanResponse,
   SpotSymbolItem,
   SignalValidationResponse,
   SimilarSetupResponse,
@@ -482,6 +484,59 @@ export function getTradeEligibility(symbol: string, horizon?: string, options?: 
 export function getOpportunities(limit = 20): Promise<OpportunityResponse[]> {
   const params = new URLSearchParams({ limit: String(limit) });
   return requestJson<OpportunityResponse[]>('/bot/opportunities', params);
+}
+
+export interface SpotOpportunityFilters {
+  maxSymbols: number;
+  minOpportunityScore: number;
+  minConfidence: number;
+  horizon: string;
+  includeAvoid: boolean;
+}
+
+function spotOpportunityScanPayload(filters: SpotOpportunityFilters) {
+  return {
+    max_symbols: filters.maxSymbols,
+    min_opportunity_score: filters.minOpportunityScore,
+    min_confidence: filters.minConfidence,
+    horizon: filters.horizon,
+    include_avoid: filters.includeAvoid,
+    batch_size: 8,
+    concurrency: 5,
+    symbol_timeout_seconds: 6,
+    scan_timeout_seconds: 45,
+  };
+}
+
+export function startSpotOpportunityScan(filters: SpotOpportunityFilters): Promise<SpotOpportunityScanJobResponse> {
+  return requestJson<SpotOpportunityScanJobResponse>(
+    '/bot/spot-opportunities/scan',
+    undefined,
+    {
+      method: 'POST',
+      body: JSON.stringify(spotOpportunityScanPayload(filters)),
+      timeoutMs: 10_000,
+    },
+  );
+}
+
+export function getSpotOpportunityScanJob(scanId: string): Promise<SpotOpportunityScanJobResponse> {
+  return requestJson<SpotOpportunityScanJobResponse>(
+    `/bot/spot-opportunities/scan/${encodeURIComponent(scanId)}`,
+    undefined,
+    { timeoutMs: 10_000 },
+  );
+}
+
+export function cancelSpotOpportunityScanJob(scanId: string): Promise<SpotOpportunityScanJobResponse> {
+  return requestJson<SpotOpportunityScanJobResponse>(
+    `/bot/spot-opportunities/scan/${encodeURIComponent(scanId)}/cancel`,
+    undefined,
+    {
+      method: 'POST',
+      timeoutMs: 10_000,
+    },
+  );
 }
 
 export interface FuturesOpportunityFilters {

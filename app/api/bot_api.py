@@ -61,6 +61,7 @@ from app.storage.models import (
     ScannerCandidatePriceRecord,
     ScannerCandidateRecord,
     ScannerRunRecord,
+    ScannerValidationSnapshotRecord,
     SignalValidationSnapshotRecord,
 )
 from app.monitoring.similar_setups import (
@@ -84,6 +85,12 @@ from app.monitoring.futures_opportunity_scanner import (
     FuturesPaperSignal,
     FuturesSignalContext,
     MIN_CANDLES_FOR_FUTURES_SIGNAL,
+)
+from app.monitoring.spot_opportunity_scanner import (
+    SpotOpportunityScanReport,
+    SpotOpportunityScanner,
+    SpotOpportunitySignal,
+    SpotScannerContext,
 )
 from app.monitoring.liquidity_bias import (
     NEUTRAL_LIQUIDITY_BIAS,
@@ -465,6 +472,62 @@ class OpportunityResponse(BaseModel):
     data_state: DataState
 
 
+class SpotOpportunitySignalResponse(BaseModel):
+    """Paper-only Spot scanner signal for one symbol."""
+
+    symbol: str
+    action: Literal["buy_candidate", "watch", "avoid", "exit_watch"]
+    opportunity_score: int
+    confidence: int
+    trend_score: int
+    momentum_score: int
+    volatility_quality_score: int
+    liquidity_score: int
+    structure_score: int
+    regime_score: int
+    validation_score: int | None = None
+    eligibility_score: int
+    evidence_strength: Literal["insufficient", "weak", "mixed", "promising", "strong"]
+    trend: str
+    momentum: str
+    best_horizon: str
+    risk_grade: Literal["low", "medium", "high"]
+    current_price: Decimal | None = None
+    suggested_entry_zone: str | None = None
+    suggested_stop_loss: Decimal | None = None
+    suggested_take_profit: Decimal | None = None
+    regime: str | None = None
+    data_source: Literal["binance_spot"] = "binance_spot"
+    price_type: Literal["spot_last_price"] = "spot_last_price"
+    reason: str
+    warnings: list[str] = Field(default_factory=list)
+    timestamp: datetime
+    paper_only: bool = True
+    advisory_only: bool = True
+    live_trading_enabled: bool = False
+    futures_enabled: bool = False
+
+
+class SpotOpportunityScanResponse(BaseModel):
+    """Paper-only Spot scanner response."""
+
+    generated_at: datetime
+    scan_state: Literal["ready", "partial", "insufficient_data", "degraded"]
+    warnings: list[str] = Field(default_factory=list)
+    scanned_count: int
+    failed_symbols: list[str] = Field(default_factory=list)
+    buy_candidates: list[SpotOpportunitySignalResponse] = Field(default_factory=list)
+    watch_candidates: list[SpotOpportunitySignalResponse] = Field(default_factory=list)
+    avoid_candidates: list[SpotOpportunitySignalResponse] = Field(default_factory=list)
+    exit_watch_candidates: list[SpotOpportunitySignalResponse] = Field(default_factory=list)
+    data_source: Literal["binance_spot", "last_successful_cache", "empty_degraded"] = "binance_spot"
+    quote_asset: str = "USDT"
+    symbol_count: int = 0
+    latest_successful_scanner_at: datetime | None = None
+    latest_error: str | None = None
+    persisted_candidate_count: int = 0
+
+
 class FuturesPaperSignalResponse(BaseModel):
     """Paper-only futures long/short scanner signal for one symbol."""
 
@@ -604,6 +667,113 @@ class FuturesOpportunityScanResponse(BaseModel):
 FuturesScannerJobStatus = Literal["queued", "running", "partial", "completed", "failed", "cancelled"]
 
 
+class SpotOpportunityScanStartRequest(BaseModel):
+    """Request body for an async paper-only Spot scanner job."""
+
+    quote_asset: str = "USDT"
+    limit: int | None = Field(default=None, ge=1)
+    max_symbols: int | None = Field(default=None, ge=1)
+    concurrency: int = Field(default=5, ge=1, le=10)
+    batch_size: int = Field(default=8, ge=5, le=10)
+    symbol_timeout_seconds: float = Field(default=6.0, ge=1, le=8)
+    scan_timeout_seconds: float = Field(default=45.0, ge=5, le=90)
+    horizon: str = "7d"
+    min_opportunity_score: int = Field(default=0, ge=0, le=100)
+    min_confidence: int = Field(default=0, ge=0, le=100)
+    include_avoid: bool = True
+
+
+class SpotOpportunityScanJobResponse(BaseModel):
+    """Progress snapshot for an async Spot scanner job."""
+
+    scan_id: str
+    status: FuturesScannerJobStatus
+    total_symbols: int = 0
+    scanned_symbols: int = 0
+    current_symbol: str | None = None
+    current_phase: str = "queued"
+    started_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
+    scan: SpotOpportunityScanResponse | None = None
+    warnings: list[str] = Field(default_factory=list)
+    failed_symbols: list[str] = Field(default_factory=list)
+    latest_error: str | None = None
+
+
+@dataclass(slots=True)
+class SpotScannerJob:
+    """Mutable in-memory state for one async Spot scanner run."""
+
+    scan_id: str
+    request: SpotOpportunityScanStartRequest
+    status: FuturesScannerJobStatus = "queued"
+    total_symbols: int = 0
+    scanned_symbols: int = 0
+    current_symbol: str | None = None
+    current_phase: str = "queued"
+    started_at: datetime = dataclass_field(default_factory=now_utc)
+    updated_at: datetime = dataclass_field(default_factory=now_utc)
+    completed_at: datetime | None = None
+    response: SpotOpportunityScanResponse | None = None
+    warnings: list[str] = dataclass_field(default_factory=list)
+    failed_symbols: list[str] = dataclass_field(default_factory=list)
+    latest_error: str | None = None
+    cancel_requested: bool = False
+    thread: Thread | None = None
+
+
+class SpotScannerJobManager:
+    """Small process-local Spot scanner job registry."""
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._jobs: dict[str, SpotScannerJob] = {}
+
+    def create(self, request: SpotOpportunityScanStartRequest) -> SpotScannerJob:
+        job = SpotScannerJob(scan_id=uuid4().hex, request=request)
+        with self._lock:
+            self._jobs[job.scan_id] = job
+        return job
+
+    def set_thread(self, scan_id: str, thread: Thread) -> None:
+        with self._lock:
+            job = self._jobs.get(scan_id)
+            if job is not None:
+                job.thread = thread
+                job.updated_at = now_utc()
+
+    def get(self, scan_id: str) -> SpotScannerJob | None:
+        with self._lock:
+            return self._jobs.get(scan_id)
+
+    def update(self, scan_id: str, **updates: object) -> SpotScannerJob | None:
+        with self._lock:
+            job = self._jobs.get(scan_id)
+            if job is None:
+                return None
+            if job.status == "cancelled" and updates.get("status") != "cancelled":
+                return job
+            for key, value in updates.items():
+                setattr(job, key, value)
+            job.updated_at = now_utc()
+            return job
+
+    def cancel(self, scan_id: str) -> SpotScannerJob | None:
+        with self._lock:
+            job = self._jobs.get(scan_id)
+            if job is None:
+                return None
+            job.cancel_requested = True
+            job.status = "cancelled"
+            job.current_phase = "cancel_requested"
+            job.completed_at = now_utc()
+            job.latest_error = "Spot scan cancelled by user."
+            job.warnings = ["Spot scan cancelled. Partial results remain advisory-only."] if job.response is not None else ["Spot scan cancelled."]
+            job.updated_at = now_utc()
+            return job
+
+
 class FuturesOpportunityScanStartRequest(BaseModel):
     """Request body for an async paper-only futures scanner job."""
 
@@ -727,6 +897,7 @@ class FuturesScannerJobManager:
         return job
 
 
+_SPOT_SCANNER_JOB_MANAGER = SpotScannerJobManager()
 _FUTURES_SCANNER_JOB_MANAGER = FuturesScannerJobManager()
 
 
@@ -3535,6 +3706,67 @@ def _opportunity_from_candles(
     )
 
 
+def _to_spot_signal_response(signal: SpotOpportunitySignal) -> SpotOpportunitySignalResponse:
+    return SpotOpportunitySignalResponse(
+        symbol=signal.symbol,
+        action=signal.action,
+        opportunity_score=signal.opportunity_score,
+        confidence=signal.confidence,
+        trend_score=signal.trend_score,
+        momentum_score=signal.momentum_score,
+        volatility_quality_score=signal.volatility_quality_score,
+        liquidity_score=signal.liquidity_score,
+        structure_score=signal.structure_score,
+        regime_score=signal.regime_score,
+        validation_score=signal.validation_score,
+        eligibility_score=signal.eligibility_score,
+        evidence_strength=signal.evidence_strength,
+        trend=signal.trend,
+        momentum=signal.momentum,
+        best_horizon=signal.best_horizon,
+        risk_grade=signal.risk_grade,
+        current_price=signal.current_price,
+        suggested_entry_zone=signal.suggested_entry_zone,
+        suggested_stop_loss=signal.suggested_stop_loss,
+        suggested_take_profit=signal.suggested_take_profit,
+        regime=signal.regime,
+        data_source="binance_spot",
+        price_type="spot_last_price",
+        reason=signal.reason,
+        warnings=list(signal.warnings),
+        timestamp=signal.timestamp,
+    )
+
+
+def _to_spot_scan_response(
+    report: SpotOpportunityScanReport,
+    *,
+    quote_asset: str,
+    symbol_count: int,
+    data_source: Literal["binance_spot", "last_successful_cache", "empty_degraded"] = "binance_spot",
+    latest_error: str | None = None,
+    latest_successful_scanner_at: datetime | None = None,
+    persisted_candidate_count: int = 0,
+) -> SpotOpportunityScanResponse:
+    return SpotOpportunityScanResponse(
+        generated_at=report.generated_at,
+        scan_state=report.scan_state,
+        warnings=list(report.warnings),
+        scanned_count=report.scanned_count,
+        failed_symbols=list(report.failed_symbols),
+        buy_candidates=[_to_spot_signal_response(signal) for signal in report.buy_candidates],
+        watch_candidates=[_to_spot_signal_response(signal) for signal in report.watch_candidates],
+        avoid_candidates=[_to_spot_signal_response(signal) for signal in report.avoid_candidates],
+        exit_watch_candidates=[_to_spot_signal_response(signal) for signal in report.exit_watch_candidates],
+        data_source=data_source,
+        quote_asset=quote_asset,
+        symbol_count=symbol_count,
+        latest_successful_scanner_at=latest_successful_scanner_at,
+        latest_error=latest_error,
+        persisted_candidate_count=persisted_candidate_count,
+    )
+
+
 def _to_futures_signal_response(signal: FuturesPaperSignal) -> FuturesPaperSignalResponse:
     """Convert a paper futures scanner signal into an API response."""
 
@@ -4002,6 +4234,34 @@ def _persist_scanner_outcome_snapshots(
             LOGGER.exception("Failed to persist post-signal scanner snapshot for %s.", signal.symbol)
 
 
+def _persist_spot_scanner_outcome_snapshots(
+    *,
+    repository: StorageRepository,
+    report: SpotOpportunityScanReport,
+) -> None:
+    for signal in (
+        report.buy_candidates
+        + report.watch_candidates
+        + report.exit_watch_candidates
+        + report.avoid_candidates
+    ):
+        try:
+            persist_signal_snapshot(
+                repository=repository,
+                payload=SignalSnapshotInput(
+                    symbol=signal.symbol,
+                    source="spot_scanner",
+                    signal_type=_spot_scanner_signal_type(signal.action),
+                    confidence=signal.confidence,
+                    entry_price=signal.current_price,
+                    notes=signal.reason,
+                    timestamp=signal.timestamp,
+                ),
+            )
+        except Exception:
+            LOGGER.exception("Failed to persist post-signal Spot scanner snapshot for %s.", signal.symbol)
+
+
 def _persist_scanner_run_candidates(
     *,
     repository: StorageRepository,
@@ -4071,6 +4331,128 @@ def _persist_scanner_run_candidates(
     )
 
 
+def _persist_spot_scanner_run_candidates(
+    *,
+    repository: StorageRepository,
+    scan_id: str,
+    report: SpotOpportunityScanReport,
+    response: SpotOpportunityScanResponse,
+    quote_asset: str,
+    horizon: str,
+    max_symbols: int,
+    min_opportunity_score: int,
+) -> None:
+    """Persist Spot scanner run and candidates for later review."""
+
+    all_candidates = (
+        report.buy_candidates
+        + report.watch_candidates
+        + report.exit_watch_candidates
+        + report.avoid_candidates
+    )
+    candidate_count = len(all_candidates)
+    repository.upsert_scanner_run(
+        ScannerRunRecord(
+            id=scan_id,
+            generated_at=report.generated_at,
+            quote_asset=_spot_scanner_quote_key(quote_asset),
+            horizon=horizon,
+            max_symbols=max_symbols,
+            min_opportunity_score=min_opportunity_score,
+            scan_state=report.scan_state,
+            scanned_count=report.scanned_count,
+            failed_symbols_json=json.dumps(report.failed_symbols),
+            warnings_json=json.dumps(report.warnings),
+            result_json=response.model_dump_json(),
+            candidate_count=candidate_count,
+        )
+    )
+    candidate_records = [
+        ScannerCandidateRecord(
+            id=f"{scan_id}:{signal.symbol}:{signal.action}",
+            scanner_run_id=scan_id,
+            symbol=signal.symbol,
+            direction=signal.action,
+            opportunity_score=signal.opportunity_score,
+            confidence=signal.confidence,
+            evidence_strength=signal.evidence_strength,
+            current_price=signal.current_price,
+            entry_zone=signal.suggested_entry_zone,
+            stop_loss=signal.suggested_stop_loss,
+            take_profit=signal.suggested_take_profit,
+            risk_grade=signal.risk_grade,
+            regime=signal.regime,
+            reason=signal.reason,
+            warnings_json=json.dumps(signal.warnings),
+            timestamp=signal.timestamp,
+        )
+        for signal in all_candidates
+    ]
+    repository.upsert_scanner_candidates(candidate_records)
+    repository.upsert_scanner_candidate_prices(
+        [
+            ScannerCandidatePriceRecord(
+                id=None,
+                scanner_candidate_id=f"{scan_id}:{signal.symbol}:{signal.action}",
+                symbol=signal.symbol,
+                price=signal.current_price,
+                price_type=signal.price_type,
+                source=signal.data_source,
+                recorded_at=signal.timestamp,
+            )
+            for signal in all_candidates
+        ]
+    )
+
+
+def _persist_spot_scanner_validation_snapshots(
+    *,
+    repository: StorageRepository,
+    report: SpotOpportunityScanReport,
+    scan_id: str,
+) -> int:
+    """Persist Spot scanner candidates into validation snapshots."""
+
+    grouped: list[tuple[str, list[SpotOpportunitySignal]]] = [
+        ("spot_buy_candidate", report.buy_candidates),
+        ("spot_watch", report.watch_candidates),
+        ("spot_exit_watch", report.exit_watch_candidates),
+        ("spot_avoid", report.avoid_candidates),
+    ]
+    snapshots: list[ScannerValidationSnapshotRecord] = []
+    for group_name, signals in grouped:
+        for index, signal in enumerate(signals, start=1):
+            snapshots.append(
+                ScannerValidationSnapshotRecord(
+                    id=None,
+                    scan_id=scan_id,
+                    symbol=signal.symbol,
+                    direction=_spot_validation_direction(signal.action),
+                    price_at_scan=signal.current_price,
+                    opportunity_score=signal.opportunity_score,
+                    confidence=signal.confidence,
+                    horizon=signal.best_horizon,
+                    risk_grade=signal.risk_grade,
+                    trend_score=signal.trend_score,
+                    momentum_score=signal.momentum_score,
+                    volatility_quality_score=signal.volatility_quality_score,
+                    liquidity_score=signal.liquidity_score,
+                    risk_score=100 - signal.eligibility_score,
+                    direction_score=signal.structure_score,
+                    validation_score=signal.validation_score,
+                    evidence_strength=signal.evidence_strength,
+                    stop_loss=signal.suggested_stop_loss,
+                    take_profit=signal.suggested_take_profit,
+                    timestamp=signal.timestamp,
+                    rank_position=index,
+                    candidate_group=group_name,
+                    regime_label=signal.regime,
+                    data_source=signal.data_source,
+                )
+            )
+    return repository.insert_scanner_validation_snapshots(snapshots)
+
+
 def _latest_successful_scanner_response(
     *,
     repository: StorageRepository,
@@ -4110,6 +4492,67 @@ def _latest_successful_scanner_response(
             "persisted_candidate_count": run.candidate_count,
             "fallback_symbol_count": fallback_symbol_count,
         }
+    )
+
+
+def _latest_successful_spot_scanner_response(
+    *,
+    repository: StorageRepository,
+    quote_asset: str,
+    horizon: str,
+    latest_error: str | None,
+) -> SpotOpportunityScanResponse | None:
+    """Load the latest persisted full Spot scanner result for degraded fallback."""
+
+    run = repository.get_latest_successful_scanner_run(
+        quote_asset=_spot_scanner_quote_key(quote_asset),
+        horizon=horizon,
+    )
+    if run is None or not run.result_json:
+        return None
+    try:
+        cached = SpotOpportunityScanResponse.model_validate(json.loads(run.result_json))
+    except Exception:
+        LOGGER.exception("Failed to parse cached Spot scanner result %s.", run.id)
+        return None
+    warnings = [
+        "Binance Spot API unavailable; showing last successful Spot scanner result.",
+        *[
+            warning
+            for warning in cached.warnings
+            if warning != "Binance Spot API unavailable; showing last successful Spot scanner result."
+        ],
+    ]
+    return cached.model_copy(
+        update={
+            "scan_state": "degraded",
+            "warnings": warnings,
+            "data_source": "last_successful_cache",
+            "latest_successful_scanner_at": run.generated_at,
+            "latest_error": latest_error,
+            "persisted_candidate_count": run.candidate_count,
+        }
+    )
+
+
+def _empty_degraded_spot_scanner_response(
+    *,
+    quote_asset: str,
+    latest_error: str | None,
+    failed_symbols: list[str] | None = None,
+) -> SpotOpportunityScanResponse:
+    return SpotOpportunityScanResponse(
+        generated_at=datetime.now(tz=UTC),
+        scan_state="degraded",
+        warnings=["No cached Spot scanner results are available and the Spot symbol universe is unavailable."],
+        scanned_count=0,
+        failed_symbols=failed_symbols or [],
+        data_source="empty_degraded",
+        quote_asset=quote_asset,
+        symbol_count=0,
+        latest_successful_scanner_at=None,
+        latest_error=latest_error,
+        persisted_candidate_count=0,
     )
 
 
@@ -4161,6 +4604,349 @@ def _to_futures_scan_job_response(job: FuturesScannerJob) -> FuturesOpportunityS
         failed_symbols=list(job.failed_symbols),
         latest_error=job.latest_error,
     )
+
+
+def _to_spot_scan_job_response(job: SpotScannerJob) -> SpotOpportunityScanJobResponse:
+    return SpotOpportunityScanJobResponse(
+        scan_id=job.scan_id,
+        status=job.status,
+        total_symbols=job.total_symbols,
+        scanned_symbols=job.scanned_symbols,
+        current_symbol=job.current_symbol,
+        current_phase=job.current_phase,
+        started_at=job.started_at,
+        updated_at=job.updated_at,
+        completed_at=job.completed_at,
+        scan=job.response,
+        warnings=list(job.warnings),
+        failed_symbols=list(job.failed_symbols),
+        latest_error=job.latest_error,
+    )
+
+
+def _build_async_spot_scan_report(
+    *,
+    scanner: SpotOpportunityScanner,
+    signals: list[SpotOpportunitySignal],
+    failed_symbols: list[str],
+    include_avoid: bool,
+    scanned_symbols: int,
+    partial: bool,
+) -> SpotOpportunityScanReport:
+    report = scanner.build_report(
+        signals=signals,
+        failed_symbols=failed_symbols,
+        include_avoid=include_avoid,
+    )
+    report.scanned_count = scanned_symbols
+    if partial:
+        report.scan_state = "partial"
+        if "Spot scanner is still running; partial results are shown." not in report.warnings:
+            report.warnings.append("Spot scanner is still running; partial results are shown.")
+    return report
+
+
+async def _run_spot_opportunity_scan_job(
+    *,
+    scan_id: str,
+    settings: Settings,
+    rest_client: BinanceRestClient | None,
+) -> None:
+    job = _SPOT_SCANNER_JOB_MANAGER.get(scan_id)
+    if job is None:
+        return
+
+    request = job.request
+    normalized_quote = request.quote_asset.strip().upper() or "USDT"
+    scan_limit = min(
+        request.max_symbols if request.max_symbols is not None else request.limit if request.limit is not None else 50,
+        100,
+    )
+    try:
+        normalized_horizon = _normalize_futures_scanner_horizon(request.horizon)
+    except ValueError as exc:
+        _SPOT_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            status="failed",
+            current_phase="failed",
+            completed_at=now_utc(),
+            latest_error=str(exc),
+            warnings=[str(exc)],
+        )
+        return
+
+    scanner = SpotOpportunityScanner()
+    worker_rest_client = rest_client or BinanceRestClient(settings)
+    close_worker_rest_client = rest_client is None
+    repository = StorageRepository(settings.database_url)
+    signals: list[SpotOpportunitySignal] = []
+    failed_symbols: list[str] = []
+    candle_cache: dict[tuple[str, SupportedInterval], list[Candle]] = {}
+    semaphore = asyncio.Semaphore(request.concurrency)
+    current_threshold = max(request.min_opportunity_score, request.min_confidence)
+    total_started_at = time.perf_counter()
+
+    async def scan_symbol(record: SpotSymbolRecord) -> SpotOpportunitySignal | None:
+        async with semaphore:
+            current_job = _SPOT_SCANNER_JOB_MANAGER.get(scan_id)
+            if current_job is not None and current_job.cancel_requested:
+                return None
+            _SPOT_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                current_symbol=record.symbol,
+                current_phase="spot_candle_fetch",
+            )
+            try:
+                signal = await asyncio.wait_for(
+                    _build_market_wide_spot_signal_for_symbol(
+                        scanner=scanner,
+                        symbol=record.symbol,
+                        horizon=normalized_horizon,
+                        repository=repository,
+                        rest_client=worker_rest_client,
+                        candle_cache=candle_cache,
+                    ),
+                    timeout=request.symbol_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                LOGGER.warning(
+                    "Timed out paper Spot scan; scan_id=%s symbol=%s timeout_seconds=%.1f",
+                    scan_id,
+                    record.symbol,
+                    request.symbol_timeout_seconds,
+                )
+                failed_symbols.append(record.symbol)
+                return None
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("Failed to scan paper Spot opportunity; scan_id=%s symbol=%s", scan_id, record.symbol)
+                failed_symbols.append(record.symbol)
+                return None
+
+            if signal.action == "buy_candidate":
+                if signal.opportunity_score < current_threshold or signal.confidence < request.min_confidence:
+                    return None
+                return signal
+            if signal.action in {"watch", "exit_watch"} or request.include_avoid:
+                return signal
+            return None
+
+    try:
+        _SPOT_SCANNER_JOB_MANAGER.update(scan_id, status="running", current_phase="loading_spot_universe")
+        symbol_service = SpotSymbolService(worker_rest_client)
+        candidates = await symbol_service.search_symbols(query="", limit=scan_limit)
+        candidates = [record for record in candidates if record.quote_asset.upper() == normalized_quote]
+        _SPOT_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            total_symbols=len(candidates),
+            current_phase="spot_universe_ready",
+        )
+        if not candidates:
+            latest_error = f"No active Binance Spot {normalized_quote} symbols are available."
+            cached_response = _latest_successful_spot_scanner_response(
+                repository=repository,
+                quote_asset=normalized_quote,
+                horizon=normalized_horizon,
+                latest_error=latest_error,
+            )
+            response = cached_response or _empty_degraded_spot_scanner_response(
+                quote_asset=normalized_quote,
+                latest_error=latest_error,
+            )
+            _SPOT_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                status="failed",
+                current_phase="failed",
+                completed_at=now_utc(),
+                response=response,
+                latest_error=latest_error,
+                warnings=list(response.warnings),
+            )
+            return
+
+        deadline = time.perf_counter() + request.scan_timeout_seconds
+        batch_size = min(10, max(5, request.batch_size))
+        for start_index in range(0, len(candidates), batch_size):
+            current_job = _SPOT_SCANNER_JOB_MANAGER.get(scan_id)
+            if current_job is None or current_job.cancel_requested:
+                raise asyncio.CancelledError()
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                failed_symbols.extend(record.symbol for record in candidates[start_index:])
+                break
+            batch = candidates[start_index:start_index + batch_size]
+            _SPOT_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                status="running" if not signals else "partial",
+                current_symbol=batch[0].symbol if batch else None,
+                current_phase="scanning_spot_batch",
+            )
+            task_by_symbol = {
+                asyncio.create_task(scan_symbol(record), name=f"spot-scan-job-{scan_id}-{record.symbol}"): record.symbol
+                for record in batch
+            }
+            done, pending = await asyncio.wait(task_by_symbol.keys(), timeout=max(0.1, remaining))
+            for task in pending:
+                symbol = task_by_symbol[task]
+                task.cancel()
+                failed_symbols.append(symbol)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            current_job = _SPOT_SCANNER_JOB_MANAGER.get(scan_id)
+            if current_job is None or current_job.cancel_requested:
+                raise asyncio.CancelledError()
+            for task in done:
+                result = task.result()
+                if result is not None:
+                    signals.append(result)
+
+            scanned_symbols = min(start_index + len(batch), len(candidates))
+            partial = scanned_symbols < len(candidates)
+            _SPOT_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                scanned_symbols=scanned_symbols,
+                failed_symbols=list(failed_symbols),
+                current_phase="ranking_spot_partial" if partial else "ranking_spot_final",
+            )
+            report = _build_async_spot_scan_report(
+                scanner=scanner,
+                signals=signals,
+                failed_symbols=failed_symbols,
+                include_avoid=request.include_avoid,
+                scanned_symbols=scanned_symbols,
+                partial=partial,
+            )
+            response = _to_spot_scan_response(
+                report,
+                quote_asset=normalized_quote,
+                symbol_count=len(candidates),
+            )
+            _SPOT_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                status="partial" if partial else "running",
+                response=response,
+                warnings=list(report.warnings),
+            )
+            if pending:
+                break
+
+        current_job = _SPOT_SCANNER_JOB_MANAGER.get(scan_id)
+        if current_job is None or current_job.cancel_requested:
+            raise asyncio.CancelledError()
+        report = _build_async_spot_scan_report(
+            scanner=scanner,
+            signals=signals,
+            failed_symbols=failed_symbols,
+            include_avoid=request.include_avoid,
+            scanned_symbols=min(len(candidates), current_job.scanned_symbols),
+            partial=bool(failed_symbols) and bool(signals),
+        )
+        if not signals and failed_symbols:
+            latest_error = "spot_klines_unavailable: no requested Spot symbols returned candles."
+            cached_response = _latest_successful_spot_scanner_response(
+                repository=repository,
+                quote_asset=normalized_quote,
+                horizon=normalized_horizon,
+                latest_error=latest_error,
+            )
+            response = cached_response or _empty_degraded_spot_scanner_response(
+                quote_asset=normalized_quote,
+                latest_error=latest_error,
+                failed_symbols=failed_symbols,
+            )
+        else:
+            response = _to_spot_scan_response(
+                report,
+                quote_asset=normalized_quote,
+                symbol_count=len(candidates),
+            )
+            _SPOT_SCANNER_JOB_MANAGER.update(scan_id, current_phase="persisting_spot_completed")
+            try:
+                _persist_spot_scanner_run_candidates(
+                    repository=repository,
+                    scan_id=scan_id,
+                    report=report,
+                    response=response,
+                    quote_asset=normalized_quote,
+                    horizon=normalized_horizon,
+                    max_symbols=scan_limit,
+                    min_opportunity_score=request.min_opportunity_score,
+                )
+                response.persisted_candidate_count = (
+                    len(report.buy_candidates)
+                    + len(report.watch_candidates)
+                    + len(report.exit_watch_candidates)
+                    + len(report.avoid_candidates)
+                )
+            except Exception:
+                LOGGER.exception("Failed to persist async Spot scanner run candidates.")
+                response.warnings.append("Spot scanner candidate persistence failed; visible results are still usable for this session.")
+            try:
+                _persist_spot_scanner_validation_snapshots(
+                    repository=repository,
+                    report=report,
+                    scan_id=scan_id,
+                )
+            except Exception:
+                LOGGER.exception("Failed to persist async Spot scanner validation snapshots.")
+                response.warnings.append(
+                    "Spot scanner validation snapshot persistence failed; this scan will not be included in scanner validation reports."
+                )
+            _persist_spot_scanner_outcome_snapshots(repository=repository, report=report)
+
+        _SPOT_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            status="completed",
+            scanned_symbols=response.scanned_count,
+            current_symbol=None,
+            current_phase="completed",
+            completed_at=now_utc(),
+            response=response,
+            failed_symbols=list(response.failed_symbols),
+            warnings=list(response.warnings),
+            latest_error=response.latest_error,
+        )
+        LOGGER.info("Async Spot scanner total scan time %.3fs scan_id=%s.", time.perf_counter() - total_started_at, scan_id)
+    except asyncio.CancelledError:
+        current = _SPOT_SCANNER_JOB_MANAGER.get(scan_id)
+        _SPOT_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            status="cancelled",
+            current_symbol=None,
+            current_phase="cancelled",
+            completed_at=now_utc(),
+            response=current.response if current is not None else None,
+            latest_error="Spot scan cancelled by user.",
+            warnings=["Spot scan cancelled. Partial results remain advisory-only."] if current is not None and current.response is not None else ["Spot scan cancelled."],
+        )
+    except Exception as exc:
+        LOGGER.exception("Async Spot scanner job failed; scan_id=%s.", scan_id)
+        latest_error = f"{type(exc).__name__}: {exc}"
+        cached_response = None
+        try:
+            cached_response = _latest_successful_spot_scanner_response(
+                repository=repository,
+                quote_asset=normalized_quote,
+                horizon=normalized_horizon,
+                latest_error=latest_error,
+            )
+        except Exception:
+            LOGGER.exception("Failed to load cached Spot scanner response after scan failure.")
+        _SPOT_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            status="failed",
+            current_symbol=None,
+            current_phase="failed",
+            completed_at=now_utc(),
+            response=cached_response,
+            latest_error=latest_error,
+            warnings=["Spot scanner failed. Last successful results are still shown."],
+        )
+    finally:
+        repository.close()
+        if close_worker_rest_client:
+            await worker_rest_client.close()
 
 
 def _build_async_futures_scan_report(
@@ -4597,6 +5383,267 @@ def _scanner_signal_type(direction: str) -> str:
     if direction == "avoid":
         return "AVOID"
     return "WAIT"
+
+
+def _spot_scanner_quote_key(quote_asset: str) -> str:
+    return f"SPOT:{quote_asset.strip().upper() or 'USDT'}"
+
+
+def _spot_validation_direction(action: str) -> str:
+    if action == "buy_candidate":
+        return "long"
+    if action == "exit_watch":
+        return "wait"
+    if action == "avoid":
+        return "avoid"
+    return "wait"
+
+
+def _spot_scanner_signal_type(action: str) -> str:
+    if action == "buy_candidate":
+        return "BUY"
+    if action == "exit_watch":
+        return "SELL"
+    if action == "avoid":
+        return "AVOID"
+    return "WAIT"
+
+
+async def _build_market_wide_spot_signal_for_symbol(
+    *,
+    scanner: SpotOpportunityScanner,
+    symbol: str,
+    horizon: str,
+    repository: StorageRepository,
+    rest_client: BinanceRestClient,
+    candle_cache: dict[tuple[str, SupportedInterval], list[Candle]] | None = None,
+) -> SpotOpportunitySignal:
+    """Build one scanner signal from stored/fresh Binance Spot OHLCV data."""
+
+    started_at = time.perf_counter()
+    candles_15m = await _load_or_fetch_spot_scan_candles(
+        repository=repository,
+        rest_client=rest_client,
+        symbol=symbol,
+        interval="15m",
+        lookback_days=7,
+        candle_cache=candle_cache,
+    )
+    technical_analysis: TechnicalAnalysisSnapshot | None = None
+    feature_snapshot: FeatureSnapshot | None = None
+    if len(candles_15m) >= 24:
+        try:
+            feature_snapshot = FeatureEngine(FeatureConfig()).build_snapshot(candles_15m)
+            technical_analysis = TechnicalAnalysisService().analyze(
+                symbol=symbol,
+                candles=candles_15m,
+                feature_snapshot=feature_snapshot,
+            )
+        except Exception:
+            LOGGER.exception("Failed to build Spot scanner technical analysis for %s.", symbol)
+            technical_analysis = None
+            feature_snapshot = None
+    pattern_analysis = None
+    try:
+        pattern_analysis = HorizonPatternAnalysisService().analyze(
+            symbol=symbol,
+            horizon=horizon,
+            points=[_to_pattern_point_from_candle(candle) for candle in candles_15m],
+            runtime_active=False,
+        )
+    except Exception:
+        LOGGER.exception("Failed to build Spot scanner pattern analysis for %s.", symbol)
+    regime_analysis = None
+    try:
+        regime_analysis = RegimeAnalysisService().analyze(
+            symbol=symbol,
+            horizon=horizon,
+            candles=candles_15m,
+            technical_analysis=technical_analysis,
+            pattern_analysis=pattern_analysis,
+            feature_snapshot=feature_snapshot,
+        )
+    except Exception:
+        LOGGER.exception("Failed to build Spot scanner regime analysis for %s.", symbol)
+    validation_report = None
+    try:
+        validation_report = _signal_validation_report_for_symbol(
+            repository=repository,
+            symbol=symbol,
+            horizon=horizon,
+        )
+    except Exception:
+        LOGGER.exception("Failed to build Spot scanner validation report for %s.", symbol)
+    liquidity_bias = estimate_liquidity_bias(
+        LiquidityBiasInput(
+            symbol=symbol,
+            candles=candles_15m,
+            volatility_regime=(
+                technical_analysis.volatility_regime
+                if technical_analysis is not None and technical_analysis.data_state == "ready"
+                else None
+            ),
+        )
+    )
+    liquidity_zones = estimate_liquidity_zones(
+        symbol=symbol,
+        candles=candles_15m,
+        current_price=candles_15m[-1].close if candles_15m else None,
+        trade_direction="long",
+        liquidity_bias=liquidity_bias,
+        regime_label=regime_analysis.regime_label if regime_analysis is not None else None,
+        atr=feature_snapshot.atr if feature_snapshot is not None else None,
+    )
+    momentum_edge = _spot_expected_edge_pct(candles_15m)
+    blocker_reasons = _spot_scanner_blockers(
+        technical_analysis=technical_analysis,
+        regime_analysis=regime_analysis,
+        candles=candles_15m,
+    )
+    eligibility = evaluate_trade_eligibility(
+        TradeEligibilityInput(
+            symbol=symbol,
+            action="buy",
+            confidence=_spot_preliminary_confidence(technical_analysis=technical_analysis, candles=candles_15m),
+            risk_grade=_spot_preliminary_risk_grade(regime_analysis=regime_analysis, candles=candles_15m),
+            preferred_horizon=horizon,
+            expected_edge_pct=momentum_edge,
+            estimated_cost_pct=Decimal("0.20"),
+            blocker_reasons=blocker_reasons,
+            current_warnings=(),
+            regime_label=regime_analysis.regime_label if regime_analysis is not None else None,
+            regime_confidence=regime_analysis.confidence if regime_analysis is not None else None,
+            regime_warnings=regime_analysis.risk_warnings if regime_analysis is not None else (),
+            regime_avoid_conditions=regime_analysis.avoid_conditions if regime_analysis is not None else (),
+            similar_setup=None,
+            signal_validation=validation_report,
+            liquidity_bias=liquidity_bias,
+            liquidity_zones=liquidity_zones,
+        )
+    )
+    signal = scanner.build_signal(
+        SpotScannerContext(
+            symbol=symbol,
+            candles=candles_15m,
+            technical_analysis=technical_analysis,
+            regime_analysis=regime_analysis,
+            signal_validation=validation_report,
+            trade_eligibility=eligibility,
+            spread_ratio_pct=None,
+            current_position_quantity=Decimal("0"),
+            horizon=horizon,
+        )
+    )
+    LOGGER.info("Spot scanner analysis completed in %.3fs symbol=%s.", time.perf_counter() - started_at, symbol)
+    return signal
+
+
+async def _load_or_fetch_spot_scan_candles(
+    *,
+    repository: StorageRepository,
+    rest_client: BinanceRestClient,
+    symbol: str,
+    interval: SupportedInterval,
+    lookback_days: int,
+    candle_cache: dict[tuple[str, SupportedInterval], list[Candle]] | None = None,
+) -> list[Candle]:
+    """Load cached Spot candles before fetching Binance Spot klines."""
+
+    cache_key = (symbol.upper(), interval)
+    if candle_cache is not None and cache_key in candle_cache:
+        return candle_cache[cache_key]
+    end_time = now_utc()
+    start_time = end_time - timedelta(days=lookback_days)
+    stored = [
+        _historical_record_to_candle(record)
+        for record in repository.get_historical_candles(
+            symbol=symbol,
+            interval=interval,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    ]
+    expected_limit = max(MIN_CANDLES_FOR_FUTURES_SIGNAL, int(timedelta(days=lookback_days) / interval_to_timedelta(interval)))
+    if len(stored) >= min(expected_limit, 96):
+        if candle_cache is not None:
+            candle_cache[cache_key] = stored
+        return stored
+    rows = await rest_client.get_klines(
+        symbol=symbol,
+        interval=interval,
+        start_time_ms=int(start_time.timestamp() * 1000),
+        end_time_ms=int(end_time.timestamp() * 1000),
+        limit=min(1000, max(MIN_CANDLES_FOR_FUTURES_SIGNAL, expected_limit)),
+    )
+    fetched = [
+        parse_rest_kline(symbol, interval, row)
+        for row in rows
+        if int(row[6]) < int(now_utc().timestamp() * 1000)
+    ]
+    repository.upsert_historical_candles(fetched, source="spot_scanner_rest")
+    merged = merge_candles(
+        stored_candles=stored,
+        live_candles=fetched,
+        interval=interval,
+        limit=None,
+    ).candles
+    if candle_cache is not None:
+        candle_cache[cache_key] = merged
+    return merged
+
+
+def _spot_expected_edge_pct(candles: list[Candle]) -> Decimal | None:
+    if len(candles) < 24 or candles[-24].close <= Decimal("0"):
+        return None
+    return (((candles[-1].close - candles[-24].close) / candles[-24].close) * Decimal("100")).quantize(Decimal("0.0001"))
+
+
+def _spot_preliminary_confidence(
+    *,
+    technical_analysis: TechnicalAnalysisSnapshot | None,
+    candles: list[Candle],
+) -> int:
+    base = technical_analysis.trend_strength_score if technical_analysis is not None and technical_analysis.trend_strength_score is not None else 50
+    edge = _spot_expected_edge_pct(candles) or Decimal("0")
+    return int(max(0, min(100, Decimal(base) + edge * Decimal("5"))))
+
+
+def _spot_preliminary_risk_grade(
+    *,
+    regime_analysis: RegimeAnalysisSnapshot | None,
+    candles: list[Candle],
+) -> Literal["low", "medium", "high"]:
+    if regime_analysis is not None and regime_analysis.regime_label in {"choppy", "high_volatility", "low_liquidity", "trending_down"}:
+        return "high"
+    if len(candles) < 24:
+        return "high"
+    ranges = [
+        ((candle.high - candle.low) / candle.close) * Decimal("100")
+        for candle in candles[-24:]
+        if candle.close > Decimal("0")
+    ]
+    average_range = sum(ranges, start=Decimal("0")) / Decimal(max(1, len(ranges)))
+    if average_range >= Decimal("2.5"):
+        return "high"
+    if average_range >= Decimal("1.5"):
+        return "medium"
+    return "low"
+
+
+def _spot_scanner_blockers(
+    *,
+    technical_analysis: TechnicalAnalysisSnapshot | None,
+    regime_analysis: RegimeAnalysisSnapshot | None,
+    candles: list[Candle],
+) -> tuple[str, ...]:
+    blockers: list[str] = []
+    if len(candles) < 48:
+        blockers.append("insufficient Spot candle history")
+    if technical_analysis is not None and technical_analysis.trend_direction == "bearish":
+        blockers.append("bearish Spot trend")
+    if regime_analysis is not None and regime_analysis.regime_label in {"choppy", "low_liquidity", "high_volatility"}:
+        blockers.append(f"{regime_analysis.regime_label} Spot regime")
+    return tuple(dict.fromkeys(blockers))
 
 
 async def _build_market_wide_futures_signal_for_symbol(
@@ -6157,6 +7204,56 @@ async def get_opportunities(
         return ranked[:limit]
     finally:
         repository.close()
+
+
+@router.post("/bot/spot-opportunities/scan", response_model=SpotOpportunityScanJobResponse)
+async def start_spot_opportunity_scan(
+    payload: SpotOpportunityScanStartRequest,
+    settings: Annotated[Settings, Depends(get_settings_dependency)] = None,
+    rest_client: Annotated[BinanceRestClient, Depends(get_rest_client)] = None,
+) -> SpotOpportunityScanJobResponse:
+    """Start a background paper-only Spot opportunity scan."""
+
+    try:
+        _normalize_futures_scanner_horizon(payload.horizon)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    job = _SPOT_SCANNER_JOB_MANAGER.create(payload)
+    worker_rest_client = None if isinstance(rest_client, BinanceRestClient) else rest_client
+    thread = Thread(
+        target=lambda: asyncio.run(
+            _run_spot_opportunity_scan_job(
+                scan_id=job.scan_id,
+                settings=settings,
+                rest_client=worker_rest_client,
+            )
+        ),
+        name=f"spot-opportunity-scan-{job.scan_id}",
+        daemon=True,
+    )
+    _SPOT_SCANNER_JOB_MANAGER.set_thread(job.scan_id, thread)
+    thread.start()
+    return _to_spot_scan_job_response(job)
+
+
+@router.get("/bot/spot-opportunities/scan/{scan_id}", response_model=SpotOpportunityScanJobResponse)
+async def get_spot_opportunity_scan_job(scan_id: str) -> SpotOpportunityScanJobResponse:
+    """Return the latest progress snapshot for a background Spot opportunity scan."""
+
+    job = _SPOT_SCANNER_JOB_MANAGER.get(scan_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Spot scanner job not found.")
+    return _to_spot_scan_job_response(job)
+
+
+@router.post("/bot/spot-opportunities/scan/{scan_id}/cancel", response_model=SpotOpportunityScanJobResponse)
+async def cancel_spot_opportunity_scan_job(scan_id: str) -> SpotOpportunityScanJobResponse:
+    """Cancel a running background Spot opportunity scan."""
+
+    job = _SPOT_SCANNER_JOB_MANAGER.cancel(scan_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Spot scanner job not found.")
+    return _to_spot_scan_job_response(job)
 
 
 @router.post("/bot/futures-opportunities/scan", response_model=FuturesOpportunityScanJobResponse)

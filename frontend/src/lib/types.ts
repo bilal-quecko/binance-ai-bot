@@ -218,6 +218,74 @@ export interface OpportunityResponse {
   data_state: WorkstationDataState;
 }
 
+export interface SpotOpportunitySignalResponse {
+  symbol: string;
+  action: 'buy_candidate' | 'watch' | 'avoid' | 'exit_watch';
+  opportunity_score: number;
+  confidence: number;
+  trend_score: number;
+  momentum_score: number;
+  volatility_quality_score: number;
+  liquidity_score: number;
+  structure_score: number;
+  regime_score: number;
+  validation_score: number | null;
+  eligibility_score: number;
+  evidence_strength: 'insufficient' | 'weak' | 'mixed' | 'promising' | 'strong';
+  trend: string;
+  momentum: string;
+  best_horizon: string;
+  risk_grade: 'low' | 'medium' | 'high';
+  current_price: string | null;
+  suggested_entry_zone: string | null;
+  suggested_stop_loss: string | null;
+  suggested_take_profit: string | null;
+  regime: string | null;
+  data_source: 'binance_spot';
+  price_type: 'spot_last_price';
+  reason: string;
+  warnings: string[];
+  timestamp: string;
+  paper_only: boolean;
+  advisory_only: boolean;
+  live_trading_enabled: boolean;
+  futures_enabled: boolean;
+}
+
+export interface SpotOpportunityScanResponse {
+  generated_at: string;
+  scan_state: 'ready' | 'partial' | 'insufficient_data' | 'degraded';
+  warnings: string[];
+  scanned_count: number;
+  failed_symbols: string[];
+  buy_candidates: SpotOpportunitySignalResponse[];
+  watch_candidates: SpotOpportunitySignalResponse[];
+  avoid_candidates: SpotOpportunitySignalResponse[];
+  exit_watch_candidates: SpotOpportunitySignalResponse[];
+  data_source: 'binance_spot' | 'last_successful_cache' | 'empty_degraded';
+  quote_asset: string;
+  symbol_count: number;
+  latest_successful_scanner_at: string | null;
+  latest_error: string | null;
+  persisted_candidate_count: number;
+}
+
+export interface SpotOpportunityScanJobResponse {
+  scan_id: string;
+  status: 'queued' | 'running' | 'partial' | 'completed' | 'failed' | 'cancelled';
+  total_symbols: number;
+  scanned_symbols: number;
+  current_symbol: string | null;
+  current_phase: string;
+  started_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  scan: SpotOpportunityScanResponse | null;
+  warnings: string[];
+  failed_symbols: string[];
+  latest_error: string | null;
+}
+
 export interface FuturesPaperSignalResponse {
   symbol: string;
   direction: 'long' | 'short' | 'wait' | 'avoid';

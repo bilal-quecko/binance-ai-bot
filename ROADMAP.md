@@ -110,6 +110,18 @@ Status: Current product direction and implemented paper scanner
 - Scanner output is advisory only.
 - No real futures execution, no live leverage or margin execution, and no Binance futures orders are allowed in this phase.
 
+### Spot Paper Opportunity Scanner
+
+Status: Implemented paper scanner
+
+- Paper-only Spot scanner ranks Binance Spot USDT symbols as BUY candidate, WATCH, EXIT watch, or AVOID.
+- Scanner uses Spot candles, technical trend/momentum/volatility/liquidity, support/resistance structure, regime analysis, signal-validation evidence, and trade-eligibility evidence.
+- Scanner uses async progressive jobs so the UI can show queued/running/partial/completed progress and partial candidates.
+- Completed Spot scanner runs persist scanner candidates, validation snapshots, and post-signal outcome snapshots for later usefulness measurement.
+- Spot scanner simulation handoff opens the existing Spot Paper Simulation flow.
+- Scanner output is advisory only.
+- No Spot shorting, live Spot order placement, autonomous execution, or profitability guarantee is allowed in this phase.
+
 ## Next Suggested Phases
 
 ### 7-Day Paper Validation Report

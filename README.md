@@ -12,7 +12,9 @@ This project is a paper-mode signal intelligence workstation for Binance symbols
 - Manual paper buy and close flows are stable.
 - Signal validation, regime analysis, similar setup outcomes, trade eligibility, and adaptive recommendations exist.
 - A paper-only Futures Long/Short Opportunity Scanner is available for advisory ranking only.
+- A paper-only Spot Opportunity Scanner is available for advisory buy/watch/avoid ranking only.
 - The futures scanner can scan up to 100 symbols and includes a display-only paper leverage risk simulator.
+- The Spot scanner can scan up to 100 Spot USDT symbols with progressive async jobs, validation-ready persistence, and Spot paper simulation handoff.
 - Selected-symbol analysis loads separately from paper trading runtime controls; Start, Pause, Resume, and Stop control only paper runtime.
 - Sidebar selections use Spot analysis/simulation by default, while Futures scanner Simulate opens a separate USD-M Futures paper simulation flow.
 - Market Sensitivity supports Conservative, Balanced, and Active paper modes. Active mode is paper-only and only surfaces smaller slow-market setups when deterministic structure, liquidity, invalidation, and cost checks remain acceptable.
@@ -103,6 +105,7 @@ npm run build
 - Trade eligibility gate: advisory evidence-based gate for paper automation consideration.
 - Adaptive recommendations: report-only threshold and rule suggestions from measured outcomes.
 - Paper futures scanner: advisory LONG/SHORT/WAIT/AVOID opportunity ranking without execution, with async progressive scan jobs, 20/50/100-symbol scan sizes, display-only leverage-risk simulation, and event-based liquidation intelligence fields.
+- Paper Spot scanner: advisory BUY candidate/WATCH/AVOID/EXIT watch ranking from Spot candles, technical structure, regime, validation, and eligibility evidence, with async progressive scan jobs and persisted validation snapshots.
 - Slow-market opportunity detection: range breakout, liquidity sweep reversal, compression breakout, mean reversion from range edge, low-volatility continuation, and low-volatility no-edge blocking are labeled for paper-only review.
 - Liquidation event intelligence: interprets recent Binance force-order events into cascade, exhaustion, sweep-confirmation, noise, and no-activity context. This uses observed liquidation events only; it does not fabricate predictive liquidation levels.
 
@@ -130,6 +133,9 @@ Advanced details are for validation and due diligence. They must not bypass pape
 - `GET /bot/pattern-analysis?symbol=...&horizon=...` - multi-horizon pattern layer.
 - `GET /bot/regime-analysis?symbol=...&horizon=...` - current regime layer.
 - `GET /bot/trade-eligibility?symbol=...&horizon=...` - advisory eligibility gate.
+- `POST /bot/spot-opportunities/scan` - start a paper-only Spot opportunity scan.
+- `GET /bot/spot-opportunities/scan/{scan_id}` - read Spot scanner progress and partial/final results.
+- `POST /bot/spot-opportunities/scan/{scan_id}/cancel` - cancel a running Spot scan.
 - `GET /bot/futures-opportunities` - paper-only futures long/short opportunity scanner.
 - `GET /performance/signal-validation` - measured signal validation report.
 - `GET /performance/similar-setups` - historical similar setup outcome report.
@@ -140,6 +146,8 @@ Advanced details are for validation and due diligence. They must not bypass pape
 Paper trading is a simulation. It does not fully model exchange latency, partial fills, liquidity shocks, downtime, liquidation, funding, or real order-book execution. Binance force-order data is event-based and retrospective. Paper results are useful for validation, but they are not proof of live profitability.
 
 The futures scanner is also paper-only and advisory-only. Its leverage simulator estimates paper TP, SL, live return, fees/slippage, and risk labels for display only. It does not open persistent futures positions and does not place Binance futures orders.
+
+The Spot scanner is paper-only and advisory-only. It ranks Spot buy candidates, watch names, exit-watch names, and avoid names. It does not short Spot symbols and does not place Binance Spot orders.
 
 ## SQLite Troubleshooting
 

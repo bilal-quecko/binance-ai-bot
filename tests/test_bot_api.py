@@ -25,6 +25,7 @@ from app.api.bot_api import (
 )
 from app.bot import BotStatus, PaperBotRuntime, WorkstationState
 from app.config import Settings
+from app.exchange.models import ExchangeInfo, ExchangeSymbol
 from app.exchange.symbol_service import SpotSymbolRecord
 from app.features.models import FeatureSnapshot
 from app.main import app
@@ -269,6 +270,87 @@ class FakeFuturesRestClient:
         ]
 
 
+class FakeSpotRestClient(FakeFuturesRestClient):
+    async def get_exchange_info(self):
+        symbol_specs = [
+            ('BTCUSDT', 'BTC'),
+            ('ETHUSDT', 'ETH'),
+            ('SOLUSDT', 'SOL'),
+            ('ADAUSDT', 'ADA'),
+        ]
+        return ExchangeInfo(
+            timezone='UTC',
+            server_time=0,
+            symbols=[
+                ExchangeSymbol(
+                    symbol=symbol,
+                    status='TRADING',
+                    base_asset=base,
+                    quote_asset='USDT',
+                    base_asset_precision=8,
+                    quote_asset_precision=8,
+                    permissions=['SPOT'],
+                    permission_sets=[['SPOT']],
+                    is_spot_trading_allowed=True,
+                )
+                for symbol, base in symbol_specs[: self.count]
+            ],
+        )
+
+    async def get_ticker_24h(self):
+        rows = [
+            {'symbol': 'BTCUSDT', 'quoteVolume': '30000000'},
+            {'symbol': 'ETHUSDT', 'quoteVolume': '20000000'},
+            {'symbol': 'SOLUSDT', 'quoteVolume': '15000000'},
+            {'symbol': 'ADAUSDT', 'quoteVolume': '10000000'},
+        ]
+        return rows[: self.count]
+
+    async def get_klines(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 1000,
+    ):
+        self.calls.append((symbol, interval))
+        if symbol in self.failing_symbols:
+            raise RuntimeError('spot klines unavailable')
+        count = 120
+        step = Decimal('0.35')
+        if symbol == 'ETHUSDT':
+            step = Decimal('0.05')
+        if symbol == 'ADAUSDT':
+            step = Decimal('-0.20')
+        base_time = datetime.now(tz=UTC) - timedelta(minutes=15 * (count + 1))
+        interval_ms = 900_000
+        rows = []
+        for index in range(count):
+            open_time = int((base_time + timedelta(milliseconds=interval_ms * index)).timestamp() * 1000)
+            close_time = open_time + interval_ms - 1
+            open_price = Decimal('100') + (Decimal(index) * step)
+            close_price = open_price + (step / Decimal('2'))
+            high = max(open_price, close_price) + Decimal('0.8')
+            low = min(open_price, close_price) - Decimal('0.5')
+            rows.append([
+                open_time,
+                str(open_price),
+                str(high),
+                str(low),
+                str(close_price),
+                '1000',
+                close_time,
+                '25000000',
+                100,
+                '0',
+                '0',
+                '0',
+            ])
+        return rows[:limit]
+
+
 class FailingFuturesRestClient(FakeFuturesRestClient):
     async def get_futures_klines(
         self,
@@ -367,6 +449,20 @@ def _poll_futures_scan_job(client: TestClient, scan_id: str, predicate, timeout:
     latest: dict | None = None
     while time.perf_counter() < deadline:
         response = client.get(f'/bot/futures-opportunities/scan/{scan_id}')
+        assert response.status_code == 200
+        latest = response.json()
+        if predicate(latest):
+            return latest
+        time.sleep(0.05)
+    assert latest is not None
+    return latest
+
+
+def _poll_spot_scan_job(client: TestClient, scan_id: str, predicate, timeout: float = 5.0) -> dict:
+    deadline = time.perf_counter() + timeout
+    latest: dict | None = None
+    while time.perf_counter() < deadline:
+        response = client.get(f'/bot/spot-opportunities/scan/{scan_id}')
         assert response.status_code == 200
         latest = response.json()
         if predicate(latest):
@@ -2252,6 +2348,84 @@ def test_futures_opportunities_response_shape_and_safety_flags() -> None:
     assert {'top_long', 'top_short', 'random_baseline'} <= {snapshot.candidate_group for snapshot in snapshots}
     assert all(snapshot.price_at_scan != Decimal('123.45') for snapshot in snapshots if snapshot.price_at_scan is not None)
     assert all(snapshot.data_source == 'binance_usdm_futures' for snapshot in snapshots)
+
+
+def test_async_spot_scan_completes_and_persists_candidates() -> None:
+    db_path = _db_path()
+    settings = Settings(DATABASE_URL=f"sqlite:///{db_path}")
+    rest_client = FakeSpotRestClient(count=3)
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: rest_client
+    client = TestClient(app)
+
+    try:
+        response = client.post(
+            '/bot/spot-opportunities/scan',
+            json={
+                'max_symbols': 3,
+                'batch_size': 5,
+                'concurrency': 2,
+                'symbol_timeout_seconds': 5,
+                'scan_timeout_seconds': 20,
+                'min_opportunity_score': 0,
+                'min_confidence': 0,
+                'include_avoid': True,
+            },
+        )
+        assert response.status_code == 200
+        scan_id = response.json()['scan_id']
+        body = _poll_spot_scan_job(
+            client,
+            scan_id,
+            lambda item: item['status'] in {'completed', 'failed', 'cancelled'},
+            timeout=6,
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert body['status'] == 'completed'
+    assert body['scan']['scanned_count'] == 3
+    assert body['scan']['symbol_count'] == 3
+    candidates = (
+        body['scan']['buy_candidates']
+        + body['scan']['watch_candidates']
+        + body['scan']['exit_watch_candidates']
+        + body['scan']['avoid_candidates']
+    )
+    assert candidates
+    assert {'symbol', 'action', 'opportunity_score', 'confidence', 'paper_only'} <= set(candidates[0])
+    assert body['scan']['data_source'] == 'binance_spot'
+    assert body['scan']['persisted_candidate_count'] >= 1
+
+    repository = StorageRepository(settings.database_url)
+    try:
+        latest_run = repository.get_latest_successful_scanner_run(quote_asset='SPOT:USDT', horizon='7d')
+        assert latest_run is not None
+        assert repository.get_scanner_candidates(scanner_run_id=latest_run.id)
+        snapshots = repository.get_scanner_validation_snapshots()
+        assert any(snapshot.scan_id == latest_run.id for snapshot in snapshots)
+    finally:
+        repository.close()
+
+
+def test_async_spot_scan_cancel_endpoint_marks_job_cancelled() -> None:
+    settings = Settings(DATABASE_URL=f"sqlite:///{_db_path()}")
+    app.dependency_overrides[get_settings_dependency] = lambda: settings
+    app.dependency_overrides[get_rest_client] = lambda: FakeSpotRestClient(count=3)
+    client = TestClient(app)
+
+    try:
+        response = client.post('/bot/spot-opportunities/scan', json={'max_symbols': 3})
+        assert response.status_code == 200
+        scan_id = response.json()['scan_id']
+        cancel_response = client.post(f'/bot/spot-opportunities/scan/{scan_id}/cancel')
+    finally:
+        app.dependency_overrides.clear()
+
+    assert cancel_response.status_code == 200
+    body = cancel_response.json()
+    assert body['status'] == 'cancelled'
+    assert body['latest_error'] == 'Spot scan cancelled by user.'
 
 
 def test_async_futures_scan_start_returns_immediately() -> None:
