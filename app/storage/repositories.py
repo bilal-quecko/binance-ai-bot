@@ -33,8 +33,17 @@ from app.storage.models import (
     PositionSnapshotRecord,
     ProfileTuningSetRecord,
     RuntimeSessionRecord,
+    ScannerCandidatePriceRecord,
+    ScannerCandidateRecord,
+    ScannerRunRecord,
     RunnerEventRecord,
+    ScannerValidationOutcomeRecord,
+    ScannerValidationSnapshotRecord,
+    SignalOutcomeRecord,
+    SignalOutcomeSnapshotRecord,
     SignalValidationSnapshotRecord,
+    SymbolAnalysisCacheRecord,
+    SymbolBackfillJobRecord,
     TradeRecord,
 )
 
@@ -179,6 +188,201 @@ def _signal_validation_snapshot_from_row(row: sqlite3.Row) -> SignalValidationSn
         signal_ignored_or_blocked=bool(row["signal_ignored_or_blocked"]),
         blocker_reasons=_parse_json_tuple(row["blocker_reasons_json"]),
         regime_label=row["regime_label"],
+    )
+
+
+def _scanner_validation_snapshot_from_row(row: sqlite3.Row) -> ScannerValidationSnapshotRecord:
+    """Convert a SQLite row into a scanner-validation snapshot record."""
+
+    return ScannerValidationSnapshotRecord(
+        id=int(row["id"]),
+        scan_id=row["scan_id"],
+        symbol=row["symbol"],
+        direction=row["direction"],
+        price_at_scan=_decimal(row["price_at_scan"]) if row["price_at_scan"] is not None else None,
+        opportunity_score=int(row["opportunity_score"]),
+        confidence=int(row["confidence"]),
+        horizon=row["horizon"],
+        risk_grade=row["risk_grade"],
+        trend_score=int(row["trend_score"]),
+        momentum_score=int(row["momentum_score"]),
+        volatility_quality_score=int(row["volatility_quality_score"]),
+        liquidity_score=int(row["liquidity_score"]),
+        risk_score=int(row["risk_score"]),
+        direction_score=int(row["direction_score"]),
+        validation_score=int(row["validation_score"]) if row["validation_score"] is not None else None,
+        evidence_strength=row["evidence_strength"],
+        stop_loss=_decimal(row["stop_loss"]) if row["stop_loss"] is not None else None,
+        take_profit=_decimal(row["take_profit"]) if row["take_profit"] is not None else None,
+        timestamp=datetime.fromisoformat(row["snapshot_time"]),
+        rank_position=int(row["rank_position"]),
+        candidate_group=row["candidate_group"],
+        regime_label=row["regime_label"],
+        data_source=row["data_source"] if "data_source" in row.keys() else None,
+    )
+
+
+def _scanner_validation_outcome_from_row(row: sqlite3.Row) -> ScannerValidationOutcomeRecord:
+    """Convert a SQLite row into a scanner-validation outcome record."""
+
+    return ScannerValidationOutcomeRecord(
+        id=int(row["id"]),
+        snapshot_id=int(row["snapshot_id"]),
+        horizon=row["horizon"],
+        future_price=_decimal(row["future_price"]) if row["future_price"] is not None else None,
+        gross_return_pct=(
+            _decimal(row["gross_return_pct"]) if row["gross_return_pct"] is not None else None
+        ),
+        estimated_fee_pct=_decimal(row["estimated_fee_pct"]),
+        estimated_slippage_pct=_decimal(row["estimated_slippage_pct"]),
+        net_return_pct=_decimal(row["net_return_pct"]) if row["net_return_pct"] is not None else None,
+        direction_correct=bool(row["direction_correct"]) if row["direction_correct"] is not None else None,
+        max_favorable_move_pct=(
+            _decimal(row["max_favorable_move_pct"])
+            if row["max_favorable_move_pct"] is not None
+            else None
+        ),
+        max_adverse_move_pct=(
+            _decimal(row["max_adverse_move_pct"]) if row["max_adverse_move_pct"] is not None else None
+        ),
+        take_profit_hit=bool(row["take_profit_hit"]),
+        stop_loss_hit=bool(row["stop_loss_hit"]),
+        first_exit=row["first_exit"],
+        outcome_state=row["outcome_state"],
+        evaluated_at=datetime.fromisoformat(row["evaluated_at"]),
+    )
+
+
+def _scanner_run_from_row(row: sqlite3.Row) -> ScannerRunRecord:
+    """Convert a SQLite row into scanner-run metadata."""
+
+    return ScannerRunRecord(
+        id=row["id"],
+        generated_at=datetime.fromisoformat(row["generated_at"]),
+        quote_asset=row["quote_asset"],
+        horizon=row["horizon"],
+        max_symbols=int(row["max_symbols"]),
+        min_opportunity_score=int(row["min_opportunity_score"]),
+        scan_state=row["scan_state"],
+        scanned_count=int(row["scanned_count"]),
+        failed_symbols_json=row["failed_symbols_json"],
+        warnings_json=row["warnings_json"],
+        result_json=row["result_json"] if "result_json" in row.keys() else None,
+        candidate_count=int(row["candidate_count"]) if "candidate_count" in row.keys() else 0,
+    )
+
+
+def _scanner_candidate_from_row(row: sqlite3.Row) -> ScannerCandidateRecord:
+    """Convert a SQLite row into a scanner candidate record."""
+
+    return ScannerCandidateRecord(
+        id=row["id"],
+        scanner_run_id=row["scanner_run_id"],
+        symbol=row["symbol"],
+        direction=row["direction"],
+        opportunity_score=int(row["opportunity_score"]),
+        confidence=int(row["confidence"]),
+        evidence_strength=row["evidence_strength"],
+        current_price=_decimal(row["current_price"]) if row["current_price"] is not None else None,
+        entry_zone=row["entry_zone"],
+        stop_loss=_decimal(row["stop_loss"]) if row["stop_loss"] is not None else None,
+        take_profit=_decimal(row["take_profit"]) if row["take_profit"] is not None else None,
+        risk_grade=row["risk_grade"],
+        regime=row["regime"],
+        reason=row["reason"],
+        warnings_json=row["warnings_json"],
+        timestamp=datetime.fromisoformat(row["timestamp"]),
+    )
+
+
+def _signal_outcome_snapshot_from_row(row: sqlite3.Row) -> SignalOutcomeSnapshotRecord:
+    """Convert a SQLite row into a post-signal snapshot record."""
+
+    return SignalOutcomeSnapshotRecord(
+        id=row["id"],
+        symbol=row["symbol"],
+        timestamp=datetime.fromisoformat(row["snapshot_time"]),
+        source=row["source"],
+        signal_type=row["signal_type"],
+        confidence=int(row["confidence"]),
+        entry_price=_decimal(row["entry_price"]) if row["entry_price"] is not None else None,
+        liquidity_bias=row["liquidity_bias"],
+        sweep_risk=row["sweep_risk"],
+        nearest_liquidity_above=(
+            _decimal(row["nearest_liquidity_above"]) if row["nearest_liquidity_above"] is not None else None
+        ),
+        nearest_liquidity_below=(
+            _decimal(row["nearest_liquidity_below"]) if row["nearest_liquidity_below"] is not None else None
+        ),
+        funding_rate=_decimal(row["funding_rate"]) if row["funding_rate"] is not None else None,
+        open_interest=_decimal(row["open_interest"]) if row["open_interest"] is not None else None,
+        notes=row["notes"],
+        heatmap_liquidity_above=(
+            _decimal(row["heatmap_liquidity_above"]) if row["heatmap_liquidity_above"] is not None else None
+        ),
+        heatmap_liquidity_below=(
+            _decimal(row["heatmap_liquidity_below"]) if row["heatmap_liquidity_below"] is not None else None
+        ),
+        heatmap_intensity_score=(
+            int(row["heatmap_intensity_score"]) if row["heatmap_intensity_score"] is not None else None
+        ),
+        heatmap_bias=row["heatmap_bias"],
+        base_signal_type=row["base_signal_type"],
+        heatmap_signal_type=row["heatmap_signal_type"],
+        base_confidence=int(row["base_confidence"]) if row["base_confidence"] is not None else None,
+        heatmap_confidence=int(row["heatmap_confidence"]) if row["heatmap_confidence"] is not None else None,
+        heatmap_alignment=row["heatmap_alignment"],
+        heatmap_explanation=row["heatmap_explanation"],
+        heatmap_provider=row["heatmap_provider"],
+        heatmap_data_quality=row["heatmap_data_quality"],
+        heatmap_is_real_data=bool(row["heatmap_is_real_data"]) if row["heatmap_is_real_data"] is not None else None,
+        heatmap_provider_status=row["heatmap_provider_status"],
+        liquidation_pressure=row["liquidation_pressure"],
+        liquidation_imbalance=(
+            _decimal(row["liquidation_imbalance"]) if row["liquidation_imbalance"] is not None else None
+        ),
+    )
+
+
+def _signal_outcome_from_row(row: sqlite3.Row) -> SignalOutcomeRecord:
+    """Convert a SQLite row into a post-signal outcome record."""
+
+    return SignalOutcomeRecord(
+        id=int(row["id"]),
+        signal_id=row["signal_id"],
+        horizon=row["horizon"],
+        future_price=_decimal(row["future_price"]) if row["future_price"] is not None else None,
+        price_change_percent=(
+            _decimal(row["price_change_percent"]) if row["price_change_percent"] is not None else None
+        ),
+        max_upside_percent=_decimal(row["max_upside_percent"]) if row["max_upside_percent"] is not None else None,
+        max_downside_percent=(
+            _decimal(row["max_downside_percent"]) if row["max_downside_percent"] is not None else None
+        ),
+        did_price_hit_tp=bool(row["did_price_hit_tp"]),
+        did_price_hit_sl=bool(row["did_price_hit_sl"]),
+        direction_correct=bool(row["direction_correct"]) if row["direction_correct"] is not None else None,
+        volatility_range=_decimal(row["volatility_range"]) if row["volatility_range"] is not None else None,
+        first_hit=row["first_hit"],
+        time_to_hit_seconds=int(row["time_to_hit_seconds"]) if row["time_to_hit_seconds"] is not None else None,
+        sweep_direction_actual=row["sweep_direction_actual"],
+        sweep_prediction_correct=(
+            bool(row["sweep_prediction_correct"]) if row["sweep_prediction_correct"] is not None else None
+        ),
+        outcome_state=row["outcome_state"],
+        evaluated_at=datetime.fromisoformat(row["evaluated_at"]),
+        base_signal_correct=bool(row["base_signal_correct"]) if row["base_signal_correct"] is not None else None,
+        heatmap_signal_correct=(
+            bool(row["heatmap_signal_correct"]) if row["heatmap_signal_correct"] is not None else None
+        ),
+        did_heatmap_improve_result=(
+            bool(row["did_heatmap_improve_result"]) if row["did_heatmap_improve_result"] is not None else None
+        ),
+        did_heatmap_reduce_loss=(
+            bool(row["did_heatmap_reduce_loss"]) if row["did_heatmap_reduce_loss"] is not None else None
+        ),
+        predicted_sweep_direction=row["predicted_sweep_direction"],
+        actual_sweep_direction=row["actual_sweep_direction"],
     )
 
 
@@ -353,6 +557,17 @@ class StorageRepository:
                     "market_candle_snapshots",
                     "signal_validation_snapshots",
                     "historical_candles",
+                    "futures_historical_candles",
+                    "scanner_runs",
+                    "scanner_candidates",
+                    "scanner_candidate_prices",
+                    "symbol_candle_cache",
+                    "symbol_analysis_cache",
+                    "symbol_backfill_jobs",
+                    "scanner_validation_snapshots",
+                    "scanner_validation_outcomes",
+                    "signal_snapshots",
+                    "signal_outcomes",
                     "runtime_session_state",
                     "paper_broker_state",
                     "paper_broker_positions",
@@ -969,6 +1184,652 @@ class StorageRepository:
             return []
         return [_signal_validation_snapshot_from_row(row) for row in rows]
 
+    def insert_scanner_validation_snapshots(
+        self,
+        snapshots: list[ScannerValidationSnapshotRecord],
+    ) -> int:
+        """Persist futures-paper scanner snapshots for later outcome validation."""
+
+        if not snapshots:
+            return 0
+        try:
+            connection = self._open_connection()
+            with connection:
+                cursor = connection.executemany(
+                    """
+                    INSERT OR IGNORE INTO scanner_validation_snapshots (
+                        scan_id, symbol, direction, price_at_scan, opportunity_score, confidence,
+                        horizon, risk_grade, trend_score, momentum_score, volatility_quality_score,
+                        liquidity_score, risk_score, direction_score, validation_score, evidence_strength,
+                        stop_loss, take_profit, snapshot_time, rank_position, candidate_group, regime_label,
+                        data_source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            snapshot.scan_id,
+                            snapshot.symbol.upper(),
+                            snapshot.direction,
+                            str(snapshot.price_at_scan) if snapshot.price_at_scan is not None else None,
+                            snapshot.opportunity_score,
+                            snapshot.confidence,
+                            snapshot.horizon,
+                            snapshot.risk_grade,
+                            snapshot.trend_score,
+                            snapshot.momentum_score,
+                            snapshot.volatility_quality_score,
+                            snapshot.liquidity_score,
+                            snapshot.risk_score,
+                            snapshot.direction_score,
+                            snapshot.validation_score,
+                            snapshot.evidence_strength,
+                            str(snapshot.stop_loss) if snapshot.stop_loss is not None else None,
+                            str(snapshot.take_profit) if snapshot.take_profit is not None else None,
+                            snapshot.timestamp.isoformat(),
+                            snapshot.rank_position,
+                            snapshot.candidate_group,
+                            snapshot.regime_label,
+                            snapshot.data_source,
+                        )
+                        for snapshot in snapshots
+                    ],
+                )
+            return int(cursor.rowcount)
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Scanner-validation snapshot storage is unavailable.")
+            LOGGER.warning("Skipping scanner-validation snapshot persistence due to schema issue: %s", exc)
+            return 0
+        finally:
+            if "connection" in locals():
+                connection.close()
+
+    def get_scanner_validation_snapshots(
+        self,
+        *,
+        symbol: str | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        direction: str | None = None,
+        min_opportunity_score: int | None = None,
+    ) -> list[ScannerValidationSnapshotRecord]:
+        """Return persisted futures-paper scanner snapshots."""
+
+        query = """
+            SELECT id, scan_id, symbol, direction, price_at_scan, opportunity_score, confidence,
+                   horizon, risk_grade, trend_score, momentum_score, volatility_quality_score,
+                   liquidity_score, risk_score, direction_score, validation_score, evidence_strength,
+                   stop_loss, take_profit, snapshot_time, rank_position, candidate_group, regime_label,
+                   data_source
+            FROM scanner_validation_snapshots
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        query, params = self._apply_history_filters(
+            query=query,
+            params=params,
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            timestamp_column="snapshot_time",
+        )
+        if direction is not None:
+            query += " AND direction = ?"
+            params.append(direction.lower())
+        if min_opportunity_score is not None:
+            query += " AND opportunity_score >= ?"
+            params.append(min_opportunity_score)
+        query += " ORDER BY snapshot_time ASC, id ASC"
+        try:
+            with self._connection_scope() as connection:
+                rows = connection.execute(query, tuple(params)).fetchall()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Scanner-validation snapshot storage is unavailable.")
+            LOGGER.warning("Failed to read scanner-validation snapshots due to schema issue: %s", exc)
+            return []
+        return [_scanner_validation_snapshot_from_row(row) for row in rows]
+
+    def upsert_scanner_validation_outcome(self, outcome: ScannerValidationOutcomeRecord) -> None:
+        """Persist or replace a scanner-validation horizon outcome."""
+
+        try:
+            connection = self._open_connection()
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO scanner_validation_outcomes (
+                        snapshot_id, horizon, future_price, gross_return_pct, estimated_fee_pct,
+                        estimated_slippage_pct, net_return_pct, direction_correct,
+                        max_favorable_move_pct, max_adverse_move_pct, take_profit_hit, stop_loss_hit,
+                        first_exit, outcome_state, evaluated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(snapshot_id, horizon) DO UPDATE SET
+                        future_price = excluded.future_price,
+                        gross_return_pct = excluded.gross_return_pct,
+                        estimated_fee_pct = excluded.estimated_fee_pct,
+                        estimated_slippage_pct = excluded.estimated_slippage_pct,
+                        net_return_pct = excluded.net_return_pct,
+                        direction_correct = excluded.direction_correct,
+                        max_favorable_move_pct = excluded.max_favorable_move_pct,
+                        max_adverse_move_pct = excluded.max_adverse_move_pct,
+                        take_profit_hit = excluded.take_profit_hit,
+                        stop_loss_hit = excluded.stop_loss_hit,
+                        first_exit = excluded.first_exit,
+                        outcome_state = excluded.outcome_state,
+                        evaluated_at = excluded.evaluated_at
+                    """,
+                    (
+                        outcome.snapshot_id,
+                        outcome.horizon,
+                        str(outcome.future_price) if outcome.future_price is not None else None,
+                        str(outcome.gross_return_pct) if outcome.gross_return_pct is not None else None,
+                        str(outcome.estimated_fee_pct),
+                        str(outcome.estimated_slippage_pct),
+                        str(outcome.net_return_pct) if outcome.net_return_pct is not None else None,
+                        int(outcome.direction_correct) if outcome.direction_correct is not None else None,
+                        (
+                            str(outcome.max_favorable_move_pct)
+                            if outcome.max_favorable_move_pct is not None
+                            else None
+                        ),
+                        (
+                            str(outcome.max_adverse_move_pct)
+                            if outcome.max_adverse_move_pct is not None
+                            else None
+                        ),
+                        int(outcome.take_profit_hit),
+                        int(outcome.stop_loss_hit),
+                        outcome.first_exit,
+                        outcome.outcome_state,
+                        outcome.evaluated_at.isoformat(),
+                    ),
+                )
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Scanner-validation outcome storage is unavailable.")
+            LOGGER.warning("Skipping scanner-validation outcome persistence due to schema issue: %s", exc)
+        finally:
+            if "connection" in locals():
+                connection.close()
+
+    def get_scanner_validation_outcomes(
+        self,
+        *,
+        snapshot_ids: list[int] | None = None,
+        horizon: str | None = None,
+    ) -> list[ScannerValidationOutcomeRecord]:
+        """Return persisted futures-paper scanner outcomes."""
+
+        if snapshot_ids == []:
+            return []
+
+        query = """
+            SELECT id, snapshot_id, horizon, future_price, gross_return_pct, estimated_fee_pct,
+                   estimated_slippage_pct, net_return_pct, direction_correct, max_favorable_move_pct,
+                   max_adverse_move_pct, take_profit_hit, stop_loss_hit, first_exit, outcome_state,
+                   evaluated_at
+            FROM scanner_validation_outcomes
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if snapshot_ids:
+            placeholders = ",".join("?" for _ in snapshot_ids)
+            query += f" AND snapshot_id IN ({placeholders})"
+            params.extend(snapshot_ids)
+        if horizon is not None:
+            query += " AND horizon = ?"
+            params.append(horizon)
+        query += " ORDER BY evaluated_at ASC, id ASC"
+        try:
+            with self._connection_scope() as connection:
+                rows = connection.execute(query, tuple(params)).fetchall()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Scanner-validation outcome storage is unavailable.")
+            LOGGER.warning("Failed to read scanner-validation outcomes due to schema issue: %s", exc)
+            return []
+        return [_scanner_validation_outcome_from_row(row) for row in rows]
+
+    def upsert_scanner_run(self, run: ScannerRunRecord) -> None:
+        """Persist scanner run metadata with stable idempotency by run id."""
+
+        try:
+            with self._connection_scope() as connection:
+                with connection:
+                    connection.execute(
+                        """
+                        INSERT INTO scanner_runs (
+                            id, generated_at, quote_asset, horizon, max_symbols,
+                            min_opportunity_score, scan_state, scanned_count,
+                            failed_symbols_json, warnings_json, result_json, candidate_count
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            generated_at = excluded.generated_at,
+                            quote_asset = excluded.quote_asset,
+                            horizon = excluded.horizon,
+                            max_symbols = excluded.max_symbols,
+                            min_opportunity_score = excluded.min_opportunity_score,
+                            scan_state = excluded.scan_state,
+                            scanned_count = excluded.scanned_count,
+                            failed_symbols_json = excluded.failed_symbols_json,
+                            warnings_json = excluded.warnings_json,
+                            result_json = excluded.result_json,
+                            candidate_count = excluded.candidate_count
+                        """,
+                        (
+                            run.id,
+                            run.generated_at.isoformat(),
+                            run.quote_asset,
+                            run.horizon,
+                            run.max_symbols,
+                            run.min_opportunity_score,
+                            run.scan_state,
+                            run.scanned_count,
+                            run.failed_symbols_json,
+                            run.warnings_json,
+                            run.result_json,
+                            run.candidate_count,
+                        ),
+                    )
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Scanner run storage is unavailable.")
+            LOGGER.warning("Skipping scanner run persistence due to schema issue: %s", exc)
+
+    def get_scanner_runs(self, *, limit: int = 20) -> list[ScannerRunRecord]:
+        """Return recent scanner runs."""
+
+        try:
+            with self._connection_scope() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id, generated_at, quote_asset, horizon, max_symbols,
+                           min_opportunity_score, scan_state, scanned_count,
+                           failed_symbols_json, warnings_json, result_json, candidate_count
+                    FROM scanner_runs
+                    ORDER BY generated_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Scanner run storage is unavailable.")
+            LOGGER.warning("Failed to read scanner runs due to schema issue: %s", exc)
+            return []
+        return [_scanner_run_from_row(row) for row in rows]
+
+    def get_latest_successful_scanner_run(
+        self,
+        *,
+        quote_asset: str = "USDT",
+        horizon: str | None = None,
+    ) -> ScannerRunRecord | None:
+        """Return the latest persisted scanner result with usable candidates."""
+
+        query = """
+            SELECT id, generated_at, quote_asset, horizon, max_symbols,
+                   min_opportunity_score, scan_state, scanned_count,
+                   failed_symbols_json, warnings_json, result_json, candidate_count
+            FROM scanner_runs
+            WHERE quote_asset = ?
+              AND result_json IS NOT NULL
+              AND candidate_count > 0
+              AND scan_state IN ('ready', 'partial', 'insufficient_data')
+        """
+        params: list[Any] = [quote_asset.upper()]
+        if horizon is not None:
+            query += " AND horizon = ?"
+            params.append(horizon)
+        query += " ORDER BY generated_at DESC LIMIT 1"
+        try:
+            with self._connection_scope() as connection:
+                row = connection.execute(query, tuple(params)).fetchone()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Scanner run storage is unavailable.")
+            LOGGER.warning("Failed to read latest scanner run due to schema issue: %s", exc)
+            return None
+        if row is None:
+            return None
+        return _scanner_run_from_row(row)
+
+    def upsert_scanner_candidates(self, candidates: list[ScannerCandidateRecord]) -> int:
+        """Persist scanner candidates for later review and validation."""
+
+        if not candidates:
+            return 0
+        try:
+            with self._connection_scope() as connection:
+                with connection:
+                    cursor = connection.executemany(
+                        """
+                        INSERT INTO scanner_candidates (
+                            id, scanner_run_id, symbol, direction, opportunity_score,
+                            confidence, evidence_strength, current_price, entry_zone,
+                            stop_loss, take_profit, risk_grade, regime, reason,
+                            warnings_json, timestamp
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(scanner_run_id, symbol, direction) DO UPDATE SET
+                            opportunity_score = excluded.opportunity_score,
+                            confidence = excluded.confidence,
+                            evidence_strength = excluded.evidence_strength,
+                            current_price = excluded.current_price,
+                            entry_zone = excluded.entry_zone,
+                            stop_loss = excluded.stop_loss,
+                            take_profit = excluded.take_profit,
+                            risk_grade = excluded.risk_grade,
+                            regime = excluded.regime,
+                            reason = excluded.reason,
+                            warnings_json = excluded.warnings_json,
+                            timestamp = excluded.timestamp
+                        """,
+                        [
+                            (
+                                candidate.id,
+                                candidate.scanner_run_id,
+                                candidate.symbol.upper(),
+                                candidate.direction,
+                                candidate.opportunity_score,
+                                candidate.confidence,
+                                candidate.evidence_strength,
+                                str(candidate.current_price) if candidate.current_price is not None else None,
+                                candidate.entry_zone,
+                                str(candidate.stop_loss) if candidate.stop_loss is not None else None,
+                                str(candidate.take_profit) if candidate.take_profit is not None else None,
+                                candidate.risk_grade,
+                                candidate.regime,
+                                candidate.reason,
+                                candidate.warnings_json,
+                                candidate.timestamp.isoformat(),
+                            )
+                            for candidate in candidates
+                        ],
+                    )
+            return int(cursor.rowcount)
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Scanner candidate storage is unavailable.")
+            LOGGER.warning("Skipping scanner candidate persistence due to schema issue: %s", exc)
+            return 0
+
+    def get_scanner_candidates(
+        self,
+        *,
+        scanner_run_id: str | None = None,
+        symbol: str | None = None,
+        limit: int = 100,
+    ) -> list[ScannerCandidateRecord]:
+        """Return persisted scanner candidates."""
+
+        query = """
+            SELECT id, scanner_run_id, symbol, direction, opportunity_score, confidence,
+                   evidence_strength, current_price, entry_zone, stop_loss, take_profit,
+                   risk_grade, regime, reason, warnings_json, timestamp
+            FROM scanner_candidates
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if scanner_run_id is not None:
+            query += " AND scanner_run_id = ?"
+            params.append(scanner_run_id)
+        if symbol is not None:
+            query += " AND symbol = ?"
+            params.append(symbol.upper())
+        query += " ORDER BY timestamp DESC, opportunity_score DESC LIMIT ?"
+        params.append(limit)
+        try:
+            with self._connection_scope() as connection:
+                rows = connection.execute(query, tuple(params)).fetchall()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Scanner candidate storage is unavailable.")
+            LOGGER.warning("Failed to read scanner candidates due to schema issue: %s", exc)
+            return []
+        return [_scanner_candidate_from_row(row) for row in rows]
+
+    def upsert_scanner_candidate_prices(self, prices: list[ScannerCandidatePriceRecord]) -> int:
+        """Persist price observations tied to scanner candidates."""
+
+        if not prices:
+            return 0
+        try:
+            with self._connection_scope() as connection:
+                with connection:
+                    cursor = connection.executemany(
+                        """
+                        INSERT OR IGNORE INTO scanner_candidate_prices (
+                            scanner_candidate_id, symbol, price, price_type, source, recorded_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                item.scanner_candidate_id,
+                                item.symbol.upper(),
+                                str(item.price) if item.price is not None else None,
+                                item.price_type,
+                                item.source,
+                                item.recorded_at.isoformat(),
+                            )
+                            for item in prices
+                        ],
+                    )
+            return int(cursor.rowcount)
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Scanner candidate price storage is unavailable.")
+            LOGGER.warning("Skipping scanner candidate price persistence due to schema issue: %s", exc)
+            return 0
+
+    def upsert_symbol_candle_cache(self, candles: list[Candle], *, source: str) -> int:
+        """Persist symbol candle cache rows for fast selected-symbol reads."""
+
+        closed_candles = [candle for candle in candles if candle.is_closed]
+        if not closed_candles:
+            return 0
+        now = datetime.now(tz=UTC).isoformat()
+        try:
+            with self._connection_scope() as connection:
+                with connection:
+                    connection.executemany(
+                        """
+                        INSERT INTO symbol_candle_cache (
+                            symbol, interval, open_time, open, high, low, close,
+                            volume, source, inserted_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(symbol, interval, open_time) DO UPDATE SET
+                            open = excluded.open,
+                            high = excluded.high,
+                            low = excluded.low,
+                            close = excluded.close,
+                            volume = excluded.volume,
+                            source = excluded.source,
+                            updated_at = excluded.updated_at
+                        """,
+                        [
+                            (
+                                candle.symbol.upper(),
+                                candle.timeframe,
+                                candle.open_time.isoformat(),
+                                str(candle.open),
+                                str(candle.high),
+                                str(candle.low),
+                                str(candle.close),
+                                str(candle.volume),
+                                source,
+                                now,
+                                now,
+                            )
+                            for candle in closed_candles
+                        ],
+                    )
+            return len(closed_candles)
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Symbol candle cache storage is unavailable.")
+            LOGGER.warning("Skipping symbol candle cache persistence due to schema issue: %s", exc)
+            return 0
+
+    def upsert_symbol_analysis_cache(self, record: SymbolAnalysisCacheRecord) -> None:
+        """Persist symbol analysis cache payloads for stale-while-revalidate reads."""
+
+        try:
+            with self._connection_scope() as connection:
+                with connection:
+                    connection.execute(
+                        """
+                        INSERT INTO symbol_analysis_cache (
+                            symbol, analysis_type, horizon, payload_json, generated_at, expires_at, data_state
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(symbol, analysis_type, horizon) DO UPDATE SET
+                            payload_json = excluded.payload_json,
+                            generated_at = excluded.generated_at,
+                            expires_at = excluded.expires_at,
+                            data_state = excluded.data_state
+                        """,
+                        (
+                            record.symbol.upper(),
+                            record.analysis_type,
+                            record.horizon,
+                            record.payload_json,
+                            record.generated_at.isoformat(),
+                            record.expires_at.isoformat(),
+                            record.data_state,
+                        ),
+                    )
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Symbol analysis cache storage is unavailable.")
+            LOGGER.warning("Skipping symbol analysis cache persistence due to schema issue: %s", exc)
+
+    def get_symbol_analysis_cache(
+        self,
+        *,
+        symbol: str,
+        analysis_type: str,
+        horizon: str,
+    ) -> SymbolAnalysisCacheRecord | None:
+        """Return one persisted symbol analysis cache entry."""
+
+        try:
+            with self._connection_scope() as connection:
+                row = connection.execute(
+                    """
+                    SELECT symbol, analysis_type, horizon, payload_json, generated_at, expires_at, data_state
+                    FROM symbol_analysis_cache
+                    WHERE symbol = ? AND analysis_type = ? AND horizon = ?
+                    """,
+                    (symbol.upper(), analysis_type, horizon),
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Symbol analysis cache storage is unavailable.")
+            LOGGER.warning("Failed to read symbol analysis cache due to schema issue: %s", exc)
+            return None
+        if row is None:
+            return None
+        return SymbolAnalysisCacheRecord(
+            symbol=row["symbol"],
+            analysis_type=row["analysis_type"],
+            horizon=row["horizon"],
+            payload_json=row["payload_json"],
+            generated_at=datetime.fromisoformat(row["generated_at"]),
+            expires_at=datetime.fromisoformat(row["expires_at"]),
+            data_state=row["data_state"],
+        )
+
+    def upsert_symbol_backfill_job(self, job: SymbolBackfillJobRecord) -> None:
+        """Persist the latest state of a symbol backfill job."""
+
+        try:
+            with self._connection_scope() as connection:
+                with connection:
+                    connection.execute(
+                        """
+                        INSERT INTO symbol_backfill_jobs (
+                            id, symbol, interval, lookback_days, status, started_at,
+                            completed_at, error_message, candles_inserted
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            status = excluded.status,
+                            completed_at = excluded.completed_at,
+                            error_message = excluded.error_message,
+                            candles_inserted = excluded.candles_inserted
+                        """,
+                        (
+                            job.id,
+                            job.symbol.upper(),
+                            job.interval,
+                            job.lookback_days,
+                            job.status,
+                            job.started_at.isoformat(),
+                            job.completed_at.isoformat() if job.completed_at is not None else None,
+                            job.error_message,
+                            job.candles_inserted,
+                        ),
+                    )
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Symbol backfill job storage is unavailable.")
+            LOGGER.warning("Skipping symbol backfill job persistence due to schema issue: %s", exc)
+
+    def get_active_symbol_backfill_job(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        lookback_days: int,
+    ) -> SymbolBackfillJobRecord | None:
+        """Return an active backfill job to prevent duplicate selected-symbol backfills."""
+
+        try:
+            with self._connection_scope() as connection:
+                row = connection.execute(
+                    """
+                    SELECT id, symbol, interval, lookback_days, status, started_at,
+                           completed_at, error_message, candles_inserted
+                    FROM symbol_backfill_jobs
+                    WHERE symbol = ? AND interval = ? AND lookback_days = ? AND status IN ('queued', 'loading')
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """,
+                    (symbol.upper(), interval, lookback_days),
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Symbol backfill job storage is unavailable.")
+            LOGGER.warning("Failed to read active symbol backfill job due to schema issue: %s", exc)
+            return None
+        if row is None:
+            return None
+        return SymbolBackfillJobRecord(
+            id=row["id"],
+            symbol=row["symbol"],
+            interval=row["interval"],
+            lookback_days=int(row["lookback_days"]),
+            status=row["status"],
+            started_at=datetime.fromisoformat(row["started_at"]),
+            completed_at=_safe_datetime(row["completed_at"]),
+            error_message=row["error_message"],
+            candles_inserted=int(row["candles_inserted"]),
+        )
+
     def upsert_historical_candles(
         self,
         candles: list[Candle],
@@ -1085,6 +1946,411 @@ class StorageRepository:
             )
             for row in rows
         ]
+
+    def upsert_futures_historical_candles(
+        self,
+        candles: list[Candle],
+        *,
+        source: str,
+    ) -> int:
+        """Persist USD-M Futures OHLCV candle history separately from Spot history."""
+
+        if not candles:
+            return 0
+        connection = self._open_connection()
+        try:
+            with connection:
+                connection.executemany(
+                    """
+                    INSERT INTO futures_historical_candles (
+                        symbol, interval, open_time, close_time, open_price, high_price, low_price,
+                        close_price, volume, quote_volume, trade_count, source, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(symbol, interval, open_time) DO UPDATE SET
+                        close_time = excluded.close_time,
+                        open_price = excluded.open_price,
+                        high_price = excluded.high_price,
+                        low_price = excluded.low_price,
+                        close_price = excluded.close_price,
+                        volume = excluded.volume,
+                        quote_volume = excluded.quote_volume,
+                        trade_count = excluded.trade_count,
+                        source = excluded.source,
+                        created_at = excluded.created_at
+                    """,
+                    [
+                        (
+                            candle.symbol.upper(),
+                            candle.timeframe,
+                            candle.open_time.isoformat(),
+                            candle.close_time.isoformat(),
+                            str(candle.open),
+                            str(candle.high),
+                            str(candle.low),
+                            str(candle.close),
+                            str(candle.volume),
+                            str(candle.quote_volume),
+                            candle.trade_count,
+                            source,
+                            candle.event_time.isoformat(),
+                        )
+                        for candle in candles
+                        if candle.is_closed
+                    ],
+                )
+            self.upsert_symbol_candle_cache(candles, source=source)
+            return len(candles)
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("USD-M Futures candle storage is unavailable.")
+            LOGGER.warning("Skipping USD-M Futures candle persistence due to schema issue: %s", exc)
+            return 0
+        finally:
+            connection.close()
+
+    def get_futures_historical_candles(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[HistoricalCandleRecord]:
+        """Return persisted USD-M Futures OHLCV candle history for one symbol and interval."""
+
+        query = """
+            SELECT symbol, interval, open_time, close_time, open_price, high_price, low_price,
+                   close_price, volume, quote_volume, trade_count, source, created_at
+            FROM futures_historical_candles
+            WHERE symbol = ? AND interval = ?
+        """
+        params: list[Any] = [symbol.upper(), interval]
+        if start_time is not None:
+            query += " AND open_time >= ?"
+            params.append(start_time.isoformat())
+        if end_time is not None:
+            query += " AND open_time <= ?"
+            params.append(end_time.isoformat())
+        query += " ORDER BY open_time ASC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        try:
+            with self._connection_scope() as connection:
+                rows = connection.execute(query, tuple(params)).fetchall()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("USD-M Futures candle storage is unavailable.")
+            LOGGER.warning("Failed to read USD-M Futures candles due to schema issue: %s", exc)
+            return []
+        return [
+            HistoricalCandleRecord(
+                symbol=row["symbol"],
+                interval=row["interval"],
+                open_time=datetime.fromisoformat(row["open_time"]),
+                close_time=datetime.fromisoformat(row["close_time"]),
+                open_price=_decimal(row["open_price"]),
+                high_price=_decimal(row["high_price"]),
+                low_price=_decimal(row["low_price"]),
+                close_price=_decimal(row["close_price"]),
+                volume=_decimal(row["volume"]),
+                quote_volume=_decimal(row["quote_volume"]),
+                trade_count=int(row["trade_count"]),
+                source=row["source"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def insert_signal_outcome_snapshot(self, snapshot: SignalOutcomeSnapshotRecord) -> str | None:
+        """Persist one generated signal snapshot for post-signal outcome tracking."""
+
+        try:
+            connection = self._open_connection()
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO signal_snapshots (
+                        id, symbol, snapshot_time, source, signal_type, confidence, entry_price,
+                        liquidity_bias, sweep_risk, nearest_liquidity_above, nearest_liquidity_below,
+                        funding_rate, open_interest, notes, heatmap_liquidity_above, heatmap_liquidity_below,
+                        heatmap_intensity_score, heatmap_bias, base_signal_type, heatmap_signal_type,
+                        base_confidence, heatmap_confidence, heatmap_alignment, heatmap_explanation,
+                        heatmap_provider, heatmap_data_quality, heatmap_is_real_data, heatmap_provider_status,
+                        liquidation_pressure, liquidation_imbalance
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot.id,
+                        snapshot.symbol.upper(),
+                        snapshot.timestamp.isoformat(),
+                        snapshot.source,
+                        snapshot.signal_type.upper(),
+                        snapshot.confidence,
+                        str(snapshot.entry_price) if snapshot.entry_price is not None else None,
+                        snapshot.liquidity_bias,
+                        snapshot.sweep_risk,
+                        (
+                            str(snapshot.nearest_liquidity_above)
+                            if snapshot.nearest_liquidity_above is not None
+                            else None
+                        ),
+                        (
+                            str(snapshot.nearest_liquidity_below)
+                            if snapshot.nearest_liquidity_below is not None
+                            else None
+                        ),
+                        str(snapshot.funding_rate) if snapshot.funding_rate is not None else None,
+                        str(snapshot.open_interest) if snapshot.open_interest is not None else None,
+                        snapshot.notes,
+                        (
+                            str(snapshot.heatmap_liquidity_above)
+                            if snapshot.heatmap_liquidity_above is not None
+                            else None
+                        ),
+                        (
+                            str(snapshot.heatmap_liquidity_below)
+                            if snapshot.heatmap_liquidity_below is not None
+                            else None
+                        ),
+                        snapshot.heatmap_intensity_score,
+                        snapshot.heatmap_bias,
+                        snapshot.base_signal_type,
+                        snapshot.heatmap_signal_type,
+                        snapshot.base_confidence,
+                        snapshot.heatmap_confidence,
+                        snapshot.heatmap_alignment,
+                        snapshot.heatmap_explanation,
+                        snapshot.heatmap_provider,
+                        snapshot.heatmap_data_quality,
+                        int(snapshot.heatmap_is_real_data) if snapshot.heatmap_is_real_data is not None else None,
+                        snapshot.heatmap_provider_status,
+                        snapshot.liquidation_pressure,
+                        (
+                            str(snapshot.liquidation_imbalance)
+                            if snapshot.liquidation_imbalance is not None
+                            else None
+                        ),
+                    ),
+                )
+            return snapshot.id
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Post-signal snapshot storage is unavailable.")
+            LOGGER.warning("Skipping post-signal snapshot persistence due to schema issue: %s", exc)
+            return None
+        finally:
+            if "connection" in locals():
+                connection.close()
+
+    def get_signal_outcome_snapshots(
+        self,
+        *,
+        symbol: str | None = None,
+        source: str | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[SignalOutcomeSnapshotRecord]:
+        """Return generated signal snapshots for post-signal outcome tracking."""
+
+        query = """
+            SELECT id, symbol, snapshot_time, source, signal_type, confidence, entry_price,
+                   liquidity_bias, sweep_risk, nearest_liquidity_above, nearest_liquidity_below,
+                   funding_rate, open_interest, notes, heatmap_liquidity_above, heatmap_liquidity_below,
+                   heatmap_intensity_score, heatmap_bias, base_signal_type, heatmap_signal_type,
+                   base_confidence, heatmap_confidence, heatmap_alignment, heatmap_explanation,
+                   heatmap_provider, heatmap_data_quality, heatmap_is_real_data, heatmap_provider_status,
+                   liquidation_pressure, liquidation_imbalance
+            FROM signal_snapshots
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        query, params = self._apply_history_filters(
+            query=query,
+            params=params,
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            timestamp_column="snapshot_time",
+        )
+        if source is not None:
+            query += " AND source = ?"
+            params.append(source)
+        query += " ORDER BY snapshot_time DESC, id DESC"
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+        try:
+            with self._connection_scope() as connection:
+                rows = connection.execute(query, tuple(params)).fetchall()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Post-signal snapshot storage is unavailable.")
+            LOGGER.warning("Failed to read post-signal snapshots due to schema issue: %s", exc)
+            return []
+        return [_signal_outcome_snapshot_from_row(row) for row in rows]
+
+    def get_signal_outcome_snapshot(self, signal_id: str) -> SignalOutcomeSnapshotRecord | None:
+        """Return one generated signal snapshot by UUID."""
+
+        try:
+            with self._connection_scope() as connection:
+                row = connection.execute(
+                    """
+                    SELECT id, symbol, snapshot_time, source, signal_type, confidence, entry_price,
+                           liquidity_bias, sweep_risk, nearest_liquidity_above, nearest_liquidity_below,
+                           funding_rate, open_interest, notes, heatmap_liquidity_above, heatmap_liquidity_below,
+                           heatmap_intensity_score, heatmap_bias, base_signal_type, heatmap_signal_type,
+                           base_confidence, heatmap_confidence, heatmap_alignment, heatmap_explanation,
+                           heatmap_provider, heatmap_data_quality, heatmap_is_real_data, heatmap_provider_status,
+                           liquidation_pressure, liquidation_imbalance
+                    FROM signal_snapshots
+                    WHERE id = ?
+                    """,
+                    (signal_id,),
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Post-signal snapshot storage is unavailable.")
+            LOGGER.warning("Failed to read post-signal snapshot due to schema issue: %s", exc)
+            return None
+        return _signal_outcome_snapshot_from_row(row) if row is not None else None
+
+    def upsert_signal_outcome(self, outcome: SignalOutcomeRecord) -> None:
+        """Persist or replace a fixed-horizon post-signal outcome."""
+
+        try:
+            connection = self._open_connection()
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO signal_outcomes (
+                        signal_id, horizon, future_price, price_change_percent, max_upside_percent,
+                        max_downside_percent, did_price_hit_tp, did_price_hit_sl, direction_correct,
+                        volatility_range, first_hit, time_to_hit_seconds, sweep_direction_actual,
+                        sweep_prediction_correct, outcome_state, evaluated_at, base_signal_correct,
+                        heatmap_signal_correct, did_heatmap_improve_result, did_heatmap_reduce_loss,
+                        predicted_sweep_direction, actual_sweep_direction
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(signal_id, horizon) DO UPDATE SET
+                        future_price = excluded.future_price,
+                        price_change_percent = excluded.price_change_percent,
+                        max_upside_percent = excluded.max_upside_percent,
+                        max_downside_percent = excluded.max_downside_percent,
+                        did_price_hit_tp = excluded.did_price_hit_tp,
+                        did_price_hit_sl = excluded.did_price_hit_sl,
+                        direction_correct = excluded.direction_correct,
+                        volatility_range = excluded.volatility_range,
+                        first_hit = excluded.first_hit,
+                        time_to_hit_seconds = excluded.time_to_hit_seconds,
+                        sweep_direction_actual = excluded.sweep_direction_actual,
+                        sweep_prediction_correct = excluded.sweep_prediction_correct,
+                        outcome_state = excluded.outcome_state,
+                        evaluated_at = excluded.evaluated_at,
+                        base_signal_correct = excluded.base_signal_correct,
+                        heatmap_signal_correct = excluded.heatmap_signal_correct,
+                        did_heatmap_improve_result = excluded.did_heatmap_improve_result,
+                        did_heatmap_reduce_loss = excluded.did_heatmap_reduce_loss,
+                        predicted_sweep_direction = excluded.predicted_sweep_direction,
+                        actual_sweep_direction = excluded.actual_sweep_direction
+                    """,
+                    (
+                        outcome.signal_id,
+                        outcome.horizon,
+                        str(outcome.future_price) if outcome.future_price is not None else None,
+                        (
+                            str(outcome.price_change_percent)
+                            if outcome.price_change_percent is not None
+                            else None
+                        ),
+                        str(outcome.max_upside_percent) if outcome.max_upside_percent is not None else None,
+                        str(outcome.max_downside_percent) if outcome.max_downside_percent is not None else None,
+                        int(outcome.did_price_hit_tp),
+                        int(outcome.did_price_hit_sl),
+                        int(outcome.direction_correct) if outcome.direction_correct is not None else None,
+                        str(outcome.volatility_range) if outcome.volatility_range is not None else None,
+                        outcome.first_hit,
+                        outcome.time_to_hit_seconds,
+                        outcome.sweep_direction_actual,
+                        (
+                            int(outcome.sweep_prediction_correct)
+                            if outcome.sweep_prediction_correct is not None
+                            else None
+                        ),
+                        outcome.outcome_state,
+                        outcome.evaluated_at.isoformat(),
+                        int(outcome.base_signal_correct) if outcome.base_signal_correct is not None else None,
+                        int(outcome.heatmap_signal_correct) if outcome.heatmap_signal_correct is not None else None,
+                        (
+                            int(outcome.did_heatmap_improve_result)
+                            if outcome.did_heatmap_improve_result is not None
+                            else None
+                        ),
+                        (
+                            int(outcome.did_heatmap_reduce_loss)
+                            if outcome.did_heatmap_reduce_loss is not None
+                            else None
+                        ),
+                        outcome.predicted_sweep_direction,
+                        outcome.actual_sweep_direction,
+                    ),
+                )
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Post-signal outcome storage is unavailable.")
+            LOGGER.warning("Skipping post-signal outcome persistence due to schema issue: %s", exc)
+        finally:
+            if "connection" in locals():
+                connection.close()
+
+    def get_signal_outcomes(
+        self,
+        *,
+        signal_ids: list[str] | None = None,
+        horizon: str | None = None,
+    ) -> list[SignalOutcomeRecord]:
+        """Return post-signal outcomes."""
+
+        if signal_ids == []:
+            return []
+        query = """
+            SELECT id, signal_id, horizon, future_price, price_change_percent, max_upside_percent,
+                   max_downside_percent, did_price_hit_tp, did_price_hit_sl, direction_correct,
+                   volatility_range, first_hit, time_to_hit_seconds, sweep_direction_actual,
+                   sweep_prediction_correct, outcome_state, evaluated_at, base_signal_correct,
+                   heatmap_signal_correct, did_heatmap_improve_result, did_heatmap_reduce_loss,
+                   predicted_sweep_direction, actual_sweep_direction
+            FROM signal_outcomes
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if signal_ids:
+            placeholders = ",".join("?" for _ in signal_ids)
+            query += f" AND signal_id IN ({placeholders})"
+            params.extend(signal_ids)
+        if horizon is not None:
+            query += " AND horizon = ?"
+            params.append(horizon)
+        query += " ORDER BY evaluated_at DESC, id DESC"
+        try:
+            with self._connection_scope() as connection:
+                rows = connection.execute(query, tuple(params)).fetchall()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Post-signal outcome storage is unavailable.")
+            LOGGER.warning("Failed to read post-signal outcomes due to schema issue: %s", exc)
+            return []
+        return [_signal_outcome_from_row(row) for row in rows]
 
     def latest_historical_candle(
         self,

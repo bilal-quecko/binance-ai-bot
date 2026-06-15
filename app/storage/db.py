@@ -165,6 +165,227 @@ SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS futures_historical_candles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        interval TEXT NOT NULL,
+        open_time TEXT NOT NULL,
+        close_time TEXT NOT NULL,
+        open_price TEXT NOT NULL,
+        high_price TEXT NOT NULL,
+        low_price TEXT NOT NULL,
+        close_price TEXT NOT NULL,
+        volume TEXT NOT NULL,
+        quote_volume TEXT NOT NULL DEFAULT '0',
+        trade_count INTEGER NOT NULL DEFAULT 0,
+        source TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(symbol, interval, open_time)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS scanner_runs (
+        id TEXT PRIMARY KEY,
+        generated_at TEXT NOT NULL,
+        quote_asset TEXT NOT NULL,
+        horizon TEXT NOT NULL,
+        max_symbols INTEGER NOT NULL,
+        min_opportunity_score INTEGER NOT NULL,
+        scan_state TEXT NOT NULL,
+        scanned_count INTEGER NOT NULL,
+        failed_symbols_json TEXT NOT NULL,
+        warnings_json TEXT NOT NULL,
+        result_json TEXT,
+        candidate_count INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS scanner_candidates (
+        id TEXT PRIMARY KEY,
+        scanner_run_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        opportunity_score INTEGER NOT NULL,
+        confidence INTEGER NOT NULL,
+        evidence_strength TEXT NOT NULL,
+        current_price TEXT,
+        entry_zone TEXT,
+        stop_loss TEXT,
+        take_profit TEXT,
+        risk_grade TEXT NOT NULL,
+        regime TEXT,
+        reason TEXT NOT NULL,
+        warnings_json TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        UNIQUE(scanner_run_id, symbol, direction)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS scanner_candidate_prices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scanner_candidate_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        price TEXT,
+        price_type TEXT NOT NULL,
+        source TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        UNIQUE(scanner_candidate_id, recorded_at)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS symbol_candle_cache (
+        symbol TEXT NOT NULL,
+        interval TEXT NOT NULL,
+        open_time TEXT NOT NULL,
+        open TEXT NOT NULL,
+        high TEXT NOT NULL,
+        low TEXT NOT NULL,
+        close TEXT NOT NULL,
+        volume TEXT NOT NULL,
+        source TEXT NOT NULL,
+        inserted_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(symbol, interval, open_time)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS symbol_analysis_cache (
+        symbol TEXT NOT NULL,
+        analysis_type TEXT NOT NULL,
+        horizon TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        generated_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        data_state TEXT NOT NULL,
+        PRIMARY KEY(symbol, analysis_type, horizon)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS symbol_backfill_jobs (
+        id TEXT PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        interval TEXT NOT NULL,
+        lookback_days INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        error_message TEXT,
+        candles_inserted INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS scanner_validation_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scan_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        price_at_scan TEXT,
+        opportunity_score INTEGER NOT NULL,
+        confidence INTEGER NOT NULL,
+        horizon TEXT NOT NULL,
+        risk_grade TEXT NOT NULL,
+        trend_score INTEGER NOT NULL,
+        momentum_score INTEGER NOT NULL,
+        volatility_quality_score INTEGER NOT NULL,
+        liquidity_score INTEGER NOT NULL,
+        risk_score INTEGER NOT NULL,
+        direction_score INTEGER NOT NULL,
+        validation_score INTEGER,
+        evidence_strength TEXT NOT NULL,
+        stop_loss TEXT,
+        take_profit TEXT,
+        snapshot_time TEXT NOT NULL,
+        rank_position INTEGER NOT NULL,
+        candidate_group TEXT NOT NULL,
+        regime_label TEXT,
+        data_source TEXT,
+        UNIQUE(scan_id, symbol, candidate_group)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS scanner_validation_outcomes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        snapshot_id INTEGER NOT NULL,
+        horizon TEXT NOT NULL,
+        future_price TEXT,
+        gross_return_pct TEXT,
+        estimated_fee_pct TEXT NOT NULL,
+        estimated_slippage_pct TEXT NOT NULL,
+        net_return_pct TEXT,
+        direction_correct INTEGER,
+        max_favorable_move_pct TEXT,
+        max_adverse_move_pct TEXT,
+        take_profit_hit INTEGER NOT NULL DEFAULT 0,
+        stop_loss_hit INTEGER NOT NULL DEFAULT 0,
+        first_exit TEXT,
+        outcome_state TEXT NOT NULL,
+        evaluated_at TEXT NOT NULL,
+        UNIQUE(snapshot_id, horizon)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS signal_snapshots (
+        id TEXT PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        snapshot_time TEXT NOT NULL,
+        source TEXT NOT NULL,
+        signal_type TEXT NOT NULL,
+        confidence INTEGER NOT NULL,
+        entry_price TEXT,
+        liquidity_bias TEXT,
+        sweep_risk TEXT,
+        nearest_liquidity_above TEXT,
+        nearest_liquidity_below TEXT,
+        funding_rate TEXT,
+        open_interest TEXT,
+        notes TEXT NOT NULL,
+        heatmap_liquidity_above TEXT,
+        heatmap_liquidity_below TEXT,
+        heatmap_intensity_score INTEGER,
+        heatmap_bias TEXT,
+        base_signal_type TEXT,
+        heatmap_signal_type TEXT,
+        base_confidence INTEGER,
+        heatmap_confidence INTEGER,
+        heatmap_alignment TEXT,
+        heatmap_explanation TEXT,
+        heatmap_provider TEXT,
+        heatmap_data_quality TEXT,
+        heatmap_is_real_data INTEGER,
+        heatmap_provider_status TEXT,
+        liquidation_pressure TEXT,
+        liquidation_imbalance TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS signal_outcomes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_id TEXT NOT NULL,
+        horizon TEXT NOT NULL,
+        future_price TEXT,
+        price_change_percent TEXT,
+        max_upside_percent TEXT,
+        max_downside_percent TEXT,
+        did_price_hit_tp INTEGER NOT NULL DEFAULT 0,
+        did_price_hit_sl INTEGER NOT NULL DEFAULT 0,
+        direction_correct INTEGER,
+        volatility_range TEXT,
+        first_hit TEXT,
+        time_to_hit_seconds INTEGER,
+        sweep_direction_actual TEXT NOT NULL DEFAULT 'none',
+        sweep_prediction_correct INTEGER,
+        outcome_state TEXT NOT NULL,
+        evaluated_at TEXT NOT NULL,
+        base_signal_correct INTEGER,
+        heatmap_signal_correct INTEGER,
+        did_heatmap_improve_result INTEGER,
+        did_heatmap_reduce_loss INTEGER,
+        predicted_sweep_direction TEXT NOT NULL DEFAULT 'none',
+        actual_sweep_direction TEXT NOT NULL DEFAULT 'none',
+        UNIQUE(signal_id, horizon)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS runtime_session_state (
         singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
         state TEXT NOT NULL,
@@ -223,6 +444,13 @@ SCHEMA_STATEMENTS = (
         ended_at TEXT
     )
     """,
+    "CREATE INDEX IF NOT EXISTS idx_scanner_runs_generated_at ON scanner_runs(generated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_scanner_candidates_symbol ON scanner_candidates(symbol, timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_scanner_candidates_run ON scanner_candidates(scanner_run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_scanner_candidate_prices_symbol ON scanner_candidate_prices(symbol, recorded_at)",
+    "CREATE INDEX IF NOT EXISTS idx_symbol_candle_cache_symbol_interval_open_time ON symbol_candle_cache(symbol, interval, open_time)",
+    "CREATE INDEX IF NOT EXISTS idx_symbol_analysis_cache_symbol_type ON symbol_analysis_cache(symbol, analysis_type, expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_symbol_backfill_jobs_symbol_interval ON symbol_backfill_jobs(symbol, interval, status)",
 )
 
 OPTIONAL_TABLE_COLUMNS: dict[str, dict[str, str]] = {
@@ -290,10 +518,131 @@ OPTIONAL_TABLE_COLUMNS: dict[str, dict[str, str]] = {
         "source": "TEXT NOT NULL DEFAULT 'historical_rest'",
         "created_at": "TEXT NOT NULL DEFAULT ''",
     },
+    "futures_historical_candles": {
+        "id": "INTEGER",
+        "symbol": "TEXT NOT NULL DEFAULT ''",
+        "interval": "TEXT NOT NULL DEFAULT '15m'",
+        "open_time": "TEXT NOT NULL DEFAULT ''",
+        "close_time": "TEXT NOT NULL DEFAULT ''",
+        "open_price": "TEXT NOT NULL DEFAULT '0'",
+        "high_price": "TEXT NOT NULL DEFAULT '0'",
+        "low_price": "TEXT NOT NULL DEFAULT '0'",
+        "close_price": "TEXT NOT NULL DEFAULT '0'",
+        "volume": "TEXT NOT NULL DEFAULT '0'",
+        "quote_volume": "TEXT NOT NULL DEFAULT '0'",
+        "trade_count": "INTEGER NOT NULL DEFAULT 0",
+        "source": "TEXT NOT NULL DEFAULT 'binance_usdm_futures'",
+        "created_at": "TEXT NOT NULL DEFAULT ''",
+    },
+    "scanner_validation_snapshots": {
+        "id": "INTEGER",
+        "scan_id": "TEXT NOT NULL DEFAULT ''",
+        "symbol": "TEXT NOT NULL DEFAULT ''",
+        "direction": "TEXT NOT NULL DEFAULT 'wait'",
+        "price_at_scan": "TEXT",
+        "opportunity_score": "INTEGER NOT NULL DEFAULT 0",
+        "confidence": "INTEGER NOT NULL DEFAULT 0",
+        "horizon": "TEXT NOT NULL DEFAULT '15m'",
+        "risk_grade": "TEXT NOT NULL DEFAULT 'high'",
+        "trend_score": "INTEGER NOT NULL DEFAULT 0",
+        "momentum_score": "INTEGER NOT NULL DEFAULT 0",
+        "volatility_quality_score": "INTEGER NOT NULL DEFAULT 0",
+        "liquidity_score": "INTEGER NOT NULL DEFAULT 0",
+        "risk_score": "INTEGER NOT NULL DEFAULT 0",
+        "direction_score": "INTEGER NOT NULL DEFAULT 0",
+        "validation_score": "INTEGER",
+        "evidence_strength": "TEXT NOT NULL DEFAULT 'unvalidated'",
+        "stop_loss": "TEXT",
+        "take_profit": "TEXT",
+        "snapshot_time": "TEXT NOT NULL DEFAULT ''",
+        "rank_position": "INTEGER NOT NULL DEFAULT 0",
+        "candidate_group": "TEXT NOT NULL DEFAULT 'neutral'",
+        "regime_label": "TEXT",
+        "data_source": "TEXT",
+    },
+    "scanner_validation_outcomes": {
+        "id": "INTEGER",
+        "snapshot_id": "INTEGER NOT NULL DEFAULT 0",
+        "horizon": "TEXT NOT NULL DEFAULT '15m'",
+        "future_price": "TEXT",
+        "gross_return_pct": "TEXT",
+        "estimated_fee_pct": "TEXT NOT NULL DEFAULT '0.08'",
+        "estimated_slippage_pct": "TEXT NOT NULL DEFAULT '0.04'",
+        "net_return_pct": "TEXT",
+        "direction_correct": "INTEGER",
+        "max_favorable_move_pct": "TEXT",
+        "max_adverse_move_pct": "TEXT",
+        "take_profit_hit": "INTEGER NOT NULL DEFAULT 0",
+        "stop_loss_hit": "INTEGER NOT NULL DEFAULT 0",
+        "first_exit": "TEXT",
+        "outcome_state": "TEXT NOT NULL DEFAULT 'pending'",
+        "evaluated_at": "TEXT NOT NULL DEFAULT ''",
+    },
+    "signal_snapshots": {
+        "id": "TEXT",
+        "symbol": "TEXT NOT NULL DEFAULT ''",
+        "snapshot_time": "TEXT NOT NULL DEFAULT ''",
+        "source": "TEXT NOT NULL DEFAULT 'assistant'",
+        "signal_type": "TEXT NOT NULL DEFAULT 'WAIT'",
+        "confidence": "INTEGER NOT NULL DEFAULT 0",
+        "entry_price": "TEXT",
+        "liquidity_bias": "TEXT",
+        "sweep_risk": "TEXT",
+        "nearest_liquidity_above": "TEXT",
+        "nearest_liquidity_below": "TEXT",
+        "funding_rate": "TEXT",
+        "open_interest": "TEXT",
+        "notes": "TEXT NOT NULL DEFAULT ''",
+        "heatmap_liquidity_above": "TEXT",
+        "heatmap_liquidity_below": "TEXT",
+        "heatmap_intensity_score": "INTEGER",
+        "heatmap_bias": "TEXT",
+        "base_signal_type": "TEXT",
+        "heatmap_signal_type": "TEXT",
+        "base_confidence": "INTEGER",
+        "heatmap_confidence": "INTEGER",
+        "heatmap_alignment": "TEXT",
+        "heatmap_explanation": "TEXT",
+        "heatmap_provider": "TEXT",
+        "heatmap_data_quality": "TEXT",
+        "heatmap_is_real_data": "INTEGER",
+        "heatmap_provider_status": "TEXT",
+        "liquidation_pressure": "TEXT",
+        "liquidation_imbalance": "TEXT",
+    },
+    "signal_outcomes": {
+        "id": "INTEGER",
+        "signal_id": "TEXT NOT NULL DEFAULT ''",
+        "horizon": "TEXT NOT NULL DEFAULT '15m'",
+        "future_price": "TEXT",
+        "price_change_percent": "TEXT",
+        "max_upside_percent": "TEXT",
+        "max_downside_percent": "TEXT",
+        "did_price_hit_tp": "INTEGER NOT NULL DEFAULT 0",
+        "did_price_hit_sl": "INTEGER NOT NULL DEFAULT 0",
+        "direction_correct": "INTEGER",
+        "volatility_range": "TEXT",
+        "first_hit": "TEXT",
+        "time_to_hit_seconds": "INTEGER",
+        "sweep_direction_actual": "TEXT NOT NULL DEFAULT 'none'",
+        "sweep_prediction_correct": "INTEGER",
+        "outcome_state": "TEXT NOT NULL DEFAULT 'pending'",
+        "evaluated_at": "TEXT NOT NULL DEFAULT ''",
+        "base_signal_correct": "INTEGER",
+        "heatmap_signal_correct": "INTEGER",
+        "did_heatmap_improve_result": "INTEGER",
+        "did_heatmap_reduce_loss": "INTEGER",
+        "predicted_sweep_direction": "TEXT NOT NULL DEFAULT 'none'",
+        "actual_sweep_direction": "TEXT NOT NULL DEFAULT 'none'",
+    },
     "runtime_session_state": {
         "trading_profile": "TEXT NOT NULL DEFAULT 'balanced'",
         "tuning_version_id": "TEXT",
         "baseline_tuning_version_id": "TEXT",
+    },
+    "scanner_runs": {
+        "result_json": "TEXT",
+        "candidate_count": "INTEGER NOT NULL DEFAULT 0",
     },
     "trades": {
         "execution_source": "TEXT NOT NULL DEFAULT 'auto'",
@@ -313,11 +662,18 @@ OPTIONAL_TABLE_COLUMNS: dict[str, dict[str, str]] = {
 def resolve_sqlite_path(database_url: str) -> Path:
     """Resolve a sqlite database URL to a local filesystem path."""
 
+    requested_path = requested_sqlite_path(database_url)
+    requested_path.parent.mkdir(parents=True, exist_ok=True)
+    return _resolve_usable_sqlite_path(requested_path)
+
+
+def requested_sqlite_path(database_url: str) -> Path:
+    """Resolve a sqlite database URL to the configured local filesystem path."""
+
     if not database_url.startswith("sqlite:///"):
         raise ValueError("Only sqlite:/// database URLs are supported for paper-mode storage.")
     requested_path = Path(database_url.removeprefix("sqlite:///")).resolve()
-    requested_path.parent.mkdir(parents=True, exist_ok=True)
-    return _resolve_usable_sqlite_path(requested_path)
+    return requested_path
 
 
 def create_db_connection(database_url: str) -> sqlite3.Connection:
@@ -333,14 +689,20 @@ def create_db_connection(database_url: str) -> sqlite3.Connection:
 
 
 def _resolve_usable_sqlite_path(requested_path: Path) -> Path:
-    """Return a SQLite path that supports local paper-mode journaling."""
+    """Return a persistent SQLite path, falling back to temp only if it is unusable."""
 
     cached_path = _SQLITE_PATH_FALLBACK_CACHE.get(requested_path)
     if cached_path is not None:
         cached_path.parent.mkdir(parents=True, exist_ok=True)
         return cached_path
 
-    if _sqlite_path_supports_wal(requested_path):
+    if _sqlite_path_accepts_persistent_writes(requested_path):
+        if not _sqlite_path_supports_wal(requested_path):
+            LOGGER.warning(
+                "SQLite path %s is writable but WAL is unavailable in this environment; "
+                "using persistent SQLite default journaling instead.",
+                requested_path,
+            )
         _SQLITE_PATH_FALLBACK_CACHE[requested_path] = requested_path
         return requested_path
 
@@ -349,12 +711,33 @@ def _resolve_usable_sqlite_path(requested_path: Path) -> Path:
     fallback_name = f"{requested_path.stem}_{sha1(str(requested_path).encode('utf-8')).hexdigest()[:12]}{requested_path.suffix}"
     fallback_path = fallback_root / fallback_name
     LOGGER.warning(
-        "SQLite path %s does not support WAL in this environment; using temp storage %s instead.",
+        "SQLite path %s is not writable for persistent storage; using temp storage %s instead. "
+        "Paper sessions, signal history, and validation data may not survive cleanup or restart.",
         requested_path,
         fallback_path,
     )
     _SQLITE_PATH_FALLBACK_CACHE[requested_path] = fallback_path
     return fallback_path
+
+
+def _sqlite_path_accepts_persistent_writes(requested_path: Path) -> bool:
+    """Return whether the requested database path can persist main-database writes."""
+
+    try:
+        connection = sqlite3.connect(requested_path, check_same_thread=False)
+        try:
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS app_storage_probe (id INTEGER PRIMARY KEY)"
+            )
+            connection.execute("DROP TABLE app_storage_probe")
+            connection.commit()
+            return True
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        LOGGER.warning("SQLite path %s is not usable for persistent storage: %s", requested_path, exc)
+        return False
 
 
 def _sqlite_path_supports_wal(requested_path: Path) -> bool:

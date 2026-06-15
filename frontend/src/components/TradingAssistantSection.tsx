@@ -1,5 +1,6 @@
 import { formatDateTime, formatDecimal } from '../lib/format';
 import type { TradingAssistantResponse } from '../lib/types';
+import { AdvancedDetailsPro } from './AdvancedDetailsPro';
 import { StatePanel } from './StatePanel';
 
 interface TradingAssistantSectionProps {
@@ -24,6 +25,25 @@ export function TradingAssistantSection({ symbol, assistant, loading, refreshing
     return <StatePanel title="No trading assistant data" message={`No beginner trading summary is available for ${symbol} yet.`} tone="empty" />;
   }
   const similarSetup = assistant.similar_setup;
+  const heatmapTag = assistant.heatmap_alignment === 'confirmed'
+    ? 'Heatmap Confirmed'
+    : assistant.heatmap_alignment === 'conflict'
+      ? 'Heatmap Conflict'
+      : null;
+  const crowdLine = assistant.crowd_side === 'long_crowded'
+    ? 'Crowd: Long heavy (downside risk)'
+    : assistant.crowd_side === 'short_crowded'
+      ? 'Crowd: Short heavy (squeeze risk)'
+      : 'Crowd: Balanced';
+  const liquidationLine = assistant.liquidation_signal === 'cascade_down'
+    ? 'Liquidation: Downside cascade in progress'
+    : assistant.liquidation_signal === 'cascade_up'
+      ? 'Liquidation: Short squeeze active'
+      : assistant.liquidation_signal === 'exhaustion'
+        ? 'Liquidation: Exhaustion detected'
+        : assistant.liquidation_signal === 'sweep_confirmation'
+          ? 'Liquidation: Sweep confirmation'
+          : 'Liquidation: No significant activity';
 
   return (
     <div className="space-y-4">
@@ -32,6 +52,13 @@ export function TradingAssistantSection({ symbol, assistant, loading, refreshing
           <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Trading Assistant</p>
           <h3 className="mt-2 text-xl font-semibold text-white">{assistant.decision.replace('_', ' ').toUpperCase()}</h3>
           <p className="mt-2 text-sm text-slate-300">{assistant.simple_reason}</p>
+          <p className="mt-2 text-sm font-medium text-slate-200">{crowdLine}</p>
+          <p className="mt-1 text-sm font-medium text-slate-200">{liquidationLine}</p>
+          {heatmapTag ? (
+            <span className="mt-3 inline-flex rounded-full border border-slate-700 px-3 py-1 text-xs font-semibold text-slate-200">
+              {heatmapTag}
+            </span>
+          ) : null}
         </div>
         <div className="text-right text-xs text-slate-400">
           <p>{refreshing ? 'Refreshing...' : 'Current summary'}</p>
@@ -86,6 +113,22 @@ export function TradingAssistantSection({ symbol, assistant, loading, refreshing
         </div>
       ) : null}
 
+      <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+        <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Liquidity Bias</p>
+        <div className="mt-3 grid gap-3 md:grid-cols-4">
+          <div><span className="text-xs text-slate-500">Bias</span><p className="text-sm text-slate-200">{assistant.liquidity_bias}</p></div>
+          <div><span className="text-xs text-slate-500">Pressure</span><p className="text-sm text-slate-200">{assistant.liquidity_pressure}</p></div>
+          <div><span className="text-xs text-slate-500">Likely Sweep</span><p className="text-sm text-slate-200">{assistant.likely_liquidation_direction}</p></div>
+          <div><span className="text-xs text-slate-500">Trap Risk</span><p className="text-sm text-slate-200">{assistant.trap_risk.replace('_', ' ')}</p></div>
+          <div><span className="text-xs text-slate-500">Upside Zone</span><p className="text-sm text-slate-200">{assistant.upside_liquidity_zone.level ? formatDecimal(assistant.upside_liquidity_zone.level) : '-'}</p></div>
+          <div><span className="text-xs text-slate-500">Downside Zone</span><p className="text-sm text-slate-200">{assistant.downside_liquidity_zone.level ? formatDecimal(assistant.downside_liquidity_zone.level) : '-'}</p></div>
+          <div><span className="text-xs text-slate-500">Nearest Target</span><p className="text-sm text-slate-200">{assistant.nearest_liquidity_target.direction}</p></div>
+          <div><span className="text-xs text-slate-500">TP/SL Alignment</span><p className="text-sm text-slate-200">{assistant.tp_sl_alignment.replace(/_/g, ' ')}</p></div>
+        </div>
+        <p className="mt-3 text-sm leading-6 text-slate-300">{assistant.liquidity_explanation}</p>
+        <p className="mt-2 text-sm leading-6 text-slate-300">{assistant.liquidity_zone_explanation}</p>
+      </div>
+
       {similarSetup ? (
         <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
           <div className="flex flex-wrap items-start justify-between gap-3">
@@ -110,6 +153,39 @@ export function TradingAssistantSection({ symbol, assistant, loading, refreshing
           </div>
         </div>
       ) : null}
+
+      <AdvancedDetailsPro>
+        <div className="grid gap-3 text-sm text-slate-300 sm:grid-cols-2 xl:grid-cols-4">
+          <div><span className="text-slate-500">Base Signal</span><p>{assistant.base_signal_type} ({assistant.base_confidence}%)</p></div>
+          <div><span className="text-slate-500">Heatmap Signal</span><p>{assistant.heatmap_signal_type} ({assistant.heatmap_confidence}%)</p></div>
+          <div><span className="text-slate-500">Heatmap Bias</span><p>{assistant.heatmap_bias.replace(/_/g, ' ')}</p></div>
+          <div><span className="text-slate-500">Heatmap Intensity</span><p>{assistant.heatmap_intensity_score ?? '-'}</p></div>
+          <div><span className="text-slate-500">Heatmap Above</span><p>{assistant.heatmap_liquidity_above ? formatDecimal(assistant.heatmap_liquidity_above) : '-'}</p></div>
+          <div><span className="text-slate-500">Heatmap Below</span><p>{assistant.heatmap_liquidity_below ? formatDecimal(assistant.heatmap_liquidity_below) : '-'}</p></div>
+          <div><span className="text-slate-500">Heatmap Provider</span><p>{assistant.heatmap_provider.replace(/_/g, ' ')}</p></div>
+          <div><span className="text-slate-500">Data Quality</span><p>{assistant.heatmap_data_quality.replace(/_/g, ' ')}</p></div>
+          <div><span className="text-slate-500">Real Data</span><p>{assistant.heatmap_is_real_data ? 'Yes' : 'No'}</p></div>
+          <div><span className="text-slate-500">Liquidation Pressure</span><p>{assistant.liquidation_pressure}</p></div>
+          <div><span className="text-slate-500">Liquidation Signal</span><p>{assistant.liquidation_signal.replace(/_/g, ' ')}</p></div>
+          <div><span className="text-slate-500">Liquidation Intensity</span><p>{assistant.liquidation_intensity}</p></div>
+          <div><span className="text-slate-500">Dominant Side</span><p>{assistant.dominant_side.replace(/_/g, ' ')}</p></div>
+          <div><span className="text-slate-500">Long Liq Volume</span><p>{formatDecimal(assistant.liquidation_volume_long)}</p></div>
+          <div><span className="text-slate-500">Short Liq Volume</span><p>{formatDecimal(assistant.liquidation_volume_short)}</p></div>
+          <div><span className="text-slate-500">Liq Imbalance</span><p>{formatDecimal(assistant.liquidation_imbalance_ratio)}</p></div>
+          <div><span className="text-slate-500">Event Frequency</span><p>{formatDecimal(assistant.liquidation_event_frequency)}/min</p></div>
+          <div><span className="text-slate-500">Funding Rate</span><p>{assistant.funding_rate ? formatDecimal(assistant.funding_rate) : '-'}</p></div>
+          <div><span className="text-slate-500">Open Interest</span><p>{assistant.open_interest ? formatDecimal(assistant.open_interest) : '-'}</p></div>
+          <div><span className="text-slate-500">OI Trend</span><p>{assistant.oi_trend}</p></div>
+          <div><span className="text-slate-500">Crowd Side</span><p>{assistant.crowd_side.replace(/_/g, ' ')}</p></div>
+          <div><span className="text-slate-500">Squeeze Risk</span><p>{assistant.squeeze_risk.replace(/_/g, ' ')}</p></div>
+        </div>
+        <p className="mt-3 text-sm leading-6 text-slate-300">{assistant.heatmap_explanation}</p>
+        <p className="mt-2 text-sm leading-6 text-slate-300">{assistant.positioning_explanation}</p>
+        <p className="mt-2 text-sm leading-6 text-slate-300">{assistant.liquidation_explanation}</p>
+        {!assistant.heatmap_is_real_data ? (
+          <p className="mt-2 text-sm leading-6 text-amber-200">Heatmap data is mock/estimated. Do not treat as real market heatmap.</p>
+        ) : null}
+      </AdvancedDetailsPro>
     </div>
   );
 }

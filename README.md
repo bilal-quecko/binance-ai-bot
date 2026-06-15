@@ -49,7 +49,38 @@ The current product is advisory and paper-mode only.
 python -m venv .venv
 source .venv/bin/activate  # Windows PowerShell: .venv\Scripts\Activate.ps1
 pip install -e .[dev]
-cp .env.example .env
+Copy-Item .env.example .env
+```
+
+Install frontend dependencies:
+
+```powershell
+cd frontend
+npm install
+cd ..
+```
+
+## Local SQLite Setup
+
+The default local database is repo-local:
+
+```text
+sqlite:///./data/binance_ai_bot.db
+```
+
+`data/` is created automatically on backend startup if it does not exist. This database stores paper sessions, signal history, validation snapshots, historical candles, runtime recovery state, and paper broker recovery state. The database file is ignored by git.
+
+If you override `DATABASE_URL`, use a writable local SQLite path:
+
+```env
+DATABASE_URL=sqlite:///./data/binance_ai_bot.db
+```
+
+## Run
+
+Backend:
+
+```powershell
 uvicorn app.main:app --reload
 ```
 

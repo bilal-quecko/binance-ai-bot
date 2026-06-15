@@ -1,132 +1,166 @@
-# BINANCE AI BOT — Full Development Roadmap
-_Last updated: 2026-04-22_
+# Binance AI Bot Roadmap
 
-# Strategic Scope Expansion
+Last updated: 2026-04-30
 
-The project is expanding from a live paper-trading workstation into a broader trading intelligence platform.
+## Product Direction
 
-The long-term architecture must include:
+The target product is an AI-Assisted Binance Signal Intelligence Platform.
 
-1. Technical Analysis Engine
-2. Market Sentiment Engine
-3. Symbol Sentiment Engine
-4. Fundamental Analysis Engine
-5. Multi-Horizon Pattern Analysis
-6. Combined Signal Engine
-7. Paper Automation
-8. Futures Long/Short Execution (later)
+The platform evolves in this order:
 
----
+1. Technical Analysis Layer
+2. Market Sentiment Layer
+3. Symbol Sentiment Layer
+4. Fundamental Analysis Layer
+5. Multi-Horizon Pattern Analysis Layer
+6. Signal Synthesis Layer
+7. Paper Automation Layer
+8. Futures Long/Short Layer, later phase only
 
-# New Phase — Technical Analysis Engine Maturity
+## Completed Phases
 
-## Goal
-Build a proper technical-analysis layer for the selected symbol.
+### Technical Analysis Engine
 
-## Must complete
-- multi-timeframe trend analysis
-- support/resistance detection
-- breakout/reversal detection
-- volatility regime classification
-- momentum analysis
-- trend-strength scoring
-- clearer technical explanations in UI
+Status: Completed
 
-## Acceptance criteria
-The selected symbol can be analyzed technically in a way a trader can understand without relying only on a generic AI card.
+- Trend, momentum, volatility, structure, support/resistance, breakout/reversal context, and multi-timeframe analysis are available for selected symbols.
 
----
+### Market and Symbol Sentiment Layers
 
-# New Phase — Market and Symbol Sentiment Layer
+Status: Completed
 
-## Goal
-Add broader market sentiment and symbol-specific sentiment.
+- Broader market sentiment exists.
+- Symbol sentiment exists with explicit source/fallback behavior.
+- Sentiment remains advisory and source-labeled.
 
-## Must complete
-- market-wide crypto sentiment/bias
-- symbol-specific sentiment feed
-- sentiment scoring pipeline
-- source freshness tracking
-- confidence / fallback handling
-- UI separation between market sentiment and symbol sentiment
+### Multi-Horizon Pattern Analysis
 
-## Acceptance criteria
-The platform can explain whether the environment is broadly supportive, broadly weak, or mixed.
+Status: Completed
 
----
+- User-selectable horizons are available.
+- Pattern behavior includes return, drawdown, volatility, persistence, breakout/range/reversal tendencies, and insufficient-history states.
 
-# New Phase — Fundamental Context Layer
+### Signal Synthesis Engine
 
-## Goal
-Add crypto-relevant fundamental context for the selected symbol.
+Status: Completed
 
-## Must complete
-- define what “fundamental analysis” means for this platform
-- add symbol/project context fields
-- add liquidity/market-structure tiering
-- add supply/unlock/context data where available
-- render a compact fundamentals summary
+- Technical, sentiment, pattern, AI advisory, fusion, risk, eligibility, and validation context feed explainable final signal presentation.
+- Signals are not a single opaque score.
 
-## Acceptance criteria
-The user can see more than price action alone when evaluating a symbol.
+### Signal Validation
 
----
+Status: Completed
 
-# New Phase — Multi-Horizon Pattern Analysis
+- Signal snapshots are persisted and evaluated against forward outcomes when enough candle history exists.
+- Reports stay honest when samples are insufficient.
 
-## Goal
-Allow custom day-based pattern analysis for the selected symbol.
+### Regime Analysis
 
-## Must complete
-- support user-selectable day horizons
-- compute trend/volatility/up-down behavior over selected range
-- summarize pattern changes over the selected duration
-- integrate into signal formation
+Status: Completed
 
-## Acceptance criteria
-The platform can explain how the symbol behaved over the selected number of days.
+- Current selected-symbol regime analysis exists with confidence, evidence, behavior guidance, avoid conditions, and warnings.
 
----
+### Similar Setup Outcome Engine
 
-# New Phase — Signal Synthesis Engine
+Status: Completed
 
-## Goal
-Combine technical, sentiment, fundamentals, and pattern analysis into one explainable signal.
+- Current or latest setups can be compared against historical signal-validation snapshots.
+- Reliability remains sample-size gated.
 
-## Must complete
-- separate sub-scores for:
-  - technical
-  - market sentiment
-  - symbol sentiment
-  - fundamentals
-  - pattern/horizon behavior
-- combine into final signal:
-  - long bias
-  - short bias
-  - neutral
-  - confidence
-  - suggested action
-  - explanation
+### Trade Eligibility Gate
 
-## Acceptance criteria
-The final signal is explainable, layered, and not a black box.
+Status: Completed
 
----
+- Advisory-only eligibility combines signal, regime, validation, similar setup evidence, blockers, confidence, horizon, risk grade, and fee/slippage checks.
+- It does not place trades or bypass paper controls.
 
-# New Phase — Futures Mode Preparation
+### Adaptive Recommendations
 
-## Goal
-Prepare for later long/short futures trading safely.
+Status: Completed
 
-## Must complete
-- futures paper mode first
-- long/short support
-- leverage-aware risk engine
-- funding/open-interest aware context
-- liquidation-risk controls
-- separate mode handling from spot
+- Evidence-based threshold and rule recommendations exist.
+- Recommendations are report-only and are not auto-applied.
 
-## Acceptance criteria
-Futures mode is introduced safely and only after signal quality and risk maturity improve.
+### V1 Signal Provider Release
 
-That is what will turn it into a real full-fledged system.
+Status: Completed
+
+- The main UI presents a premium V1 signal summary dashboard.
+- Advanced modules are preserved under `Advanced Details - Pro`.
+- Manual paper buy/close remains stable.
+- Safety messaging is visible: paper mode, advisory only, no guaranteed profit.
+
+## Current Phase
+
+### Futures Paper Long/Short Opportunity Scanner
+
+Status: Current product direction and implemented paper scanner
+
+- Paper-only scanner ranks Binance quote-asset symbols as LONG, SHORT, WAIT, or AVOID.
+- Scanner supports 20, 50, and 100-symbol market coverage for paper opportunity discovery.
+- Scanner refresh uses async progressive jobs so the UI can show queued/running/partial/completed progress and partial candidates while slower symbols continue.
+- Scanner uses USD-M Futures candles/prices and cache-first reads for scanner candle history.
+- Scanner Simulate opens a separate Futures Paper Simulation flow with scanner-provided direction, entry, stop, target, confidence, risk grade, and editable paper stop/target fields.
+- Market Sensitivity supports Conservative, Balanced, and Active paper modes; Active surfaces smaller slow-market setups only when structure and risk gates remain clean.
+- Slow-market setup labels include range breakout, liquidity sweep reversal, compression breakout, mean reversion from range edge, low-volatility continuation, and low-volatility no-edge.
+- Scanner cards include display-only leverage-risk simulation for paper TP/SL/live return estimates.
+- LONG candidates should render green.
+- SHORT candidates should render red.
+- WAIT and AVOID candidates should render neutral/default.
+- Scanner output is advisory only.
+- No real futures execution, no live leverage or margin execution, and no Binance futures orders are allowed in this phase.
+
+### Spot Paper Opportunity Scanner
+
+Status: Implemented paper scanner
+
+- Paper-only Spot scanner ranks Binance Spot USDT symbols as BUY candidate, WATCH, EXIT watch, or AVOID.
+- Scanner uses Spot candles, technical trend/momentum/volatility/liquidity, support/resistance structure, regime analysis, signal-validation evidence, and trade-eligibility evidence.
+- Scanner uses async progressive jobs so the UI can show queued/running/partial/completed progress and partial candidates.
+- Completed Spot scanner runs persist scanner candidates, validation snapshots, and post-signal outcome snapshots for later usefulness measurement.
+- Spot scanner simulation handoff opens the existing Spot Paper Simulation flow.
+- Scanner output is advisory only.
+- No Spot shorting, live Spot order placement, autonomous execution, or profitability guarantee is allowed in this phase.
+
+## Next Suggested Phases
+
+### 7-Day Paper Validation Report
+
+Build a compact report that summarizes whether V1 signals, trade eligibility, futures scanner rankings, and adaptive recommendations improved paper outcomes over a rolling 7-day window.
+
+### Public Performance Report
+
+Create a shareable, honest performance report with sample sizes, win/loss distribution, expectancy, drawdown, false positives, blocked trades, and insufficient-data labels.
+
+### Portfolio and Capital Allocator
+
+Design a paper-only allocator that decides symbol exposure, position sizing, max concurrent positions, and capital rotation from validated signal quality and risk controls.
+
+### Manual Apply-and-Compare for Adaptive Settings
+
+Allow an operator to manually queue adaptive recommendations for a future paper session and compare baseline versus adjusted settings.
+
+### Fundamental Context Layer Expansion
+
+Add crypto-relevant fundamental context behind service layers: project quality, liquidity tier, market cap tier, supply/unlock context where available, and source freshness.
+
+### Real Futures Execution
+
+Later phase only after strong validation.
+
+Required before implementation:
+
+- Proven paper results over meaningful samples.
+- Futures paper mode with persistent hypothetical long/short outcomes.
+- Funding-rate and liquidation-risk context.
+- Event-based liquidation intelligence that separates observed cascades, exhaustion, and sweep confirmations from predictive heatmap claims.
+- Leverage and margin-aware risk engine.
+- Stronger controls than spot paper trading.
+- Explicit user request and separate design review.
+
+## Not In Scope Now
+
+- Live spot trading.
+- Real futures execution.
+- Autonomous AI order placement.
+- Profitability guarantees.

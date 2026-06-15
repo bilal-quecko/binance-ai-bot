@@ -95,8 +95,8 @@ export function BotControlPanel({
     <section className="rounded-2xl border border-slate-800/80 bg-slate-900/80 p-5 shadow-glow backdrop-blur">
       <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <h2 className="text-lg font-semibold text-white">Live Paper Controls</h2>
-          <p className="mt-1 text-sm text-slate-400">Select one live Binance Spot USDT symbol, then start, pause, resume, or stop paper trading without enabling live order placement.</p>
+          <h2 className="text-lg font-semibold text-white">Paper Trading Controls</h2>
+          <p className="mt-1 text-sm text-slate-400">Analyze any selected symbol independently; start, pause, resume, and stop only control paper trading runtime.</p>
         </div>
         <div className="shrink-0">
           <span className={classNames('rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em]', badgeTone(status.state === 'running' ? 'approve' : status.state === 'paused' ? 'HOLD' : status.state === 'error' ? 'reject' : 'skipped'))}>
@@ -116,7 +116,7 @@ export function BotControlPanel({
             }}
           >
             <label className="text-sm text-slate-400">
-              Search live Spot symbol
+              Analyze Symbol
               <div className="relative mt-2">
                 <input
                   role="combobox"
@@ -271,7 +271,7 @@ export function BotControlPanel({
         <div className="space-y-4 rounded-2xl border border-slate-800 bg-slate-950/40 p-4">
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
             <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Trading profile</p>
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Market Sensitivity</p>
               <div className="mt-2">
                 <select
                   value={tradingProfile}
@@ -281,19 +281,19 @@ export function BotControlPanel({
                 >
                   <option value="conservative">Conservative</option>
                   <option value="balanced">Balanced</option>
-                  <option value="aggressive">Aggressive</option>
+                  <option value="aggressive">Active</option>
                 </select>
               </div>
               <p className="mt-1 text-xs text-slate-400">
                 {status.state === 'stopped'
-                  ? 'Selected profile will be applied on the next start.'
-                  : `Runtime is using ${status.trading_profile}. Stop the runtime to switch profiles.`}
+                  ? 'Selected sensitivity will be applied on the next paper runtime start.'
+                  : `Runtime is using ${status.trading_profile === 'aggressive' ? 'active' : status.trading_profile}. Stop the runtime to switch sensitivity.`}
               </p>
             </div>
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Selected symbol</p>
               <p className="mt-2 text-lg font-semibold text-white">{selectedLabel}</p>
-              <p className="mt-1 text-xs text-slate-400">{hasValidSelection ? 'Ready to start with selected symbol' : 'Pick a symbol from the dropdown to enable start'}</p>
+              <p className="mt-1 text-xs text-slate-400">{hasValidSelection ? 'Analysis loads without starting runtime' : 'Pick a symbol from the dropdown to analyze'}</p>
             </div>
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Current bot status</p>

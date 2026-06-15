@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field as dataclass_field
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 import json
 import logging
+from threading import RLock, Thread
+import time
 from typing import Annotated, Literal
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -32,6 +36,15 @@ from app.ai.service import AISignalService
 from app.bot import BotStatus, PaperBotRuntime, WorkstationState
 from app.bot.runtime import PersistenceState
 from app.config import Settings, get_settings
+from app.data.historical_candles import SupportedInterval, interval_to_timedelta, now_utc, parse_rest_kline
+from app.data.heatmap_provider import HeatmapSignalEnrichment, enrich_signal_with_heatmap
+from app.data.binance_liquidation_feed import get_global_liquidation_feed_service
+from app.data.binance_derivatives_data import (
+    BinanceDerivativesSnapshot,
+    fallback_derivatives_snapshot,
+    get_derivatives_snapshot,
+)
+from app.exchange.binance_rest import BinanceRestClient
 from app.data import MarketContextService
 from app.features.feature_store import FeatureEngine
 from app.features.models import FeatureConfig, FeatureSnapshot
@@ -45,6 +58,10 @@ from app.storage.candle_repository import CandleBackfillStatus, CandleRepository
 from app.storage.models import (
     HistoricalCandleRecord,
     MarketCandleSnapshotRecord,
+    ScannerCandidatePriceRecord,
+    ScannerCandidateRecord,
+    ScannerRunRecord,
+    ScannerValidationSnapshotRecord,
     SignalValidationSnapshotRecord,
 )
 from app.monitoring.similar_setups import (
@@ -62,12 +79,103 @@ from app.monitoring.trade_eligibility import (
     TradeEligibilityResult,
     evaluate_trade_eligibility,
 )
+from app.monitoring.futures_opportunity_scanner import (
+    FuturesOpportunityScanReport,
+    FuturesOpportunityScanner,
+    FuturesPaperSignal,
+    FuturesSignalContext,
+    MIN_CANDLES_FOR_FUTURES_SIGNAL,
+)
+from app.monitoring.spot_opportunity_scanner import (
+    SpotOpportunityScanReport,
+    SpotOpportunityScanner,
+    SpotOpportunitySignal,
+    SpotScannerContext,
+)
+from app.monitoring.liquidity_bias import (
+    NEUTRAL_LIQUIDITY_BIAS,
+    LiquidityBiasInput,
+    LiquidityBiasSnapshot,
+    estimate_liquidity_bias,
+)
+from app.monitoring.crowd_positioning import (
+    CrowdPositioningSnapshot,
+    NEUTRAL_CROWD_POSITIONING,
+    crowd_positioning_from_derivatives,
+)
+from app.monitoring.liquidity_zones import (
+    NEUTRAL_LIQUIDITY_ZONES,
+    LiquidityZone,
+    LiquidityZoneSnapshot,
+    NearestLiquidityTarget,
+    estimate_liquidity_zones,
+    validate_liquidity_zones_with_liquidations,
+)
+from app.monitoring.liquidation_intelligence import (
+    LiquidationIntelligenceSnapshot,
+    NEUTRAL_LIQUIDATION_INTELLIGENCE,
+    interpret_liquidation_events,
+)
+from app.monitoring.scanner_validation_report import persist_scanner_validation_snapshots
+from app.monitoring.signal_outcomes import SignalSnapshotInput, persist_signal_snapshot
+from app.monitoring.futures_scanner_ws_heartbeat import (
+    FuturesScannerLivePrice,
+    FuturesScannerWebSocketHeartbeatService,
+    sanitize_scanner_symbols,
+)
 
 router = APIRouter()
 LOGGER = logging.getLogger(__name__)
 
 DataState = Literal["ready", "waiting_for_runtime", "waiting_for_history", "degraded_storage"]
 ChartTimeframe = Literal["1m", "5m", "15m", "1h"]
+SelectedMarket = Literal["spot", "futures"]
+FuturesSymbolUniverseSource = Literal["live", "cache", "fallback", "unavailable"]
+FUTURES_SYMBOL_UNIVERSE_CACHE_TTL = timedelta(minutes=20)
+FUTURES_SCANNER_FALLBACK_SYMBOLS = (
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT",
+    "SOLUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "LTCUSDT",
+    "TRXUSDT",
+    "DOTUSDT",
+    "BCHUSDT",
+    "NEARUSDT",
+    "INJUSDT",
+    "OPUSDT",
+    "ARBUSDT",
+    "SUIUSDT",
+    "SEIUSDT",
+    "APTUSDT",
+)
+
+
+@dataclass(slots=True)
+class FuturesSymbolUniverseCacheEntry:
+    """In-memory USD-M Futures universe cache entry."""
+
+    records: list[SpotSymbolRecord]
+    fetched_at: datetime
+    latest_error: str | None = None
+
+
+@dataclass(slots=True)
+class FuturesSymbolUniverseResult:
+    """Resolved USD-M Futures universe with diagnostics for the scanner response."""
+
+    records: list[SpotSymbolRecord]
+    source: FuturesSymbolUniverseSource
+    last_successful_fetch_at: datetime | None
+    latest_error: str | None = None
+
+
+_FUTURES_SYMBOL_UNIVERSE_CACHE: dict[str, FuturesSymbolUniverseCacheEntry] = {}
 
 
 @dataclass(slots=True)
@@ -80,7 +188,11 @@ class SignalAnalysisContext:
     technical_analysis: TechnicalAnalysisSnapshot | None
     market_sentiment: MarketSentimentSnapshot | None
     symbol_sentiment: SymbolSentimentSnapshot | None
+    liquidity_bias: LiquidityBiasSnapshot
     benchmark_candles: list[Candle]
+    crowd_positioning: CrowdPositioningSnapshot = NEUTRAL_CROWD_POSITIONING
+    derivatives_data: BinanceDerivativesSnapshot | None = None
+    liquidation_intelligence: LiquidationIntelligenceSnapshot = NEUTRAL_LIQUIDATION_INTELLIGENCE
 
 
 class PersistenceHealthResponse(BaseModel):
@@ -195,6 +307,23 @@ class SimilarSetupSummaryResponse(BaseModel):
     matched_attributes: list[str] = Field(default_factory=list)
 
 
+class LiquidityZoneResponse(BaseModel):
+    """Estimated liquidity zone, not an exact liquidation level."""
+
+    level: Decimal | None = None
+    strength: Literal["low", "medium", "high"] = "low"
+    reason: str = "No clear estimated liquidity zone."
+
+
+class NearestLiquidityTargetResponse(BaseModel):
+    """Nearest estimated liquidity target relative to current price."""
+
+    direction: Literal["up", "down", "none"] = "none"
+    level: Decimal | None = None
+    distance_pct: Decimal | None = None
+    strength: Literal["low", "medium", "high"] = "low"
+
+
 class TradingAssistantResponse(BaseModel):
     """Beginner-friendly symbol decision summary."""
 
@@ -212,6 +341,67 @@ class TradingAssistantResponse(BaseModel):
     data_state: DataState
     backfill_status: BackfillStatusResponse
     similar_setup: SimilarSetupSummaryResponse | None = None
+    liquidity_bias: Literal["bullish", "bearish", "neutral"] = "neutral"
+    liquidity_pressure: Literal["low", "medium", "high"] = "low"
+    likely_liquidation_direction: Literal["up", "down", "none"] = "none"
+    trap_risk: Literal["long_trap", "short_trap", "low"] = "low"
+    liquidity_explanation: str = NEUTRAL_LIQUIDITY_BIAS.explanation
+    upside_liquidity_zone: LiquidityZoneResponse = Field(default_factory=LiquidityZoneResponse)
+    downside_liquidity_zone: LiquidityZoneResponse = Field(default_factory=LiquidityZoneResponse)
+    nearest_liquidity_target: NearestLiquidityTargetResponse = Field(default_factory=NearestLiquidityTargetResponse)
+    sweep_risk: Literal["none", "upside_sweep", "downside_sweep", "both_sides"] = "none"
+    trade_timing_adjustment: Literal[
+        "enter_now",
+        "wait_for_sweep",
+        "wait_for_confirmation",
+        "avoid_chop",
+    ] = "wait_for_confirmation"
+    tp_sl_alignment: Literal[
+        "aligned",
+        "stop_too_close_to_liquidity",
+        "target_before_liquidity",
+        "target_after_liquidity",
+        "needs_review",
+    ] = "needs_review"
+    liquidity_zone_explanation: str = NEUTRAL_LIQUIDITY_ZONES.explanation
+    crowd_side: Literal["long_crowded", "short_crowded", "balanced"] = "balanced"
+    crowd_strength: Literal["low", "medium", "high"] = "low"
+    squeeze_risk: Literal["long_squeeze", "short_squeeze", "low"] = "low"
+    positioning_explanation: str = NEUTRAL_CROWD_POSITIONING.explanation
+    funding_rate: Decimal | None = None
+    open_interest: Decimal | None = None
+    oi_trend: Literal["rising", "falling", "neutral"] = "neutral"
+    heatmap_liquidity_above: Decimal | None = None
+    heatmap_liquidity_below: Decimal | None = None
+    heatmap_intensity_score: int | None = None
+    heatmap_bias: Literal["upside_squeeze", "downside_sweep", "neutral"] = "neutral"
+    base_signal_type: str = "WAIT"
+    heatmap_signal_type: str = "WAIT"
+    base_confidence: int = 0
+    heatmap_confidence: int = 0
+    heatmap_alignment: Literal["confirmed", "conflict", "neutral"] = "neutral"
+    heatmap_explanation: str = "Heatmap unavailable."
+    heatmap_provider: str = "mock"
+    heatmap_data_quality: str = "mock"
+    heatmap_is_real_data: bool = False
+    heatmap_provider_status: str = "available"
+    liquidation_pressure: Literal["low", "medium", "high"] = "low"
+    liquidation_imbalance: Decimal | None = None
+    liquidation_signal: Literal[
+        "none",
+        "cascade_down",
+        "cascade_up",
+        "exhaustion",
+        "sweep_confirmation",
+        "noise",
+    ] = "none"
+    liquidation_intensity: Literal["low", "medium", "high"] = "low"
+    dominant_side: Literal["longs_liquidated", "shorts_liquidated", "balanced"] = "balanced"
+    liquidation_explanation: str = NEUTRAL_LIQUIDATION_INTELLIGENCE.explanation
+    liquidation_volume_long: Decimal = Decimal("0")
+    liquidation_volume_short: Decimal = Decimal("0")
+    liquidation_imbalance_ratio: Decimal = Decimal("0")
+    liquidation_event_frequency: Decimal = Decimal("0")
 
 
 class TradeEligibilityResponse(BaseModel):
@@ -230,6 +420,37 @@ class TradeEligibilityResponse(BaseModel):
     regime_summary: str
     fee_slippage_summary: str
     warnings: list[str] = Field(default_factory=list)
+    liquidity_zone_summary: str = "No liquidity-zone estimate is available yet."
+    sweep_risk: Literal["none", "upside_sweep", "downside_sweep", "both_sides"] = "none"
+    trade_timing_adjustment: Literal[
+        "enter_now",
+        "wait_for_sweep",
+        "wait_for_confirmation",
+        "avoid_chop",
+    ] = "wait_for_confirmation"
+    tp_sl_alignment: Literal[
+        "aligned",
+        "stop_too_close_to_liquidity",
+        "target_before_liquidity",
+        "target_after_liquidity",
+        "needs_review",
+    ] = "needs_review"
+    crowd_side: Literal["long_crowded", "short_crowded", "balanced"] = "balanced"
+    crowd_strength: Literal["low", "medium", "high"] = "low"
+    squeeze_risk: Literal["long_squeeze", "short_squeeze", "low"] = "low"
+    funding_rate: Decimal | None = None
+    open_interest: Decimal | None = None
+    oi_trend: Literal["rising", "falling", "neutral"] = "neutral"
+    liquidation_signal: Literal[
+        "none",
+        "cascade_down",
+        "cascade_up",
+        "exhaustion",
+        "sweep_confirmation",
+        "noise",
+    ] = "none"
+    liquidation_intensity: Literal["low", "medium", "high"] = "low"
+    dominant_side: Literal["longs_liquidated", "shorts_liquidated", "balanced"] = "balanced"
     paper_only: bool = True
     advisory_only: bool = True
     live_trading_enabled: bool = False
@@ -249,6 +470,470 @@ class OpportunityResponse(BaseModel):
     risk_label: Literal["low", "medium", "high"]
     reason: str
     data_state: DataState
+
+
+class SpotOpportunitySignalResponse(BaseModel):
+    """Paper-only Spot scanner signal for one symbol."""
+
+    symbol: str
+    action: Literal["buy_candidate", "watch", "avoid", "exit_watch"]
+    opportunity_score: int
+    confidence: int
+    trend_score: int
+    momentum_score: int
+    volatility_quality_score: int
+    liquidity_score: int
+    structure_score: int
+    regime_score: int
+    validation_score: int | None = None
+    eligibility_score: int
+    evidence_strength: Literal["insufficient", "weak", "mixed", "promising", "strong"]
+    trend: str
+    momentum: str
+    best_horizon: str
+    risk_grade: Literal["low", "medium", "high"]
+    current_price: Decimal | None = None
+    suggested_entry_zone: str | None = None
+    suggested_stop_loss: Decimal | None = None
+    suggested_take_profit: Decimal | None = None
+    regime: str | None = None
+    data_source: Literal["binance_spot"] = "binance_spot"
+    price_type: Literal["spot_last_price"] = "spot_last_price"
+    reason: str
+    warnings: list[str] = Field(default_factory=list)
+    timestamp: datetime
+    paper_only: bool = True
+    advisory_only: bool = True
+    live_trading_enabled: bool = False
+    futures_enabled: bool = False
+
+
+class SpotOpportunityScanResponse(BaseModel):
+    """Paper-only Spot scanner response."""
+
+    generated_at: datetime
+    scan_state: Literal["ready", "partial", "insufficient_data", "degraded"]
+    warnings: list[str] = Field(default_factory=list)
+    scanned_count: int
+    failed_symbols: list[str] = Field(default_factory=list)
+    buy_candidates: list[SpotOpportunitySignalResponse] = Field(default_factory=list)
+    watch_candidates: list[SpotOpportunitySignalResponse] = Field(default_factory=list)
+    avoid_candidates: list[SpotOpportunitySignalResponse] = Field(default_factory=list)
+    exit_watch_candidates: list[SpotOpportunitySignalResponse] = Field(default_factory=list)
+    data_source: Literal["binance_spot", "last_successful_cache", "empty_degraded"] = "binance_spot"
+    quote_asset: str = "USDT"
+    symbol_count: int = 0
+    latest_successful_scanner_at: datetime | None = None
+    latest_error: str | None = None
+    persisted_candidate_count: int = 0
+
+
+class FuturesPaperSignalResponse(BaseModel):
+    """Paper-only futures long/short scanner signal for one symbol."""
+
+    symbol: str
+    direction: Literal["long", "short", "wait", "avoid"]
+    opportunity_score: int
+    direction_score: int
+    momentum_score: int
+    trend_score: int
+    volatility_quality_score: int
+    liquidity_score: int
+    risk_score: int
+    validation_score: int | None = None
+    confidence: int
+    evidence_strength: Literal["insufficient", "unvalidated", "weak", "mixed", "promising", "strong"]
+    trend: str
+    momentum: str
+    best_horizon: str
+    risk_grade: Literal["low", "medium", "high"]
+    regime: str | None = None
+    current_price: Decimal | None = None
+    market_sensitivity: Literal["conservative", "balanced", "aggressive"] = "balanced"
+    slow_market_setup: Literal[
+        "none",
+        "range_breakout",
+        "liquidity_sweep_reversal",
+        "compression_breakout",
+        "mean_reversion_range_edge",
+        "low_volatility_continuation",
+        "low_volatility_no_edge",
+    ] = "none"
+    slow_market_reason: str | None = None
+    data_source: Literal["binance_usdm_futures"] = "binance_usdm_futures"
+    price_type: Literal["mark_price", "futures_last_price"] = "futures_last_price"
+    reason: str
+    invalidation_hint: str | None = None
+    suggested_entry_zone: str | None = None
+    suggested_stop_loss: Decimal | None = None
+    suggested_take_profit: Decimal | None = None
+    estimated_fee_impact: Decimal | None = None
+    leverage_suggestion: str
+    liquidation_safety_note: str
+    similar_setup_summary: str
+    eligibility_status: str
+    warnings: list[str] = Field(default_factory=list)
+    timestamp: datetime
+    liquidity_bias: Literal["bullish", "bearish", "neutral"] = "neutral"
+    liquidity_pressure: Literal["low", "medium", "high"] = "low"
+    likely_liquidation_direction: Literal["up", "down", "none"] = "none"
+    trap_risk: Literal["long_trap", "short_trap", "low"] = "low"
+    liquidity_explanation: str = NEUTRAL_LIQUIDITY_BIAS.explanation
+    upside_liquidity_zone: LiquidityZoneResponse = Field(default_factory=LiquidityZoneResponse)
+    downside_liquidity_zone: LiquidityZoneResponse = Field(default_factory=LiquidityZoneResponse)
+    nearest_liquidity_target: NearestLiquidityTargetResponse = Field(default_factory=NearestLiquidityTargetResponse)
+    sweep_risk: Literal["none", "upside_sweep", "downside_sweep", "both_sides"] = "none"
+    trade_timing_adjustment: Literal[
+        "enter_now",
+        "wait_for_sweep",
+        "wait_for_confirmation",
+        "avoid_chop",
+    ] = "wait_for_confirmation"
+    tp_sl_alignment: Literal[
+        "aligned",
+        "stop_too_close_to_liquidity",
+        "target_before_liquidity",
+        "target_after_liquidity",
+        "needs_review",
+    ] = "needs_review"
+    liquidity_zone_explanation: str = NEUTRAL_LIQUIDITY_ZONES.explanation
+    liquidity_adjusted_note: str | None = None
+    crowd_side: Literal["long_crowded", "short_crowded", "balanced"] = "balanced"
+    crowd_strength: Literal["low", "medium", "high"] = "low"
+    squeeze_risk: Literal["long_squeeze", "short_squeeze", "low"] = "low"
+    funding_rate: Decimal | None = None
+    open_interest: Decimal | None = None
+    oi_trend: Literal["rising", "falling", "neutral"] = "neutral"
+    heatmap_liquidity_above: Decimal | None = None
+    heatmap_liquidity_below: Decimal | None = None
+    heatmap_intensity_score: int | None = None
+    heatmap_bias: Literal["upside_squeeze", "downside_sweep", "neutral"] = "neutral"
+    base_signal_type: str = "WAIT"
+    heatmap_signal_type: str = "WAIT"
+    base_confidence: int = 0
+    heatmap_confidence: int = 0
+    heatmap_alignment: Literal["confirmed", "conflict", "neutral"] = "neutral"
+    heatmap_explanation: str = "Heatmap unavailable."
+    heatmap_provider: str = "mock"
+    heatmap_data_quality: str = "mock"
+    heatmap_is_real_data: bool = False
+    heatmap_provider_status: str = "available"
+    liquidation_pressure: Literal["low", "medium", "high"] = "low"
+    liquidation_imbalance: Decimal | None = None
+    liquidation_signal: Literal[
+        "none",
+        "cascade_down",
+        "cascade_up",
+        "exhaustion",
+        "sweep_confirmation",
+        "noise",
+    ] = "none"
+    liquidation_intensity: Literal["low", "medium", "high"] = "low"
+    dominant_side: Literal["longs_liquidated", "shorts_liquidated", "balanced"] = "balanced"
+    liquidation_explanation: str = NEUTRAL_LIQUIDATION_INTELLIGENCE.explanation
+    liquidation_volume_long: Decimal = Decimal("0")
+    liquidation_volume_short: Decimal = Decimal("0")
+    liquidation_imbalance_ratio: Decimal = Decimal("0")
+    liquidation_event_frequency: Decimal = Decimal("0")
+
+
+class FuturesOpportunityScanResponse(BaseModel):
+    """Paper-only futures opportunity scanner response."""
+
+    generated_at: datetime
+    scan_state: Literal["ready", "partial", "insufficient_data", "degraded"]
+    long_candidates: list[FuturesPaperSignalResponse] = Field(default_factory=list)
+    short_candidates: list[FuturesPaperSignalResponse] = Field(default_factory=list)
+    neutral_candidates: list[FuturesPaperSignalResponse] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    scanned_count: int
+    failed_symbols: list[str] = Field(default_factory=list)
+    paper_only: bool = True
+    advisory_only: bool = True
+    live_futures_trading_enabled: bool = False
+    real_orders_enabled: bool = False
+    max_leverage_suggestion: str = "3x paper-only"
+    futures_symbol_universe_source: Literal["live", "cache", "fallback", "unavailable"] = "unavailable"
+    symbol_count: int = 0
+    last_successful_fetch_at: datetime | None = None
+    latest_error: str | None = None
+    data_source: str = "live_scan"
+    latest_successful_scanner_at: datetime | None = None
+    latest_scanner_error: str | None = None
+    persisted_candidate_count: int = 0
+    fallback_symbol_count: int = 0
+
+
+FuturesScannerJobStatus = Literal["queued", "running", "partial", "completed", "failed", "cancelled"]
+
+
+class SpotOpportunityScanStartRequest(BaseModel):
+    """Request body for an async paper-only Spot scanner job."""
+
+    quote_asset: str = "USDT"
+    limit: int | None = Field(default=None, ge=1)
+    max_symbols: int | None = Field(default=None, ge=1)
+    concurrency: int = Field(default=5, ge=1, le=10)
+    batch_size: int = Field(default=8, ge=5, le=10)
+    symbol_timeout_seconds: float = Field(default=6.0, ge=1, le=8)
+    scan_timeout_seconds: float = Field(default=45.0, ge=5, le=90)
+    horizon: str = "7d"
+    min_opportunity_score: int = Field(default=0, ge=0, le=100)
+    min_confidence: int = Field(default=0, ge=0, le=100)
+    include_avoid: bool = True
+
+
+class SpotOpportunityScanJobResponse(BaseModel):
+    """Progress snapshot for an async Spot scanner job."""
+
+    scan_id: str
+    status: FuturesScannerJobStatus
+    total_symbols: int = 0
+    scanned_symbols: int = 0
+    current_symbol: str | None = None
+    current_phase: str = "queued"
+    started_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
+    scan: SpotOpportunityScanResponse | None = None
+    warnings: list[str] = Field(default_factory=list)
+    failed_symbols: list[str] = Field(default_factory=list)
+    latest_error: str | None = None
+
+
+@dataclass(slots=True)
+class SpotScannerJob:
+    """Mutable in-memory state for one async Spot scanner run."""
+
+    scan_id: str
+    request: SpotOpportunityScanStartRequest
+    status: FuturesScannerJobStatus = "queued"
+    total_symbols: int = 0
+    scanned_symbols: int = 0
+    current_symbol: str | None = None
+    current_phase: str = "queued"
+    started_at: datetime = dataclass_field(default_factory=now_utc)
+    updated_at: datetime = dataclass_field(default_factory=now_utc)
+    completed_at: datetime | None = None
+    response: SpotOpportunityScanResponse | None = None
+    warnings: list[str] = dataclass_field(default_factory=list)
+    failed_symbols: list[str] = dataclass_field(default_factory=list)
+    latest_error: str | None = None
+    cancel_requested: bool = False
+    thread: Thread | None = None
+
+
+class SpotScannerJobManager:
+    """Small process-local Spot scanner job registry."""
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._jobs: dict[str, SpotScannerJob] = {}
+
+    def create(self, request: SpotOpportunityScanStartRequest) -> SpotScannerJob:
+        job = SpotScannerJob(scan_id=uuid4().hex, request=request)
+        with self._lock:
+            self._jobs[job.scan_id] = job
+        return job
+
+    def set_thread(self, scan_id: str, thread: Thread) -> None:
+        with self._lock:
+            job = self._jobs.get(scan_id)
+            if job is not None:
+                job.thread = thread
+                job.updated_at = now_utc()
+
+    def get(self, scan_id: str) -> SpotScannerJob | None:
+        with self._lock:
+            return self._jobs.get(scan_id)
+
+    def update(self, scan_id: str, **updates: object) -> SpotScannerJob | None:
+        with self._lock:
+            job = self._jobs.get(scan_id)
+            if job is None:
+                return None
+            if job.status == "cancelled" and updates.get("status") != "cancelled":
+                return job
+            for key, value in updates.items():
+                setattr(job, key, value)
+            job.updated_at = now_utc()
+            return job
+
+    def cancel(self, scan_id: str) -> SpotScannerJob | None:
+        with self._lock:
+            job = self._jobs.get(scan_id)
+            if job is None:
+                return None
+            job.cancel_requested = True
+            job.status = "cancelled"
+            job.current_phase = "cancel_requested"
+            job.completed_at = now_utc()
+            job.latest_error = "Spot scan cancelled by user."
+            job.warnings = ["Spot scan cancelled. Partial results remain advisory-only."] if job.response is not None else ["Spot scan cancelled."]
+            job.updated_at = now_utc()
+            return job
+
+
+class FuturesOpportunityScanStartRequest(BaseModel):
+    """Request body for an async paper-only futures scanner job."""
+
+    quote_asset: str = "USDT"
+    limit: int | None = Field(default=None, ge=1)
+    max_symbols: int | None = Field(default=None, ge=1)
+    concurrency: int = Field(default=5, ge=1, le=10)
+    batch_size: int = Field(default=8, ge=5, le=10)
+    symbol_timeout_seconds: float = Field(default=7.0, ge=1, le=8)
+    scan_timeout_seconds: float = Field(default=45.0, ge=5, le=90)
+    horizon: str = "7d"
+    min_opportunity_score: int = Field(default=0, ge=0, le=100)
+    min_confidence: int = Field(default=0, ge=0, le=100)
+    include_weak_evidence: bool = True
+    include_avoid: bool = True
+    market_sensitivity: Literal["conservative", "balanced", "aggressive"] = "balanced"
+
+
+class FuturesOpportunityScanJobResponse(BaseModel):
+    """Progress snapshot for an async futures scanner job."""
+
+    scan_id: str
+    status: FuturesScannerJobStatus
+    total_symbols: int = 0
+    scanned_symbols: int = 0
+    current_symbol: str | None = None
+    current_phase: str = "queued"
+    started_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
+    scan: FuturesOpportunityScanResponse | None = None
+    warnings: list[str] = Field(default_factory=list)
+    failed_symbols: list[str] = Field(default_factory=list)
+    latest_error: str | None = None
+
+
+@dataclass(slots=True)
+class FuturesScannerJob:
+    """Mutable in-memory state for one async futures scanner run."""
+
+    scan_id: str
+    request: FuturesOpportunityScanStartRequest
+    status: FuturesScannerJobStatus = "queued"
+    total_symbols: int = 0
+    scanned_symbols: int = 0
+    current_symbol: str | None = None
+    current_phase: str = "queued"
+    started_at: datetime = dataclass_field(default_factory=now_utc)
+    updated_at: datetime = dataclass_field(default_factory=now_utc)
+    completed_at: datetime | None = None
+    long_candidates: list[FuturesPaperSignal] = dataclass_field(default_factory=list)
+    short_candidates: list[FuturesPaperSignal] = dataclass_field(default_factory=list)
+    neutral_candidates: list[FuturesPaperSignal] = dataclass_field(default_factory=list)
+    warnings: list[str] = dataclass_field(default_factory=list)
+    failed_symbols: list[str] = dataclass_field(default_factory=list)
+    response: FuturesOpportunityScanResponse | None = None
+    latest_error: str | None = None
+    cancel_requested: bool = False
+    task: asyncio.Task[None] | None = None
+    thread: Thread | None = None
+
+
+class FuturesScannerJobManager:
+    """Small process-local async scanner job registry."""
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._jobs: dict[str, FuturesScannerJob] = {}
+
+    def create(self, request: FuturesOpportunityScanStartRequest) -> FuturesScannerJob:
+        job = FuturesScannerJob(scan_id=uuid4().hex, request=request)
+        with self._lock:
+            self._jobs[job.scan_id] = job
+        return job
+
+    def set_task(self, scan_id: str, task: asyncio.Task[None]) -> None:
+        with self._lock:
+            job = self._jobs.get(scan_id)
+            if job is not None:
+                job.task = task
+                job.updated_at = now_utc()
+
+    def set_thread(self, scan_id: str, thread: Thread) -> None:
+        with self._lock:
+            job = self._jobs.get(scan_id)
+            if job is not None:
+                job.thread = thread
+                job.updated_at = now_utc()
+
+    def get(self, scan_id: str) -> FuturesScannerJob | None:
+        with self._lock:
+            return self._jobs.get(scan_id)
+
+    def update(self, scan_id: str, **updates: object) -> FuturesScannerJob | None:
+        with self._lock:
+            job = self._jobs.get(scan_id)
+            if job is None:
+                return None
+            if job.status == "cancelled" and updates.get("status") != "cancelled":
+                return job
+            for key, value in updates.items():
+                setattr(job, key, value)
+            job.updated_at = now_utc()
+            return job
+
+    def cancel(self, scan_id: str) -> FuturesScannerJob | None:
+        with self._lock:
+            job = self._jobs.get(scan_id)
+            if job is None:
+                return None
+            job.cancel_requested = True
+            job.status = "cancelled"
+            job.current_phase = "cancel_requested"
+            job.completed_at = now_utc()
+            job.latest_error = "Scan cancelled by user."
+            job.warnings = ["Scan cancelled. Partial results remain advisory-only."] if job.response is not None else ["Scan cancelled."]
+            job.updated_at = now_utc()
+            task = job.task
+        if task is not None and not task.done():
+            task.cancel()
+        return job
+
+
+_SPOT_SCANNER_JOB_MANAGER = SpotScannerJobManager()
+_FUTURES_SCANNER_JOB_MANAGER = FuturesScannerJobManager()
+
+
+class FuturesLivePriceItemResponse(BaseModel):
+    """Lightweight live price heartbeat for a scanner symbol."""
+
+    symbol: str
+    live_price: Decimal | None = None
+    updated_at: datetime
+    source: Literal["websocket", "rest", "cache", "unavailable"]
+    data_source: Literal["binance_usdm_futures"] = "binance_usdm_futures"
+    price_type: Literal["mark_price", "futures_last_price"] = "mark_price"
+    stale: bool = False
+    warning: str | None = None
+
+
+class FuturesLivePriceResponse(BaseModel):
+    """Live price heartbeat response for visible futures scanner candidates."""
+
+    items: list[FuturesLivePriceItemResponse]
+    warnings: list[str] = Field(default_factory=list)
+
+
+class FuturesLiveSubscriptionRequest(BaseModel):
+    """Visible scanner symbols for websocket heartbeat subscriptions."""
+
+    symbols: list[str] = Field(default_factory=list)
+
+
+class FuturesLiveSubscriptionResponse(BaseModel):
+    """WebSocket heartbeat subscription state."""
+
+    symbols: list[str] = Field(default_factory=list)
+    count: int
+    websocket_enabled: bool
+    warning: str | None = None
 
 
 class TopOfBookResponse(BaseModel):
@@ -696,6 +1381,17 @@ def _build_signal_analysis_context(
         benchmark_symbol="BTCUSDT" if benchmark_candles else None,
         benchmark_closes=[candle.close for candle in benchmark_candles[-24:]],
     )
+    liquidity_bias = estimate_liquidity_bias(
+        LiquidityBiasInput(
+            symbol=symbol,
+            candles=candles,
+            volatility_regime=(
+                technical_analysis.volatility_regime
+                if technical_analysis is not None and technical_analysis.data_state == "ready"
+                else None
+            ),
+        )
+    )
     return SignalAnalysisContext(
         symbol=symbol,
         candles=candles,
@@ -703,8 +1399,78 @@ def _build_signal_analysis_context(
         technical_analysis=technical_analysis,
         market_sentiment=market_sentiment,
         symbol_sentiment=symbol_sentiment,
+        liquidity_bias=liquidity_bias,
         benchmark_candles=benchmark_candles,
     )
+
+
+async def _load_crowd_positioning(
+    *,
+    settings: Settings,
+    symbol: str,
+) -> tuple[BinanceDerivativesSnapshot, CrowdPositioningSnapshot]:
+    """Load Binance funding/OI crowd-positioning inputs with safe fallback."""
+
+    if not settings.binance_derivatives_data_enabled:
+        derivatives = fallback_derivatives_snapshot(symbol)
+        return derivatives, crowd_positioning_from_derivatives(derivatives)
+    derivatives = await get_derivatives_snapshot(symbol, settings=settings)
+    crowd = crowd_positioning_from_derivatives(derivatives)
+    return derivatives, crowd
+
+
+def _apply_crowd_positioning_to_context(
+    *,
+    context: SignalAnalysisContext,
+    crowd: CrowdPositioningSnapshot,
+    derivatives: BinanceDerivativesSnapshot,
+) -> SignalAnalysisContext:
+    """Update context liquidity bias with derivatives-based crowd positioning."""
+
+    volatility_regime = (
+        context.technical_analysis.volatility_regime
+        if context.technical_analysis is not None and context.technical_analysis.data_state == "ready"
+        else None
+    )
+    context.crowd_positioning = crowd
+    context.derivatives_data = derivatives
+    context.liquidity_bias = estimate_liquidity_bias(
+        LiquidityBiasInput(
+            symbol=context.symbol,
+            candles=context.candles,
+            funding_rate=derivatives.funding_rate,
+            open_interest_change_pct=derivatives.oi_change_1h or derivatives.oi_change_24h,
+            volatility_regime=volatility_regime,
+            crowd_positioning=crowd,
+        )
+    )
+    return context
+
+
+def _load_liquidation_intelligence(
+    *,
+    symbol: str,
+    candles: list[Candle],
+    liquidity_zones: LiquidityZoneSnapshot | None = None,
+    crowd_positioning: CrowdPositioningSnapshot | None = None,
+) -> LiquidationIntelligenceSnapshot:
+    """Interpret recent Binance force-order events when the feed is available."""
+
+    service = get_global_liquidation_feed_service()
+    if service is None:
+        return NEUTRAL_LIQUIDATION_INTELLIGENCE
+    try:
+        events = service.recent_events(symbol, lookback_minutes=5)
+        return interpret_liquidation_events(
+            symbol=symbol,
+            events=events,
+            candles=candles,
+            liquidity_zones=liquidity_zones,
+            crowd_positioning=crowd_positioning,
+        )
+    except Exception:
+        LOGGER.exception("Failed to interpret liquidation events for %s.", symbol)
+        return NEUTRAL_LIQUIDATION_INTELLIGENCE
 
 
 def _safe_technical_analysis(
@@ -1328,6 +2094,22 @@ def get_backfill_service(request: Request) -> HistoricalBackfillService:
     return _StorageOnlyBackfillService()  # type: ignore[return-value]
 
 
+def get_rest_client(request: Request) -> BinanceRestClient:
+    """Return the shared Binance REST client from app state."""
+
+    if hasattr(request.app.state, "rest_client"):
+        return request.app.state.rest_client
+    return BinanceRestClient(get_settings())
+
+
+def get_futures_scanner_heartbeat_service(request: Request) -> FuturesScannerWebSocketHeartbeatService | None:
+    """Return the shared futures scanner WebSocket heartbeat service when available."""
+
+    if hasattr(request.app.state, "futures_scanner_heartbeat_service"):
+        return request.app.state.futures_scanner_heartbeat_service
+    return None
+
+
 def get_settings_dependency() -> Settings:
     """Return application settings for bot control routes."""
 
@@ -1395,6 +2177,115 @@ def _load_merged_candle_series(
         live_candles=live,
         interval=interval,
         limit=limit,
+    )
+
+
+def _load_futures_candle_series(
+    *,
+    repository: StorageRepository,
+    symbol: str,
+    interval: ChartTimeframe = "1m",
+    limit: int | None = None,
+):
+    """Load stored USD-M Futures candles for selected-symbol charting."""
+
+    end_time = now_utc()
+    start_time = end_time - timedelta(days=7)
+    stored = [
+        _historical_record_to_candle(record)
+        for record in repository.get_futures_historical_candles(
+            symbol=symbol,
+            interval=interval,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    ]
+    if limit is not None:
+        stored = stored[-limit:]
+    return merge_candles(
+        stored_candles=stored,
+        live_candles=[],
+        interval=interval,
+        limit=limit,
+    )
+
+
+def _futures_backfill_status(
+    *,
+    repository: StorageRepository,
+    symbol: str,
+    interval: ChartTimeframe,
+    lookback_days: int,
+    loading: bool = False,
+    failed_message: str | None = None,
+) -> CandleBackfillStatus:
+    """Return USD-M Futures selected-symbol candle coverage."""
+
+    end_time = now_utc()
+    start_time = end_time - timedelta(days=lookback_days)
+    candles = [
+        _historical_record_to_candle(record)
+        for record in repository.get_futures_historical_candles(
+            symbol=symbol,
+            interval=interval,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    ]
+    if not candles:
+        status = "failed" if failed_message else ("loading" if loading else "not_started")
+        return CandleBackfillStatus(
+            symbol=symbol,
+            requested_interval=interval,
+            requested_lookback_days=lookback_days,
+            available_from=None,
+            available_to=None,
+            candle_count=0,
+            coverage_pct=Decimal("0"),
+            status=status,
+            message=failed_message or (
+                f"USD-M Futures {interval} candles for {symbol} are loading."
+                if loading
+                else f"USD-M Futures {interval} candles for {symbol} have not been loaded yet."
+            ),
+            last_backfilled_at=None,
+            effective_interval=interval,
+        )
+
+    latest = candles[-1]
+    earliest = candles[0]
+    requested_span = timedelta(days=lookback_days)
+    actual_span = max(latest.close_time - earliest.open_time, timedelta(0))
+    coverage_pct = min(
+        Decimal("100"),
+        (Decimal(actual_span.total_seconds()) / Decimal(requested_span.total_seconds())) * Decimal("100")
+        if requested_span.total_seconds() > 0
+        else Decimal("0"),
+    ).quantize(Decimal("0.01"))
+    if failed_message:
+        status = "failed"
+        message = failed_message
+    elif loading:
+        status = "partial"
+        message = f"USD-M Futures {interval} candles for {symbol} are still loading."
+    elif coverage_pct >= Decimal("50"):
+        status = "ready"
+        message = f"USD-M Futures {interval} candles are ready for {symbol}."
+    else:
+        status = "partial"
+        message = f"USD-M Futures {interval} candles for {symbol} are only partially backfilled."
+    return CandleBackfillStatus(
+        symbol=symbol,
+        requested_interval=interval,
+        requested_lookback_days=lookback_days,
+        available_from=earliest.open_time,
+        available_to=latest.close_time,
+        candle_count=len(candles),
+        coverage_pct=coverage_pct,
+        status=status,
+        message=message,
+        last_backfilled_at=latest.event_time,
+        effective_interval=interval,
     )
 
 
@@ -2052,6 +2943,32 @@ def _risk_label(value: str | None) -> Literal["low", "medium", "high"]:
     return "high"
 
 
+def _build_heatmap_enrichment(
+    *,
+    symbol: str,
+    price: Decimal | None,
+    base_signal_type: str,
+    base_confidence: int,
+) -> HeatmapSignalEnrichment:
+    """Build heatmap metadata without affecting the base signal decision."""
+
+    try:
+        return enrich_signal_with_heatmap(
+            symbol=symbol,
+            price=price,
+            base_signal_type=base_signal_type,
+            base_confidence=base_confidence,
+        )
+    except Exception:
+        LOGGER.exception("Failed to enrich %s signal with liquidation heatmap metadata.", symbol)
+        return enrich_signal_with_heatmap(
+            symbol=symbol,
+            price=None,
+            base_signal_type=base_signal_type,
+            base_confidence=base_confidence,
+        )
+
+
 def _build_trading_assistant_response(
     *,
     symbol: str,
@@ -2060,6 +2977,11 @@ def _build_trading_assistant_response(
     technical_analysis: TechnicalAnalysisResponse | None,
     workstation: WorkstationResponse | None,
     similar_setup: SimilarSetupReport | None = None,
+    liquidity_bias: LiquidityBiasSnapshot | None = None,
+    crowd_positioning: CrowdPositioningSnapshot | None = None,
+    derivatives_data: BinanceDerivativesSnapshot | None = None,
+    candles: list[Candle] | None = None,
+    regime_label: str | None = None,
 ) -> TradingAssistantResponse:
     """Build a beginner-friendly trading summary without changing execution logic."""
 
@@ -2103,11 +3025,11 @@ def _build_trading_assistant_response(
     suggested_entry_zone: str | None = None
     suggested_stop_loss: Decimal | None = None
     suggested_take_profit: Decimal | None = None
+    current_price = workstation.last_price if workstation is not None else None
+    atr = workstation.feature.atr if workstation is not None and workstation.feature is not None else None
     if technical_analysis is not None and technical_analysis.data_state == "ready" and decision == "buy":
-        current_price = workstation.last_price if workstation is not None else None
         nearest_support = technical_analysis.support_levels[-1] if technical_analysis.support_levels else None
         nearest_resistance = technical_analysis.resistance_levels[0] if technical_analysis.resistance_levels else None
-        atr = workstation.feature.atr if workstation is not None and workstation.feature is not None else None
         if nearest_support is not None and current_price is not None:
             suggested_entry_zone = f"{nearest_support} - {current_price}"
         elif current_price is not None:
@@ -2124,6 +3046,83 @@ def _build_trading_assistant_response(
     best_timeframe: Literal["5m", "15m", "1h", "unknown"] = "unknown"
     if fusion_signal.preferred_horizon in {"5m", "15m", "1h"}:
         best_timeframe = fusion_signal.preferred_horizon
+
+    liquidity = liquidity_bias or NEUTRAL_LIQUIDITY_BIAS
+    crowd = crowd_positioning or NEUTRAL_CROWD_POSITIONING
+    derivatives = derivatives_data or fallback_derivatives_snapshot(symbol)
+    confidence_score = _liquidity_adjusted_assistant_confidence(
+        confidence=confidence_score,
+        decision=decision,
+        liquidity=liquidity,
+    )
+    confidence_score = _crowd_adjusted_assistant_confidence(
+        confidence=confidence_score,
+        decision=decision,
+        crowd=crowd,
+    )
+    if decision == "buy" and crowd.crowd_side == "long_crowded" and crowd.crowd_strength == "high":
+        decision = "wait"
+        why_not_trade = "Binance funding and open interest show crowded longs with downside squeeze risk."
+        simple_reason = f"{simple_reason} Crowd: long heavy downside risk."
+    if decision == "buy" and liquidity.trap_risk == "long_trap" and liquidity.liquidity_pressure == "high":
+        decision = "wait"
+        why_not_trade = "Estimated liquidity positioning shows high downside sweep risk against a fresh long entry."
+        simple_reason = f"{simple_reason} Liquidity: high downside sweep risk."
+    liquidity_zones = estimate_liquidity_zones(
+        symbol=symbol,
+        candles=candles or (),
+        current_price=current_price,
+        trade_direction=_assistant_liquidity_zone_direction(decision=decision, fusion_signal=fusion_signal.final_signal),
+        stop_loss=suggested_stop_loss,
+        take_profit=suggested_take_profit,
+        liquidity_bias=liquidity,
+        crowd_positioning=crowd,
+        regime_label=regime_label,
+        atr=atr,
+    )
+    liquidation_intelligence = _load_liquidation_intelligence(
+        symbol=symbol,
+        candles=candles or (),
+        liquidity_zones=liquidity_zones,
+        crowd_positioning=crowd,
+    )
+    liquidity_zones = validate_liquidity_zones_with_liquidations(
+        zones=liquidity_zones,
+        liquidation_signal=liquidation_intelligence.liquidation_signal,
+        dominant_side=liquidation_intelligence.dominant_side,
+    )
+    if decision == "buy" and liquidity_zones.trade_timing_adjustment == "wait_for_sweep":
+        decision = "wait"
+        confidence_score = max(0, confidence_score - 6)
+        why_not_trade = "Estimated liquidity zones show sweep risk against this entry; waiting for the sweep or confirmation is safer in paper mode."
+        simple_reason = f"{simple_reason} Liquidity: downside sweep risk."
+    elif decision == "buy" and liquidity_zones.trade_timing_adjustment == "avoid_chop":
+        decision = "wait"
+        confidence_score = max(0, confidence_score - 8)
+        why_not_trade = "Estimated liquidity is concentrated on both sides in a choppy structure."
+        simple_reason = f"{simple_reason} Liquidity: choppy both-side risk."
+    confidence_score = _liquidation_adjusted_assistant_confidence(
+        confidence=confidence_score,
+        decision=decision,
+        liquidation=liquidation_intelligence,
+    )
+    if decision == "buy" and liquidation_intelligence.liquidation_signal == "cascade_down":
+        decision = "wait"
+        why_not_trade = "Recent Binance force-order events show downside liquidation cascade risk."
+        simple_reason = f"{simple_reason} Liquidation: downside cascade risk."
+    elif decision == "sell_exit" and liquidation_intelligence.liquidation_signal == "cascade_up":
+        decision = "wait"
+        why_not_trade = "Recent Binance force-order events show upside short-squeeze pressure."
+        simple_reason = f"{simple_reason} Liquidation: upside squeeze risk."
+    elif liquidation_intelligence.liquidation_signal == "exhaustion":
+        simple_reason = f"{simple_reason} Liquidation: exhaustion risk."
+
+    heatmap = _build_heatmap_enrichment(
+        symbol=symbol,
+        price=current_price,
+        base_signal_type=_assistant_signal_type(decision),
+        base_confidence=confidence_score,
+    )
 
     return TradingAssistantResponse(
         symbol=symbol,
@@ -2144,7 +3143,123 @@ def _build_trading_assistant_response(
         ),
         backfill_status=_to_backfill_status_response(backfill_status),
         similar_setup=_to_similar_setup_summary_response(similar_setup),
+        liquidity_bias=liquidity.liquidity_bias,
+        liquidity_pressure=liquidity.liquidity_pressure,
+        likely_liquidation_direction=liquidity.likely_liquidation_direction,
+        trap_risk=liquidity.trap_risk,
+        liquidity_explanation=liquidity.explanation,
+        upside_liquidity_zone=_to_liquidity_zone_response(liquidity_zones.upside_liquidity_zone),
+        downside_liquidity_zone=_to_liquidity_zone_response(liquidity_zones.downside_liquidity_zone),
+        nearest_liquidity_target=_to_nearest_liquidity_target_response(liquidity_zones.nearest_liquidity_target),
+        sweep_risk=liquidity_zones.sweep_risk,
+        trade_timing_adjustment=liquidity_zones.trade_timing_adjustment,
+        tp_sl_alignment=liquidity_zones.tp_sl_alignment,
+        liquidity_zone_explanation=liquidity_zones.explanation,
+        crowd_side=crowd.crowd_side,
+        crowd_strength=crowd.crowd_strength,
+        squeeze_risk=crowd.squeeze_risk,
+        positioning_explanation=crowd.explanation,
+        funding_rate=derivatives.funding_rate,
+        open_interest=derivatives.open_interest,
+        oi_trend=derivatives.oi_trend,
+        heatmap_liquidity_above=heatmap.heatmap_liquidity_above,
+        heatmap_liquidity_below=heatmap.heatmap_liquidity_below,
+        heatmap_intensity_score=heatmap.heatmap_intensity_score,
+        heatmap_bias=heatmap.heatmap_bias,
+        base_signal_type=heatmap.base_signal_type,
+        heatmap_signal_type=heatmap.heatmap_signal_type,
+        base_confidence=heatmap.base_confidence,
+        heatmap_confidence=heatmap.heatmap_confidence,
+        heatmap_alignment=heatmap.heatmap_alignment,
+        heatmap_explanation=heatmap.heatmap_explanation,
+        heatmap_provider=heatmap.heatmap_provider,
+        heatmap_data_quality=heatmap.heatmap_data_quality,
+        heatmap_is_real_data=heatmap.heatmap_is_real_data,
+        heatmap_provider_status=heatmap.heatmap_provider_status,
+        liquidation_pressure=heatmap.liquidation_pressure,
+        liquidation_imbalance=heatmap.liquidation_imbalance,
+        liquidation_signal=liquidation_intelligence.liquidation_signal,
+        liquidation_intensity=liquidation_intelligence.liquidation_intensity,
+        dominant_side=liquidation_intelligence.dominant_side,
+        liquidation_explanation=liquidation_intelligence.explanation,
+        liquidation_volume_long=liquidation_intelligence.liquidation_volume_long,
+        liquidation_volume_short=liquidation_intelligence.liquidation_volume_short,
+        liquidation_imbalance_ratio=liquidation_intelligence.imbalance_ratio,
+        liquidation_event_frequency=liquidation_intelligence.event_frequency,
     )
+
+
+def _assistant_liquidity_zone_direction(*, decision: str, fusion_signal: str) -> Literal["long", "short", "wait", "avoid", "buy", "sell_exit", "none"]:
+    if decision == "buy":
+        return "buy"
+    if decision == "sell_exit":
+        return "sell_exit"
+    if fusion_signal == "short":
+        return "short"
+    if decision == "avoid":
+        return "avoid"
+    if decision == "wait":
+        return "wait"
+    return "none"
+
+
+def _liquidity_adjusted_assistant_confidence(
+    *,
+    confidence: int,
+    decision: str,
+    liquidity: LiquidityBiasSnapshot,
+) -> int:
+    adjustment = 0
+    if liquidity.liquidity_pressure == "high":
+        adjustment -= 3
+    if decision == "buy":
+        if liquidity.trap_risk == "long_trap":
+            adjustment -= 10 if liquidity.liquidity_pressure == "high" else 5
+        elif liquidity.trap_risk == "short_trap":
+            adjustment += 4
+    return max(0, min(100, confidence + adjustment))
+
+
+def _crowd_adjusted_assistant_confidence(
+    *,
+    confidence: int,
+    decision: str,
+    crowd: CrowdPositioningSnapshot,
+) -> int:
+    adjustment = 0
+    if crowd.crowd_strength == "high":
+        if decision == "buy" and crowd.crowd_side == "long_crowded":
+            adjustment -= 6
+        elif decision == "buy" and crowd.crowd_side == "short_crowded":
+            adjustment += 3
+    elif crowd.crowd_strength == "medium":
+        if decision == "buy" and crowd.crowd_side == "long_crowded":
+            adjustment -= 3
+        elif decision == "buy" and crowd.crowd_side == "short_crowded":
+            adjustment += 2
+    return max(0, min(100, confidence + adjustment))
+
+
+def _liquidation_adjusted_assistant_confidence(
+    *,
+    confidence: int,
+    decision: str,
+    liquidation: LiquidationIntelligenceSnapshot,
+) -> int:
+    adjustment = 0
+    if decision == "buy":
+        if liquidation.liquidation_signal == "cascade_up":
+            adjustment += 4
+        elif liquidation.liquidation_signal == "cascade_down":
+            adjustment -= 10
+    elif decision == "sell_exit":
+        if liquidation.liquidation_signal == "cascade_down":
+            adjustment += 3
+        elif liquidation.liquidation_signal == "cascade_up":
+            adjustment -= 8
+    if liquidation.liquidation_signal == "exhaustion":
+        adjustment -= 5
+    return max(0, min(100, confidence + adjustment))
 
 
 def _to_similar_setup_summary_response(report: SimilarSetupReport | None) -> SimilarSetupSummaryResponse | None:
@@ -2173,6 +3288,27 @@ def _to_similar_setup_summary_response(report: SimilarSetupReport | None) -> Sim
     )
 
 
+def _to_liquidity_zone_response(zone: LiquidityZone | None) -> LiquidityZoneResponse:
+    if zone is None:
+        return LiquidityZoneResponse()
+    return LiquidityZoneResponse(
+        level=zone.level,
+        strength=zone.strength,
+        reason=zone.reason,
+    )
+
+
+def _to_nearest_liquidity_target_response(target: NearestLiquidityTarget | None) -> NearestLiquidityTargetResponse:
+    if target is None:
+        return NearestLiquidityTargetResponse()
+    return NearestLiquidityTargetResponse(
+        direction=target.direction,
+        level=target.level,
+        distance_pct=target.distance_pct,
+        strength=target.strength,
+    )
+
+
 def _to_trade_eligibility_response(
     *,
     symbol: str,
@@ -2194,6 +3330,19 @@ def _to_trade_eligibility_response(
         regime_summary=result.regime_summary,
         fee_slippage_summary=result.fee_slippage_summary,
         warnings=result.warnings,
+        liquidity_zone_summary=result.liquidity_zone_summary,
+        sweep_risk=result.sweep_risk,
+        trade_timing_adjustment=result.trade_timing_adjustment,
+        tp_sl_alignment=result.tp_sl_alignment,
+        crowd_side=result.crowd_side,
+        crowd_strength=result.crowd_strength,
+        squeeze_risk=result.squeeze_risk,
+        funding_rate=result.funding_rate,
+        open_interest=result.open_interest,
+        oi_trend=result.oi_trend,
+        liquidation_signal=result.liquidation_signal,
+        liquidation_intensity=result.liquidation_intensity,
+        dominant_side=result.dominant_side,
     )
 
 
@@ -2555,6 +3704,2309 @@ def _opportunity_from_candles(
         reason=reason,
         data_state="ready",
     )
+
+
+def _to_spot_signal_response(signal: SpotOpportunitySignal) -> SpotOpportunitySignalResponse:
+    return SpotOpportunitySignalResponse(
+        symbol=signal.symbol,
+        action=signal.action,
+        opportunity_score=signal.opportunity_score,
+        confidence=signal.confidence,
+        trend_score=signal.trend_score,
+        momentum_score=signal.momentum_score,
+        volatility_quality_score=signal.volatility_quality_score,
+        liquidity_score=signal.liquidity_score,
+        structure_score=signal.structure_score,
+        regime_score=signal.regime_score,
+        validation_score=signal.validation_score,
+        eligibility_score=signal.eligibility_score,
+        evidence_strength=signal.evidence_strength,
+        trend=signal.trend,
+        momentum=signal.momentum,
+        best_horizon=signal.best_horizon,
+        risk_grade=signal.risk_grade,
+        current_price=signal.current_price,
+        suggested_entry_zone=signal.suggested_entry_zone,
+        suggested_stop_loss=signal.suggested_stop_loss,
+        suggested_take_profit=signal.suggested_take_profit,
+        regime=signal.regime,
+        data_source="binance_spot",
+        price_type="spot_last_price",
+        reason=signal.reason,
+        warnings=list(signal.warnings),
+        timestamp=signal.timestamp,
+    )
+
+
+def _to_spot_scan_response(
+    report: SpotOpportunityScanReport,
+    *,
+    quote_asset: str,
+    symbol_count: int,
+    data_source: Literal["binance_spot", "last_successful_cache", "empty_degraded"] = "binance_spot",
+    latest_error: str | None = None,
+    latest_successful_scanner_at: datetime | None = None,
+    persisted_candidate_count: int = 0,
+) -> SpotOpportunityScanResponse:
+    return SpotOpportunityScanResponse(
+        generated_at=report.generated_at,
+        scan_state=report.scan_state,
+        warnings=list(report.warnings),
+        scanned_count=report.scanned_count,
+        failed_symbols=list(report.failed_symbols),
+        buy_candidates=[_to_spot_signal_response(signal) for signal in report.buy_candidates],
+        watch_candidates=[_to_spot_signal_response(signal) for signal in report.watch_candidates],
+        avoid_candidates=[_to_spot_signal_response(signal) for signal in report.avoid_candidates],
+        exit_watch_candidates=[_to_spot_signal_response(signal) for signal in report.exit_watch_candidates],
+        data_source=data_source,
+        quote_asset=quote_asset,
+        symbol_count=symbol_count,
+        latest_successful_scanner_at=latest_successful_scanner_at,
+        latest_error=latest_error,
+        persisted_candidate_count=persisted_candidate_count,
+    )
+
+
+def _to_futures_signal_response(signal: FuturesPaperSignal) -> FuturesPaperSignalResponse:
+    """Convert a paper futures scanner signal into an API response."""
+
+    heatmap = _build_heatmap_enrichment(
+        symbol=signal.symbol,
+        price=signal.current_price,
+        base_signal_type=_scanner_signal_type(signal.direction),
+        base_confidence=signal.confidence,
+    )
+    return FuturesPaperSignalResponse(
+        symbol=signal.symbol,
+        direction=signal.direction,
+        opportunity_score=signal.opportunity_score,
+        direction_score=signal.direction_score,
+        momentum_score=signal.momentum_score,
+        trend_score=signal.trend_score,
+        volatility_quality_score=signal.volatility_quality_score,
+        liquidity_score=signal.liquidity_score,
+        risk_score=signal.risk_score,
+        validation_score=signal.validation_score,
+        confidence=signal.confidence,
+        evidence_strength=signal.evidence_strength,
+        trend=signal.trend,
+        momentum=signal.momentum,
+        best_horizon=signal.best_horizon,
+        risk_grade=signal.risk_grade,
+        regime=signal.regime,
+        current_price=signal.current_price,
+        market_sensitivity=signal.market_sensitivity,
+        slow_market_setup=signal.slow_market_setup,
+        slow_market_reason=signal.slow_market_reason,
+        data_source="binance_usdm_futures",
+        price_type=signal.price_type,
+        reason=signal.reason,
+        invalidation_hint=signal.invalidation_hint,
+        suggested_entry_zone=signal.suggested_entry_zone,
+        suggested_stop_loss=signal.suggested_stop_loss,
+        suggested_take_profit=signal.suggested_take_profit,
+        estimated_fee_impact=signal.estimated_fee_impact,
+        leverage_suggestion=signal.leverage_suggestion,
+        liquidation_safety_note=signal.liquidation_safety_note,
+        similar_setup_summary=signal.similar_setup_summary,
+        eligibility_status=signal.eligibility_status,
+        warnings=list(signal.warnings),
+        timestamp=signal.timestamp,
+        liquidity_bias=signal.liquidity_bias,
+        liquidity_pressure=signal.liquidity_pressure,
+        likely_liquidation_direction=signal.likely_liquidation_direction,
+        trap_risk=signal.trap_risk,
+        liquidity_explanation=signal.liquidity_explanation,
+        upside_liquidity_zone=LiquidityZoneResponse(
+            level=signal.upside_liquidity_zone_level,
+            strength=signal.upside_liquidity_zone_strength,
+            reason=signal.upside_liquidity_zone_reason,
+        ),
+        downside_liquidity_zone=LiquidityZoneResponse(
+            level=signal.downside_liquidity_zone_level,
+            strength=signal.downside_liquidity_zone_strength,
+            reason=signal.downside_liquidity_zone_reason,
+        ),
+        nearest_liquidity_target=NearestLiquidityTargetResponse(
+            direction=signal.nearest_liquidity_target_direction,
+            level=signal.nearest_liquidity_target_level,
+            distance_pct=signal.nearest_liquidity_target_distance_pct,
+            strength=signal.nearest_liquidity_target_strength,
+        ),
+        sweep_risk=signal.sweep_risk,
+        trade_timing_adjustment=signal.trade_timing_adjustment,
+        tp_sl_alignment=signal.tp_sl_alignment,
+        liquidity_zone_explanation=signal.liquidity_zone_explanation,
+        liquidity_adjusted_note=signal.liquidity_adjusted_note,
+        crowd_side=signal.crowd_side,
+        crowd_strength=signal.crowd_strength,
+        squeeze_risk=signal.squeeze_risk,
+        funding_rate=signal.funding_rate,
+        open_interest=signal.open_interest,
+        oi_trend=signal.oi_trend,
+        heatmap_liquidity_above=heatmap.heatmap_liquidity_above,
+        heatmap_liquidity_below=heatmap.heatmap_liquidity_below,
+        heatmap_intensity_score=heatmap.heatmap_intensity_score,
+        heatmap_bias=heatmap.heatmap_bias,
+        base_signal_type=heatmap.base_signal_type,
+        heatmap_signal_type=heatmap.heatmap_signal_type,
+        base_confidence=heatmap.base_confidence,
+        heatmap_confidence=heatmap.heatmap_confidence,
+        heatmap_alignment=heatmap.heatmap_alignment,
+        heatmap_explanation=heatmap.heatmap_explanation,
+        heatmap_provider=heatmap.heatmap_provider,
+        heatmap_data_quality=heatmap.heatmap_data_quality,
+        heatmap_is_real_data=heatmap.heatmap_is_real_data,
+        heatmap_provider_status=heatmap.heatmap_provider_status,
+        liquidation_pressure=heatmap.liquidation_pressure,
+        liquidation_imbalance=heatmap.liquidation_imbalance,
+        liquidation_signal=signal.liquidation_signal,
+        liquidation_intensity=signal.liquidation_intensity,
+        dominant_side=signal.dominant_side,
+        liquidation_explanation=signal.liquidation_explanation,
+        liquidation_volume_long=signal.liquidation_volume_long,
+        liquidation_volume_short=signal.liquidation_volume_short,
+        liquidation_imbalance_ratio=signal.liquidation_imbalance_ratio,
+        liquidation_event_frequency=signal.liquidation_event_frequency,
+    )
+
+
+def _to_futures_scan_response(report: FuturesOpportunityScanReport) -> FuturesOpportunityScanResponse:
+    """Convert paper futures scanner report into the API response shape."""
+
+    candidate_count = (
+        len(report.long_candidates)
+        + len(report.short_candidates)
+        + len(report.neutral_candidates)
+    )
+    fallback_symbol_count = (
+        len(_manual_futures_symbol_fallback("USDT"))
+        if report.futures_symbol_universe_source == "fallback"
+        else 0
+    )
+    data_source = "fallback_scan" if report.futures_symbol_universe_source == "fallback" else "live_scan"
+    if report.futures_symbol_universe_source == "cache":
+        data_source = "symbol_universe_cache"
+    return FuturesOpportunityScanResponse(
+        generated_at=report.generated_at,
+        scan_state=report.scan_state,
+        long_candidates=[_to_futures_signal_response(signal) for signal in report.long_candidates],
+        short_candidates=[_to_futures_signal_response(signal) for signal in report.short_candidates],
+        neutral_candidates=[_to_futures_signal_response(signal) for signal in report.neutral_candidates],
+        warnings=report.warnings,
+        scanned_count=report.scanned_count,
+        failed_symbols=report.failed_symbols,
+        futures_symbol_universe_source=report.futures_symbol_universe_source,  # type: ignore[arg-type]
+        symbol_count=report.symbol_count,
+        last_successful_fetch_at=report.last_successful_fetch_at,
+        latest_error=report.latest_error,
+        data_source=data_source,
+        latest_successful_scanner_at=report.generated_at if report.scan_state != "degraded" else None,
+        latest_scanner_error=report.latest_error,
+        persisted_candidate_count=candidate_count,
+        fallback_symbol_count=fallback_symbol_count,
+    )
+
+
+def _build_futures_paper_signal_for_symbol(
+    *,
+    scanner: FuturesOpportunityScanner,
+    symbol: str,
+    horizon: str,
+    runtime: PaperBotRuntime,
+    repository: StorageRepository,
+    sentiment_service: SymbolSentimentService,
+    backfill_service: HistoricalBackfillService,
+) -> FuturesPaperSignal:
+    """Build one paper-only futures scanner signal without touching execution."""
+
+    context = _build_signal_analysis_context(
+        runtime=runtime,
+        repository=repository,
+        symbol=symbol,
+        sentiment_service=sentiment_service,
+    )
+    workstation_state, _, _ = _safe_workstation_state(runtime, symbol)
+    workstation_status = runtime.status()
+    workstation_data_state, workstation_status_message = _derive_workstation_data_state(
+        state=workstation_state,
+        status=workstation_status,
+        storage_degraded=runtime.storage_degraded(),
+        storage_message=runtime.storage_status_message(),
+        state_failed=False,
+        state_failure_message=None,
+    )
+    workstation = _to_workstation_response(
+        state=workstation_state,
+        runtime=runtime,
+        status=workstation_status,
+        data_state=workstation_data_state,
+        status_message=workstation_status_message,
+    )
+    technical_analysis, _ = _safe_technical_analysis(
+        runtime,
+        repository,
+        symbol,
+        context=context,
+    )
+    technical_response = _to_technical_analysis_response(
+        symbol=symbol,
+        analysis=technical_analysis,
+        data_state=(
+            "ready"
+            if technical_analysis is not None and technical_analysis.data_state == "ready"
+            else "waiting_for_history"
+        ),
+        status_message=technical_analysis.status_message if technical_analysis is not None else None,
+    )
+    fusion_analysis, _ = _safe_fusion_signal(
+        symbol=symbol,
+        runtime=runtime,
+        repository=repository,
+        sentiment_service=sentiment_service,
+        workstation_state=workstation_state,
+        context=context,
+    )
+    fusion_state, fusion_message = _derive_fusion_data_state(
+        symbol=symbol,
+        status=runtime.status(),
+        analysis=fusion_analysis,
+        analysis_failed=False,
+    )
+    fusion_response = _to_fusion_signal_response(
+        symbol=symbol,
+        analysis=fusion_analysis,
+        data_state=fusion_state,
+        status_message=fusion_message,
+    )
+    backfill_status = backfill_service.status(symbol=symbol, interval="1m", lookback_days=7)
+    pattern_analysis, _ = _safe_pattern_analysis(
+        runtime,
+        symbol=symbol,
+        horizon=horizon,
+        repository=repository,
+        candles=context.candles,
+    )
+    regime_analysis, _ = _safe_regime_analysis(
+        symbol=symbol,
+        horizon=horizon,
+        runtime=runtime,
+        repository=repository,
+        sentiment_service=sentiment_service,
+        context=context,
+    )
+    assistant = _build_trading_assistant_response(
+        symbol=symbol,
+        backfill_status=backfill_status,
+        fusion_signal=fusion_response,
+        technical_analysis=technical_response,
+        workstation=workstation,
+        liquidity_bias=context.liquidity_bias,
+        crowd_positioning=context.crowd_positioning,
+        derivatives_data=context.derivatives_data,
+        candles=context.candles,
+        regime_label=regime_analysis.regime_label if regime_analysis is not None else None,
+    )
+    current_snapshot = _build_signal_validation_snapshot_record(
+        symbol=symbol,
+        assistant=assistant,
+        fusion_signal=fusion_response,
+        workstation=workstation,
+        context=context,
+        pattern_analysis=pattern_analysis,
+        regime_analysis=regime_analysis,
+    )
+    similar_setup = _similar_setup_report_for_snapshot(
+        repository=repository,
+        current_snapshot=current_snapshot,
+    )
+    validation_report = _signal_validation_report_for_symbol(
+        repository=repository,
+        symbol=symbol,
+        horizon=fusion_response.preferred_horizon,
+    )
+    blocker_reasons = current_snapshot.blocker_reasons if current_snapshot is not None else ()
+    liquidity_zones = _estimate_assistant_liquidity_zones(
+        symbol=symbol,
+        candles=context.candles,
+        workstation=workstation,
+        assistant=assistant,
+        fusion_signal=fusion_response,
+        liquidity_bias=context.liquidity_bias,
+        regime_analysis=regime_analysis,
+        crowd_positioning=context.crowd_positioning,
+    )
+    liquidation_intelligence = _load_liquidation_intelligence(
+        symbol=symbol,
+        candles=context.candles,
+        liquidity_zones=liquidity_zones,
+        crowd_positioning=context.crowd_positioning,
+    )
+    liquidity_zones = validate_liquidity_zones_with_liquidations(
+        zones=liquidity_zones,
+        liquidation_signal=liquidation_intelligence.liquidation_signal,
+        dominant_side=liquidation_intelligence.dominant_side,
+    )
+    eligibility = evaluate_trade_eligibility(
+        TradeEligibilityInput(
+            symbol=symbol,
+            action=assistant.decision,
+            confidence=assistant.confidence_score,
+            risk_grade=assistant.risk_label,
+            preferred_horizon=fusion_response.preferred_horizon,
+            expected_edge_pct=fusion_response.expected_edge_pct,
+            estimated_cost_pct=current_snapshot.estimated_cost_pct if current_snapshot is not None else None,
+            blocker_reasons=blocker_reasons,
+            current_warnings=tuple(fusion_response.warnings),
+            regime_label=regime_analysis.regime_label if regime_analysis is not None else None,
+            regime_confidence=regime_analysis.confidence if regime_analysis is not None else None,
+            regime_warnings=regime_analysis.risk_warnings if regime_analysis is not None else (),
+            regime_avoid_conditions=regime_analysis.avoid_conditions if regime_analysis is not None else (),
+            similar_setup=similar_setup,
+            signal_validation=validation_report,
+            liquidity_bias=context.liquidity_bias,
+            liquidity_zones=liquidity_zones,
+            crowd_positioning=context.crowd_positioning,
+            funding_rate=context.derivatives_data.funding_rate if context.derivatives_data is not None else None,
+            open_interest=context.derivatives_data.open_interest if context.derivatives_data is not None else None,
+            oi_trend=context.derivatives_data.oi_trend if context.derivatives_data is not None else "neutral",
+            liquidation_intelligence=liquidation_intelligence,
+        )
+    )
+    return scanner.analyze_symbol(
+        FuturesSignalContext(
+            symbol=symbol,
+            candles=context.candles,
+            technical_analysis=technical_analysis,
+            regime_analysis=regime_analysis,
+            similar_setup=similar_setup,
+            trade_eligibility=eligibility,
+            preferred_horizon=fusion_response.preferred_horizon,
+            expected_edge_pct=fusion_response.expected_edge_pct,
+            invalidation_hint=fusion_response.invalidation_hint,
+            blocker_reasons=blocker_reasons,
+            warnings=tuple(fusion_response.warnings),
+            spread_ratio_pct=_spread_ratio_pct(runtime=runtime, symbol=symbol),
+            liquidity_bias=context.liquidity_bias,
+            liquidity_zones=liquidity_zones,
+            crowd_positioning=context.crowd_positioning,
+            funding_rate=context.derivatives_data.funding_rate if context.derivatives_data is not None else None,
+            open_interest=context.derivatives_data.open_interest if context.derivatives_data is not None else None,
+            oi_trend=context.derivatives_data.oi_trend if context.derivatives_data is not None else "neutral",
+            liquidation_intelligence=liquidation_intelligence,
+        )
+    )
+
+
+def _spread_ratio_pct(*, runtime: PaperBotRuntime, symbol: str) -> Decimal | None:
+    top_of_book_getter = getattr(runtime, "top_of_book", None)
+    top = top_of_book_getter(symbol) if callable(top_of_book_getter) else None
+    if top is None or top.bid_price <= Decimal("0"):
+        return None
+    return (((top.ask_price - top.bid_price) / top.bid_price) * Decimal("100")).quantize(
+        Decimal("0.0001"),
+        rounding=ROUND_HALF_UP,
+    )
+
+
+def _estimate_assistant_liquidity_zones(
+    *,
+    symbol: str,
+    candles: list[Candle],
+    workstation: WorkstationResponse | None,
+    assistant: TradingAssistantResponse,
+    fusion_signal: FusionSignalResponse,
+    liquidity_bias: LiquidityBiasSnapshot,
+    regime_analysis: RegimeAnalysisSnapshot | None,
+    crowd_positioning: CrowdPositioningSnapshot | None = None,
+) -> LiquidityZoneSnapshot:
+    current_price = workstation.last_price if workstation is not None else (candles[-1].close if candles else None)
+    atr = workstation.feature.atr if workstation is not None and workstation.feature is not None else None
+    return estimate_liquidity_zones(
+        symbol=symbol,
+        candles=candles,
+        current_price=current_price,
+        trade_direction=_assistant_liquidity_zone_direction(
+            decision=assistant.decision,
+            fusion_signal=fusion_signal.final_signal,
+        ),
+        stop_loss=assistant.suggested_stop_loss,
+        take_profit=assistant.suggested_take_profit,
+        liquidity_bias=liquidity_bias,
+        crowd_positioning=crowd_positioning,
+        regime_label=regime_analysis.regime_label if regime_analysis is not None else None,
+        atr=atr,
+    )
+
+
+def _persist_assistant_outcome_snapshot(
+    *,
+    repository: StorageRepository,
+    symbol: str,
+    assistant: TradingAssistantResponse,
+    current_price: Decimal | None,
+) -> None:
+    try:
+        persist_signal_snapshot(
+            repository=repository,
+            payload=SignalSnapshotInput(
+                symbol=symbol,
+                source="assistant",
+                signal_type=_assistant_signal_type(assistant.decision),
+                confidence=assistant.confidence_score,
+                entry_price=current_price,
+                liquidity_bias=assistant.liquidity_bias,
+                sweep_risk=assistant.sweep_risk,
+                nearest_liquidity_above=(
+                    assistant.nearest_liquidity_target.level
+                    if assistant.nearest_liquidity_target.direction == "up"
+                    else assistant.upside_liquidity_zone.level
+                ),
+                nearest_liquidity_below=(
+                    assistant.nearest_liquidity_target.level
+                    if assistant.nearest_liquidity_target.direction == "down"
+                    else assistant.downside_liquidity_zone.level
+                ),
+                funding_rate=assistant.funding_rate,
+                open_interest=assistant.open_interest,
+                notes=assistant.simple_reason,
+            ),
+        )
+    except Exception:
+        LOGGER.exception("Failed to persist post-signal assistant snapshot for %s.", symbol)
+
+
+def _persist_eligibility_outcome_snapshot(
+    *,
+    repository: StorageRepository,
+    symbol: str,
+    assistant: TradingAssistantResponse,
+    eligibility: TradeEligibilityResponse,
+    current_price: Decimal | None,
+) -> None:
+    try:
+        persist_signal_snapshot(
+            repository=repository,
+            payload=SignalSnapshotInput(
+                symbol=symbol,
+                source="eligibility",
+                signal_type=_eligibility_signal_type(eligibility.status, assistant.decision),
+                confidence=assistant.confidence_score,
+                entry_price=current_price,
+                liquidity_bias=assistant.liquidity_bias,
+                sweep_risk=eligibility.sweep_risk,
+                nearest_liquidity_above=assistant.upside_liquidity_zone.level,
+                nearest_liquidity_below=assistant.downside_liquidity_zone.level,
+                funding_rate=assistant.funding_rate,
+                open_interest=assistant.open_interest,
+                notes=eligibility.reason,
+            ),
+        )
+    except Exception:
+        LOGGER.exception("Failed to persist post-signal eligibility snapshot for %s.", symbol)
+
+
+def _persist_scanner_outcome_snapshots(
+    *,
+    repository: StorageRepository,
+    report: FuturesOpportunityScanReport,
+) -> None:
+    for signal in report.long_candidates + report.short_candidates + report.neutral_candidates:
+        try:
+            persist_signal_snapshot(
+                repository=repository,
+                payload=SignalSnapshotInput(
+                    symbol=signal.symbol,
+                    source="scanner",
+                    signal_type=_scanner_signal_type(signal.direction),
+                    confidence=signal.confidence,
+                    entry_price=signal.current_price,
+                    liquidity_bias=signal.liquidity_bias,
+                    sweep_risk=signal.sweep_risk,
+                    nearest_liquidity_above=signal.upside_liquidity_zone_level,
+                    nearest_liquidity_below=signal.downside_liquidity_zone_level,
+                    funding_rate=signal.funding_rate,
+                    open_interest=signal.open_interest,
+                    notes=signal.reason,
+                ),
+            )
+        except Exception:
+            LOGGER.exception("Failed to persist post-signal scanner snapshot for %s.", signal.symbol)
+
+
+def _persist_spot_scanner_outcome_snapshots(
+    *,
+    repository: StorageRepository,
+    report: SpotOpportunityScanReport,
+) -> None:
+    for signal in (
+        report.buy_candidates
+        + report.watch_candidates
+        + report.exit_watch_candidates
+        + report.avoid_candidates
+    ):
+        try:
+            persist_signal_snapshot(
+                repository=repository,
+                payload=SignalSnapshotInput(
+                    symbol=signal.symbol,
+                    source="spot_scanner",
+                    signal_type=_spot_scanner_signal_type(signal.action),
+                    confidence=signal.confidence,
+                    entry_price=signal.current_price,
+                    notes=signal.reason,
+                    timestamp=signal.timestamp,
+                ),
+            )
+        except Exception:
+            LOGGER.exception("Failed to persist post-signal Spot scanner snapshot for %s.", signal.symbol)
+
+
+def _persist_scanner_run_candidates(
+    *,
+    repository: StorageRepository,
+    scan_id: str,
+    report: FuturesOpportunityScanReport,
+    response: FuturesOpportunityScanResponse,
+    quote_asset: str,
+    horizon: str,
+    max_symbols: int,
+    min_opportunity_score: int,
+) -> None:
+    """Persist scanner run and candidate rows for later review."""
+
+    all_candidates = report.long_candidates + report.short_candidates + report.neutral_candidates
+    candidate_count = len(all_candidates)
+    repository.upsert_scanner_run(
+        ScannerRunRecord(
+            id=scan_id,
+            generated_at=report.generated_at,
+            quote_asset=quote_asset,
+            horizon=horizon,
+            max_symbols=max_symbols,
+            min_opportunity_score=min_opportunity_score,
+            scan_state=report.scan_state,
+            scanned_count=report.scanned_count,
+            failed_symbols_json=json.dumps(report.failed_symbols),
+            warnings_json=json.dumps(report.warnings),
+            result_json=response.model_dump_json(),
+            candidate_count=candidate_count,
+        )
+    )
+    candidate_records = [
+        ScannerCandidateRecord(
+            id=f"{scan_id}:{signal.symbol}:{signal.direction}",
+            scanner_run_id=scan_id,
+            symbol=signal.symbol,
+            direction=signal.direction,
+            opportunity_score=signal.opportunity_score,
+            confidence=signal.confidence,
+            evidence_strength=signal.evidence_strength,
+            current_price=signal.current_price,
+            entry_zone=signal.suggested_entry_zone,
+            stop_loss=signal.suggested_stop_loss,
+            take_profit=signal.suggested_take_profit,
+            risk_grade=signal.risk_grade,
+            regime=signal.regime,
+            reason=signal.reason,
+            warnings_json=json.dumps(signal.warnings),
+            timestamp=signal.timestamp,
+        )
+        for signal in all_candidates
+    ]
+    repository.upsert_scanner_candidates(candidate_records)
+    repository.upsert_scanner_candidate_prices(
+        [
+            ScannerCandidatePriceRecord(
+                id=None,
+                scanner_candidate_id=f"{scan_id}:{signal.symbol}:{signal.direction}",
+                symbol=signal.symbol,
+                price=signal.current_price,
+                price_type=signal.price_type,
+                source=signal.data_source,
+                recorded_at=signal.timestamp,
+            )
+            for signal in all_candidates
+        ]
+    )
+
+
+def _persist_spot_scanner_run_candidates(
+    *,
+    repository: StorageRepository,
+    scan_id: str,
+    report: SpotOpportunityScanReport,
+    response: SpotOpportunityScanResponse,
+    quote_asset: str,
+    horizon: str,
+    max_symbols: int,
+    min_opportunity_score: int,
+) -> None:
+    """Persist Spot scanner run and candidates for later review."""
+
+    all_candidates = (
+        report.buy_candidates
+        + report.watch_candidates
+        + report.exit_watch_candidates
+        + report.avoid_candidates
+    )
+    candidate_count = len(all_candidates)
+    repository.upsert_scanner_run(
+        ScannerRunRecord(
+            id=scan_id,
+            generated_at=report.generated_at,
+            quote_asset=_spot_scanner_quote_key(quote_asset),
+            horizon=horizon,
+            max_symbols=max_symbols,
+            min_opportunity_score=min_opportunity_score,
+            scan_state=report.scan_state,
+            scanned_count=report.scanned_count,
+            failed_symbols_json=json.dumps(report.failed_symbols),
+            warnings_json=json.dumps(report.warnings),
+            result_json=response.model_dump_json(),
+            candidate_count=candidate_count,
+        )
+    )
+    candidate_records = [
+        ScannerCandidateRecord(
+            id=f"{scan_id}:{signal.symbol}:{signal.action}",
+            scanner_run_id=scan_id,
+            symbol=signal.symbol,
+            direction=signal.action,
+            opportunity_score=signal.opportunity_score,
+            confidence=signal.confidence,
+            evidence_strength=signal.evidence_strength,
+            current_price=signal.current_price,
+            entry_zone=signal.suggested_entry_zone,
+            stop_loss=signal.suggested_stop_loss,
+            take_profit=signal.suggested_take_profit,
+            risk_grade=signal.risk_grade,
+            regime=signal.regime,
+            reason=signal.reason,
+            warnings_json=json.dumps(signal.warnings),
+            timestamp=signal.timestamp,
+        )
+        for signal in all_candidates
+    ]
+    repository.upsert_scanner_candidates(candidate_records)
+    repository.upsert_scanner_candidate_prices(
+        [
+            ScannerCandidatePriceRecord(
+                id=None,
+                scanner_candidate_id=f"{scan_id}:{signal.symbol}:{signal.action}",
+                symbol=signal.symbol,
+                price=signal.current_price,
+                price_type=signal.price_type,
+                source=signal.data_source,
+                recorded_at=signal.timestamp,
+            )
+            for signal in all_candidates
+        ]
+    )
+
+
+def _persist_spot_scanner_validation_snapshots(
+    *,
+    repository: StorageRepository,
+    report: SpotOpportunityScanReport,
+    scan_id: str,
+) -> int:
+    """Persist Spot scanner candidates into validation snapshots."""
+
+    grouped: list[tuple[str, list[SpotOpportunitySignal]]] = [
+        ("spot_buy_candidate", report.buy_candidates),
+        ("spot_watch", report.watch_candidates),
+        ("spot_exit_watch", report.exit_watch_candidates),
+        ("spot_avoid", report.avoid_candidates),
+    ]
+    snapshots: list[ScannerValidationSnapshotRecord] = []
+    for group_name, signals in grouped:
+        for index, signal in enumerate(signals, start=1):
+            snapshots.append(
+                ScannerValidationSnapshotRecord(
+                    id=None,
+                    scan_id=scan_id,
+                    symbol=signal.symbol,
+                    direction=_spot_validation_direction(signal.action),
+                    price_at_scan=signal.current_price,
+                    opportunity_score=signal.opportunity_score,
+                    confidence=signal.confidence,
+                    horizon=signal.best_horizon,
+                    risk_grade=signal.risk_grade,
+                    trend_score=signal.trend_score,
+                    momentum_score=signal.momentum_score,
+                    volatility_quality_score=signal.volatility_quality_score,
+                    liquidity_score=signal.liquidity_score,
+                    risk_score=100 - signal.eligibility_score,
+                    direction_score=signal.structure_score,
+                    validation_score=signal.validation_score,
+                    evidence_strength=signal.evidence_strength,
+                    stop_loss=signal.suggested_stop_loss,
+                    take_profit=signal.suggested_take_profit,
+                    timestamp=signal.timestamp,
+                    rank_position=index,
+                    candidate_group=group_name,
+                    regime_label=signal.regime,
+                    data_source=signal.data_source,
+                )
+            )
+    return repository.insert_scanner_validation_snapshots(snapshots)
+
+
+def _latest_successful_scanner_response(
+    *,
+    repository: StorageRepository,
+    quote_asset: str,
+    horizon: str,
+    latest_error: str | None,
+    universe_source: FuturesSymbolUniverseSource,
+    fallback_symbol_count: int,
+) -> FuturesOpportunityScanResponse | None:
+    """Load the latest persisted full scanner result for degraded fallback."""
+
+    run = repository.get_latest_successful_scanner_run(quote_asset=quote_asset, horizon=horizon)
+    if run is None or not run.result_json:
+        return None
+    try:
+        cached = FuturesOpportunityScanResponse.model_validate(json.loads(run.result_json))
+    except Exception:
+        LOGGER.exception("Failed to parse cached scanner result %s.", run.id)
+        return None
+    warnings = [
+        "Binance API unavailable; showing last successful scanner result.",
+        *[
+            warning
+            for warning in cached.warnings
+            if warning != "Binance API unavailable; showing last successful scanner result."
+        ],
+    ]
+    return cached.model_copy(
+        update={
+            "scan_state": "degraded",
+            "warnings": warnings,
+            "data_source": "last_successful_cache",
+            "futures_symbol_universe_source": universe_source,
+            "latest_successful_scanner_at": run.generated_at,
+            "latest_scanner_error": latest_error,
+            "latest_error": latest_error,
+            "persisted_candidate_count": run.candidate_count,
+            "fallback_symbol_count": fallback_symbol_count,
+        }
+    )
+
+
+def _latest_successful_spot_scanner_response(
+    *,
+    repository: StorageRepository,
+    quote_asset: str,
+    horizon: str,
+    latest_error: str | None,
+) -> SpotOpportunityScanResponse | None:
+    """Load the latest persisted full Spot scanner result for degraded fallback."""
+
+    run = repository.get_latest_successful_scanner_run(
+        quote_asset=_spot_scanner_quote_key(quote_asset),
+        horizon=horizon,
+    )
+    if run is None or not run.result_json:
+        return None
+    try:
+        cached = SpotOpportunityScanResponse.model_validate(json.loads(run.result_json))
+    except Exception:
+        LOGGER.exception("Failed to parse cached Spot scanner result %s.", run.id)
+        return None
+    warnings = [
+        "Binance Spot API unavailable; showing last successful Spot scanner result.",
+        *[
+            warning
+            for warning in cached.warnings
+            if warning != "Binance Spot API unavailable; showing last successful Spot scanner result."
+        ],
+    ]
+    return cached.model_copy(
+        update={
+            "scan_state": "degraded",
+            "warnings": warnings,
+            "data_source": "last_successful_cache",
+            "latest_successful_scanner_at": run.generated_at,
+            "latest_error": latest_error,
+            "persisted_candidate_count": run.candidate_count,
+        }
+    )
+
+
+def _empty_degraded_spot_scanner_response(
+    *,
+    quote_asset: str,
+    latest_error: str | None,
+    failed_symbols: list[str] | None = None,
+) -> SpotOpportunityScanResponse:
+    return SpotOpportunityScanResponse(
+        generated_at=datetime.now(tz=UTC),
+        scan_state="degraded",
+        warnings=["No cached Spot scanner results are available and the Spot symbol universe is unavailable."],
+        scanned_count=0,
+        failed_symbols=failed_symbols or [],
+        data_source="empty_degraded",
+        quote_asset=quote_asset,
+        symbol_count=0,
+        latest_successful_scanner_at=None,
+        latest_error=latest_error,
+        persisted_candidate_count=0,
+    )
+
+
+def _empty_degraded_scanner_response(
+    *,
+    universe_source: FuturesSymbolUniverseSource,
+    latest_error: str | None,
+    fallback_symbol_count: int,
+    failed_symbols: list[str] | None = None,
+) -> FuturesOpportunityScanResponse:
+    """Return a stable empty scanner state when no cached result exists."""
+
+    warning = "No scanner results yet. Run scanner when Binance API is available."
+    if universe_source == "fallback":
+        warning = "No fallback symbols could be scanned. Run scanner again when Binance USD-M klines are available."
+    elif universe_source == "unavailable":
+        warning = "No cached scanner results are available and the USD-M symbol universe is unavailable."
+    return FuturesOpportunityScanResponse(
+        generated_at=datetime.now(tz=UTC),
+        scan_state="degraded",
+        warnings=[warning],
+        scanned_count=0,
+        failed_symbols=failed_symbols or [],
+        futures_symbol_universe_source=universe_source,
+        symbol_count=0,
+        last_successful_fetch_at=None,
+        latest_error=latest_error,
+        data_source="empty_degraded",
+        latest_successful_scanner_at=None,
+        latest_scanner_error=latest_error,
+        persisted_candidate_count=0,
+        fallback_symbol_count=fallback_symbol_count,
+    )
+
+
+def _to_futures_scan_job_response(job: FuturesScannerJob) -> FuturesOpportunityScanJobResponse:
+    return FuturesOpportunityScanJobResponse(
+        scan_id=job.scan_id,
+        status=job.status,
+        total_symbols=job.total_symbols,
+        scanned_symbols=job.scanned_symbols,
+        current_symbol=job.current_symbol,
+        current_phase=job.current_phase,
+        started_at=job.started_at,
+        updated_at=job.updated_at,
+        completed_at=job.completed_at,
+        scan=job.response,
+        warnings=list(job.warnings),
+        failed_symbols=list(job.failed_symbols),
+        latest_error=job.latest_error,
+    )
+
+
+def _to_spot_scan_job_response(job: SpotScannerJob) -> SpotOpportunityScanJobResponse:
+    return SpotOpportunityScanJobResponse(
+        scan_id=job.scan_id,
+        status=job.status,
+        total_symbols=job.total_symbols,
+        scanned_symbols=job.scanned_symbols,
+        current_symbol=job.current_symbol,
+        current_phase=job.current_phase,
+        started_at=job.started_at,
+        updated_at=job.updated_at,
+        completed_at=job.completed_at,
+        scan=job.response,
+        warnings=list(job.warnings),
+        failed_symbols=list(job.failed_symbols),
+        latest_error=job.latest_error,
+    )
+
+
+def _build_async_spot_scan_report(
+    *,
+    scanner: SpotOpportunityScanner,
+    signals: list[SpotOpportunitySignal],
+    failed_symbols: list[str],
+    include_avoid: bool,
+    scanned_symbols: int,
+    partial: bool,
+) -> SpotOpportunityScanReport:
+    report = scanner.build_report(
+        signals=signals,
+        failed_symbols=failed_symbols,
+        include_avoid=include_avoid,
+    )
+    report.scanned_count = scanned_symbols
+    if partial:
+        report.scan_state = "partial"
+        if "Spot scanner is still running; partial results are shown." not in report.warnings:
+            report.warnings.append("Spot scanner is still running; partial results are shown.")
+    return report
+
+
+async def _run_spot_opportunity_scan_job(
+    *,
+    scan_id: str,
+    settings: Settings,
+    rest_client: BinanceRestClient | None,
+) -> None:
+    job = _SPOT_SCANNER_JOB_MANAGER.get(scan_id)
+    if job is None:
+        return
+
+    request = job.request
+    normalized_quote = request.quote_asset.strip().upper() or "USDT"
+    scan_limit = min(
+        request.max_symbols if request.max_symbols is not None else request.limit if request.limit is not None else 50,
+        100,
+    )
+    try:
+        normalized_horizon = _normalize_futures_scanner_horizon(request.horizon)
+    except ValueError as exc:
+        _SPOT_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            status="failed",
+            current_phase="failed",
+            completed_at=now_utc(),
+            latest_error=str(exc),
+            warnings=[str(exc)],
+        )
+        return
+
+    scanner = SpotOpportunityScanner()
+    worker_rest_client = rest_client or BinanceRestClient(settings)
+    close_worker_rest_client = rest_client is None
+    repository = StorageRepository(settings.database_url)
+    signals: list[SpotOpportunitySignal] = []
+    failed_symbols: list[str] = []
+    candle_cache: dict[tuple[str, SupportedInterval], list[Candle]] = {}
+    semaphore = asyncio.Semaphore(request.concurrency)
+    current_threshold = max(request.min_opportunity_score, request.min_confidence)
+    total_started_at = time.perf_counter()
+
+    async def scan_symbol(record: SpotSymbolRecord) -> SpotOpportunitySignal | None:
+        async with semaphore:
+            current_job = _SPOT_SCANNER_JOB_MANAGER.get(scan_id)
+            if current_job is not None and current_job.cancel_requested:
+                return None
+            _SPOT_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                current_symbol=record.symbol,
+                current_phase="spot_candle_fetch",
+            )
+            try:
+                signal = await asyncio.wait_for(
+                    _build_market_wide_spot_signal_for_symbol(
+                        scanner=scanner,
+                        symbol=record.symbol,
+                        horizon=normalized_horizon,
+                        repository=repository,
+                        rest_client=worker_rest_client,
+                        candle_cache=candle_cache,
+                    ),
+                    timeout=request.symbol_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                LOGGER.warning(
+                    "Timed out paper Spot scan; scan_id=%s symbol=%s timeout_seconds=%.1f",
+                    scan_id,
+                    record.symbol,
+                    request.symbol_timeout_seconds,
+                )
+                failed_symbols.append(record.symbol)
+                return None
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("Failed to scan paper Spot opportunity; scan_id=%s symbol=%s", scan_id, record.symbol)
+                failed_symbols.append(record.symbol)
+                return None
+
+            if signal.action == "buy_candidate":
+                if signal.opportunity_score < current_threshold or signal.confidence < request.min_confidence:
+                    return None
+                return signal
+            if signal.action in {"watch", "exit_watch"} or request.include_avoid:
+                return signal
+            return None
+
+    try:
+        _SPOT_SCANNER_JOB_MANAGER.update(scan_id, status="running", current_phase="loading_spot_universe")
+        symbol_service = SpotSymbolService(worker_rest_client)
+        candidates = await symbol_service.search_symbols(query="", limit=scan_limit)
+        candidates = [record for record in candidates if record.quote_asset.upper() == normalized_quote]
+        _SPOT_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            total_symbols=len(candidates),
+            current_phase="spot_universe_ready",
+        )
+        if not candidates:
+            latest_error = f"No active Binance Spot {normalized_quote} symbols are available."
+            cached_response = _latest_successful_spot_scanner_response(
+                repository=repository,
+                quote_asset=normalized_quote,
+                horizon=normalized_horizon,
+                latest_error=latest_error,
+            )
+            response = cached_response or _empty_degraded_spot_scanner_response(
+                quote_asset=normalized_quote,
+                latest_error=latest_error,
+            )
+            _SPOT_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                status="failed",
+                current_phase="failed",
+                completed_at=now_utc(),
+                response=response,
+                latest_error=latest_error,
+                warnings=list(response.warnings),
+            )
+            return
+
+        deadline = time.perf_counter() + request.scan_timeout_seconds
+        batch_size = min(10, max(5, request.batch_size))
+        for start_index in range(0, len(candidates), batch_size):
+            current_job = _SPOT_SCANNER_JOB_MANAGER.get(scan_id)
+            if current_job is None or current_job.cancel_requested:
+                raise asyncio.CancelledError()
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                failed_symbols.extend(record.symbol for record in candidates[start_index:])
+                break
+            batch = candidates[start_index:start_index + batch_size]
+            _SPOT_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                status="running" if not signals else "partial",
+                current_symbol=batch[0].symbol if batch else None,
+                current_phase="scanning_spot_batch",
+            )
+            task_by_symbol = {
+                asyncio.create_task(scan_symbol(record), name=f"spot-scan-job-{scan_id}-{record.symbol}"): record.symbol
+                for record in batch
+            }
+            done, pending = await asyncio.wait(task_by_symbol.keys(), timeout=max(0.1, remaining))
+            for task in pending:
+                symbol = task_by_symbol[task]
+                task.cancel()
+                failed_symbols.append(symbol)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            current_job = _SPOT_SCANNER_JOB_MANAGER.get(scan_id)
+            if current_job is None or current_job.cancel_requested:
+                raise asyncio.CancelledError()
+            for task in done:
+                result = task.result()
+                if result is not None:
+                    signals.append(result)
+
+            scanned_symbols = min(start_index + len(batch), len(candidates))
+            partial = scanned_symbols < len(candidates)
+            _SPOT_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                scanned_symbols=scanned_symbols,
+                failed_symbols=list(failed_symbols),
+                current_phase="ranking_spot_partial" if partial else "ranking_spot_final",
+            )
+            report = _build_async_spot_scan_report(
+                scanner=scanner,
+                signals=signals,
+                failed_symbols=failed_symbols,
+                include_avoid=request.include_avoid,
+                scanned_symbols=scanned_symbols,
+                partial=partial,
+            )
+            response = _to_spot_scan_response(
+                report,
+                quote_asset=normalized_quote,
+                symbol_count=len(candidates),
+            )
+            _SPOT_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                status="partial" if partial else "running",
+                response=response,
+                warnings=list(report.warnings),
+            )
+            if pending:
+                break
+
+        current_job = _SPOT_SCANNER_JOB_MANAGER.get(scan_id)
+        if current_job is None or current_job.cancel_requested:
+            raise asyncio.CancelledError()
+        report = _build_async_spot_scan_report(
+            scanner=scanner,
+            signals=signals,
+            failed_symbols=failed_symbols,
+            include_avoid=request.include_avoid,
+            scanned_symbols=min(len(candidates), current_job.scanned_symbols),
+            partial=bool(failed_symbols) and bool(signals),
+        )
+        if not signals and failed_symbols:
+            latest_error = "spot_klines_unavailable: no requested Spot symbols returned candles."
+            cached_response = _latest_successful_spot_scanner_response(
+                repository=repository,
+                quote_asset=normalized_quote,
+                horizon=normalized_horizon,
+                latest_error=latest_error,
+            )
+            response = cached_response or _empty_degraded_spot_scanner_response(
+                quote_asset=normalized_quote,
+                latest_error=latest_error,
+                failed_symbols=failed_symbols,
+            )
+        else:
+            response = _to_spot_scan_response(
+                report,
+                quote_asset=normalized_quote,
+                symbol_count=len(candidates),
+            )
+            _SPOT_SCANNER_JOB_MANAGER.update(scan_id, current_phase="persisting_spot_completed")
+            try:
+                _persist_spot_scanner_run_candidates(
+                    repository=repository,
+                    scan_id=scan_id,
+                    report=report,
+                    response=response,
+                    quote_asset=normalized_quote,
+                    horizon=normalized_horizon,
+                    max_symbols=scan_limit,
+                    min_opportunity_score=request.min_opportunity_score,
+                )
+                response.persisted_candidate_count = (
+                    len(report.buy_candidates)
+                    + len(report.watch_candidates)
+                    + len(report.exit_watch_candidates)
+                    + len(report.avoid_candidates)
+                )
+            except Exception:
+                LOGGER.exception("Failed to persist async Spot scanner run candidates.")
+                response.warnings.append("Spot scanner candidate persistence failed; visible results are still usable for this session.")
+            try:
+                _persist_spot_scanner_validation_snapshots(
+                    repository=repository,
+                    report=report,
+                    scan_id=scan_id,
+                )
+            except Exception:
+                LOGGER.exception("Failed to persist async Spot scanner validation snapshots.")
+                response.warnings.append(
+                    "Spot scanner validation snapshot persistence failed; this scan will not be included in scanner validation reports."
+                )
+            _persist_spot_scanner_outcome_snapshots(repository=repository, report=report)
+
+        _SPOT_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            status="completed",
+            scanned_symbols=response.scanned_count,
+            current_symbol=None,
+            current_phase="completed",
+            completed_at=now_utc(),
+            response=response,
+            failed_symbols=list(response.failed_symbols),
+            warnings=list(response.warnings),
+            latest_error=response.latest_error,
+        )
+        LOGGER.info("Async Spot scanner total scan time %.3fs scan_id=%s.", time.perf_counter() - total_started_at, scan_id)
+    except asyncio.CancelledError:
+        current = _SPOT_SCANNER_JOB_MANAGER.get(scan_id)
+        _SPOT_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            status="cancelled",
+            current_symbol=None,
+            current_phase="cancelled",
+            completed_at=now_utc(),
+            response=current.response if current is not None else None,
+            latest_error="Spot scan cancelled by user.",
+            warnings=["Spot scan cancelled. Partial results remain advisory-only."] if current is not None and current.response is not None else ["Spot scan cancelled."],
+        )
+    except Exception as exc:
+        LOGGER.exception("Async Spot scanner job failed; scan_id=%s.", scan_id)
+        latest_error = f"{type(exc).__name__}: {exc}"
+        cached_response = None
+        try:
+            cached_response = _latest_successful_spot_scanner_response(
+                repository=repository,
+                quote_asset=normalized_quote,
+                horizon=normalized_horizon,
+                latest_error=latest_error,
+            )
+        except Exception:
+            LOGGER.exception("Failed to load cached Spot scanner response after scan failure.")
+        _SPOT_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            status="failed",
+            current_symbol=None,
+            current_phase="failed",
+            completed_at=now_utc(),
+            response=cached_response,
+            latest_error=latest_error,
+            warnings=["Spot scanner failed. Last successful results are still shown."],
+        )
+    finally:
+        repository.close()
+        if close_worker_rest_client:
+            await worker_rest_client.close()
+
+
+def _build_async_futures_scan_report(
+    *,
+    scanner: FuturesOpportunityScanner,
+    signals: list[FuturesPaperSignal],
+    failed_symbols: list[str],
+    include_avoid: bool,
+    universe_source: FuturesSymbolUniverseSource,
+    symbol_count: int,
+    scanned_symbols: int,
+    last_successful_fetch_at: datetime | None,
+    latest_error: str | None,
+    universe_warnings: list[str],
+    partial: bool,
+) -> FuturesOpportunityScanReport:
+    report = scanner.build_report(
+        signals=signals,
+        failed_symbols=failed_symbols,
+        include_avoid=include_avoid,
+    )
+    report.scanned_count = scanned_symbols
+    report.futures_symbol_universe_source = universe_source
+    report.symbol_count = symbol_count
+    report.last_successful_fetch_at = last_successful_fetch_at
+    report.latest_error = latest_error
+    report.warnings.extend(universe_warnings)
+    if partial:
+        report.scan_state = "partial"
+        if "Scanner is still running; partial results are shown." not in report.warnings:
+            report.warnings.append("Scanner is still running; partial results are shown.")
+    elif universe_source in {"cache", "fallback"} and report.scan_state == "ready":
+        report.scan_state = "partial"
+    return report
+
+
+async def _run_futures_opportunity_scan_job(
+    *,
+    scan_id: str,
+    settings: Settings,
+    rest_client: BinanceRestClient | None,
+) -> None:
+    job = _FUTURES_SCANNER_JOB_MANAGER.get(scan_id)
+    if job is None:
+        return
+
+    request = job.request
+    normalized_quote = request.quote_asset.strip().upper() or "USDT"
+    scan_limit = min(
+        request.max_symbols if request.max_symbols is not None else request.limit if request.limit is not None else 50,
+        100,
+    )
+    fallback_symbol_count = len(_manual_futures_symbol_fallback(normalized_quote))
+    try:
+        normalized_horizon = _normalize_futures_scanner_horizon(request.horizon)
+    except ValueError as exc:
+        _FUTURES_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            status="failed",
+            current_phase="failed",
+            completed_at=now_utc(),
+            latest_error=str(exc),
+            warnings=[str(exc)],
+        )
+        return
+
+    scanner = FuturesOpportunityScanner()
+    total_started_at = time.perf_counter()
+    worker_rest_client = rest_client or BinanceRestClient(settings)
+    close_worker_rest_client = rest_client is None
+    repository = StorageRepository(settings.database_url)
+    signals: list[FuturesPaperSignal] = []
+    failed_symbols: list[str] = []
+    candle_cache: dict[tuple[str, SupportedInterval], list[Candle]] = {}
+    semaphore = asyncio.Semaphore(request.concurrency)
+    threshold_floor = 60 if request.market_sensitivity == "aggressive" else 0
+    sensitivity_discount = 8 if request.market_sensitivity == "aggressive" else 0
+    current_threshold = max(threshold_floor, max(request.min_opportunity_score, request.min_confidence) - sensitivity_discount)
+
+    async def scan_symbol(record: SpotSymbolRecord) -> FuturesPaperSignal | None:
+        async with semaphore:
+            current_job = _FUTURES_SCANNER_JOB_MANAGER.get(scan_id)
+            if current_job is not None and current_job.cancel_requested:
+                return None
+            symbol_started_at = time.perf_counter()
+            _FUTURES_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                current_symbol=record.symbol,
+                current_phase="futures_candle_fetch",
+            )
+            try:
+                signal = await asyncio.wait_for(
+                    _build_market_wide_futures_signal_for_symbol(
+                        scanner=scanner,
+                        symbol=record.symbol,
+                        horizon=normalized_horizon,
+                        repository=repository,
+                        rest_client=worker_rest_client,
+                        settings=settings,
+                        candle_cache=candle_cache,
+                        market_sensitivity=request.market_sensitivity,
+                    ),
+                    timeout=request.symbol_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                LOGGER.warning(
+                    "Timed out futures-paper async scan; scan_id=%s phase=symbol_scan symbol=%s endpoint=/fapi/v1/klines exception_type=TimeoutError timeout_seconds=%.1f",
+                    scan_id,
+                    record.symbol,
+                    request.symbol_timeout_seconds,
+                )
+                failed_symbols.append(record.symbol)
+                return None
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception(
+                    "Failed to scan async paper futures opportunity; scan_id=%s phase=symbol_scan symbol=%s endpoint=/fapi/v1/klines",
+                    scan_id,
+                    record.symbol,
+                )
+                failed_symbols.append(record.symbol)
+                return None
+            finally:
+                LOGGER.debug(
+                    "Async futures scanner symbol %s finished in %.3fs.",
+                    record.symbol,
+                    time.perf_counter() - symbol_started_at,
+                )
+
+            weak_validation = signal.evidence_strength in {"insufficient", "unvalidated", "weak"}
+            if signal.direction in {"long", "short"}:
+                if signal.opportunity_score < current_threshold:
+                    return None
+                if weak_validation and not request.include_weak_evidence:
+                    return None
+                return signal
+            if signal.direction == "wait" or request.include_avoid:
+                return signal
+            return None
+
+    try:
+        _FUTURES_SCANNER_JOB_MANAGER.update(scan_id, status="running", current_phase="loading_universe")
+        universe_started_at = time.perf_counter()
+        universe = await _load_futures_symbol_universe(
+            rest_client=worker_rest_client,
+            quote_asset=normalized_quote,
+            limit=scan_limit,
+        )
+        LOGGER.info(
+            "Async futures scanner universe load %.3fs source=%s symbols=%d scan_id=%s.",
+            time.perf_counter() - universe_started_at,
+            universe.source,
+            len(universe.records),
+            scan_id,
+        )
+        candidates = universe.records
+        _FUTURES_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            total_symbols=len(candidates),
+            current_phase="symbol_universe_ready",
+        )
+        if universe.source == "unavailable" or not candidates:
+            latest_error = universe.latest_error or "No USD-M Futures symbol universe is available."
+            cached_response = _latest_successful_scanner_response(
+                repository=repository,
+                quote_asset=normalized_quote,
+                horizon=normalized_horizon,
+                latest_error=latest_error,
+                universe_source=universe.source,
+                fallback_symbol_count=fallback_symbol_count,
+            )
+            response = cached_response or _empty_degraded_scanner_response(
+                universe_source=universe.source,
+                latest_error=latest_error,
+                fallback_symbol_count=fallback_symbol_count,
+            )
+            _FUTURES_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                status="failed",
+                current_phase="failed",
+                completed_at=now_utc(),
+                response=response,
+                latest_error=latest_error,
+                warnings=["Scanner failed. Last successful results are still shown."],
+            )
+            return
+
+        universe_warnings: list[str] = []
+        if universe.source == "cache":
+            universe_warnings.append(
+                "Using cached USD-M Futures symbol universe because live Binance exchangeInfo is unavailable or recently cached."
+            )
+        elif universe.source == "fallback":
+            universe_warnings.append("Live USD-M symbol universe unavailable; using curated fallback list.")
+
+        deadline = time.perf_counter() + request.scan_timeout_seconds
+        batch_size = min(10, max(5, request.batch_size))
+        scan_started_at = time.perf_counter()
+        for start_index in range(0, len(candidates), batch_size):
+            current_job = _FUTURES_SCANNER_JOB_MANAGER.get(scan_id)
+            if current_job is None or current_job.cancel_requested:
+                raise asyncio.CancelledError()
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                remaining_symbols = [record.symbol for record in candidates[start_index:]]
+                failed_symbols.extend(remaining_symbols)
+                break
+            batch = candidates[start_index:start_index + batch_size]
+            _FUTURES_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                status="running" if not signals else "partial",
+                current_symbol=batch[0].symbol if batch else None,
+                current_phase="scanning_batch",
+            )
+            task_by_symbol = {
+                asyncio.create_task(scan_symbol(record), name=f"futures-scan-job-{scan_id}-{record.symbol}"): record.symbol
+                for record in batch
+            }
+            done, pending = await asyncio.wait(task_by_symbol.keys(), timeout=max(0.1, remaining))
+            for task in pending:
+                symbol = task_by_symbol[task]
+                task.cancel()
+                failed_symbols.append(symbol)
+                LOGGER.warning(
+                    "Async futures scanner request timed out; scan_id=%s phase=scan_timeout symbol=%s endpoint=/bot/futures-opportunities/scan exception_type=TimeoutError timeout_seconds=%.1f",
+                    scan_id,
+                    symbol,
+                    request.scan_timeout_seconds,
+                )
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            current_job = _FUTURES_SCANNER_JOB_MANAGER.get(scan_id)
+            if current_job is None or current_job.cancel_requested:
+                raise asyncio.CancelledError()
+            for task in done:
+                result = task.result()
+                if result is not None:
+                    signals.append(result)
+
+            scanned_symbols = min(start_index + len(batch), len(candidates))
+            partial = scanned_symbols < len(candidates)
+            _FUTURES_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                scanned_symbols=scanned_symbols,
+                failed_symbols=list(failed_symbols),
+                current_phase="ranking_partial" if partial else "ranking_final",
+            )
+            ranking_started_at = time.perf_counter()
+            report = _build_async_futures_scan_report(
+                scanner=scanner,
+                signals=signals,
+                failed_symbols=failed_symbols,
+                include_avoid=request.include_avoid,
+                universe_source=universe.source,
+                symbol_count=len(candidates),
+                scanned_symbols=scanned_symbols,
+                last_successful_fetch_at=universe.last_successful_fetch_at,
+                latest_error=universe.latest_error,
+                universe_warnings=universe_warnings,
+                partial=partial,
+            )
+            response = _to_futures_scan_response(report)
+            LOGGER.info(
+                "Async futures scanner ranking %.3fs scan_id=%s scanned=%d/%d candidates=%d.",
+                time.perf_counter() - ranking_started_at,
+                scan_id,
+                scanned_symbols,
+                len(candidates),
+                len(signals),
+            )
+            _FUTURES_SCANNER_JOB_MANAGER.update(
+                scan_id,
+                status="partial" if partial else "running",
+                response=response,
+                long_candidates=list(report.long_candidates),
+                short_candidates=list(report.short_candidates),
+                neutral_candidates=list(report.neutral_candidates),
+                warnings=list(report.warnings),
+            )
+            if pending:
+                break
+
+        LOGGER.info(
+            "Async futures scanner analyzed %d/%d symbols in %.3fs with concurrency=%d scan_id=%s.",
+            len(signals),
+            len(candidates),
+            time.perf_counter() - scan_started_at,
+            request.concurrency,
+            scan_id,
+        )
+        current_job = _FUTURES_SCANNER_JOB_MANAGER.get(scan_id)
+        if current_job is None or current_job.cancel_requested:
+            raise asyncio.CancelledError()
+        scanned_total = current_job.scanned_symbols
+        report = _build_async_futures_scan_report(
+            scanner=scanner,
+            signals=signals,
+            failed_symbols=failed_symbols,
+            include_avoid=request.include_avoid,
+            universe_source=universe.source,
+            symbol_count=len(candidates),
+            scanned_symbols=min(len(candidates), scanned_total),
+            last_successful_fetch_at=universe.last_successful_fetch_at,
+            latest_error=universe.latest_error,
+            universe_warnings=universe_warnings,
+            partial=bool(failed_symbols) and len(signals) > 0,
+        )
+        if not signals and failed_symbols:
+            latest_error = universe.latest_error or "futures_klines_unavailable: no requested futures symbols returned candles."
+            cached_response = _latest_successful_scanner_response(
+                repository=repository,
+                quote_asset=normalized_quote,
+                horizon=normalized_horizon,
+                latest_error=latest_error,
+                universe_source=universe.source,
+                fallback_symbol_count=fallback_symbol_count,
+            )
+            response = cached_response or _empty_degraded_scanner_response(
+                universe_source=universe.source,
+                latest_error=latest_error,
+                fallback_symbol_count=fallback_symbol_count,
+                failed_symbols=failed_symbols,
+            )
+        else:
+            response = _to_futures_scan_response(report)
+            _FUTURES_SCANNER_JOB_MANAGER.update(scan_id, current_phase="persisting_completed")
+            try:
+                _persist_scanner_run_candidates(
+                    repository=repository,
+                    scan_id=scan_id,
+                    report=report,
+                    response=response,
+                    quote_asset=normalized_quote,
+                    horizon=normalized_horizon,
+                    max_symbols=scan_limit,
+                    min_opportunity_score=request.min_opportunity_score,
+                )
+            except Exception:
+                LOGGER.exception("Failed to persist async futures scanner run candidates.")
+                response.warnings.append("Scanner candidate persistence failed; visible results are still usable for this session.")
+            try:
+                persist_scanner_validation_snapshots(repository=repository, report=report, scan_id=scan_id)
+            except Exception:
+                LOGGER.exception("Failed to persist async futures scanner validation snapshots.")
+                response.warnings.append(
+                    "Scanner validation snapshot persistence failed; this scan will not be included in paper validation reports."
+                )
+            _persist_scanner_outcome_snapshots(repository=repository, report=report)
+
+        completed_at = now_utc()
+        _FUTURES_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            status="completed",
+            scanned_symbols=response.scanned_count,
+            current_symbol=None,
+            current_phase="completed",
+            completed_at=completed_at,
+            response=response,
+            long_candidates=list(report.long_candidates) if signals else [],
+            short_candidates=list(report.short_candidates) if signals else [],
+            neutral_candidates=list(report.neutral_candidates) if signals else [],
+            failed_symbols=list(failed_symbols),
+            warnings=list(response.warnings),
+            latest_error=response.latest_error,
+        )
+        LOGGER.info("Async futures scanner total scan time %.3fs scan_id=%s.", time.perf_counter() - total_started_at, scan_id)
+    except asyncio.CancelledError:
+        current = _FUTURES_SCANNER_JOB_MANAGER.get(scan_id)
+        _FUTURES_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            status="cancelled",
+            current_symbol=None,
+            current_phase="cancelled",
+            completed_at=now_utc(),
+            response=current.response if current is not None else None,
+            latest_error="Scan cancelled by user.",
+            warnings=["Scan cancelled. Partial results remain advisory-only."] if current is not None and current.response is not None else ["Scan cancelled."],
+        )
+    except Exception as exc:
+        LOGGER.exception("Async futures scanner job failed; scan_id=%s.", scan_id)
+        latest_error = f"{type(exc).__name__}: {exc}"
+        cached_response = None
+        try:
+            cached_response = _latest_successful_scanner_response(
+                repository=repository,
+                quote_asset=normalized_quote,
+                horizon=normalized_horizon,
+                latest_error=latest_error,
+                universe_source="unavailable",
+                fallback_symbol_count=fallback_symbol_count,
+            )
+        except Exception:
+            LOGGER.exception("Failed to load cached scanner response after async scan failure.")
+        _FUTURES_SCANNER_JOB_MANAGER.update(
+            scan_id,
+            status="failed",
+            current_symbol=None,
+            current_phase="failed",
+            completed_at=now_utc(),
+            response=cached_response,
+            latest_error=latest_error,
+            warnings=["Scanner failed. Last successful results are still shown."],
+        )
+    finally:
+        repository.close()
+        if close_worker_rest_client:
+            await worker_rest_client.close()
+
+
+def _assistant_signal_type(decision: str) -> str:
+    if decision == "buy":
+        return "BUY"
+    if decision == "sell_exit":
+        return "SELL"
+    if decision == "avoid":
+        return "AVOID"
+    return "WAIT"
+
+
+def _eligibility_signal_type(status: str, assistant_decision: str) -> str:
+    if status == "eligible":
+        return _assistant_signal_type(assistant_decision)
+    if status == "not_eligible":
+        return "AVOID"
+    return "WAIT"
+
+
+def _scanner_signal_type(direction: str) -> str:
+    if direction == "long":
+        return "BUY"
+    if direction == "short":
+        return "SELL"
+    if direction == "avoid":
+        return "AVOID"
+    return "WAIT"
+
+
+def _spot_scanner_quote_key(quote_asset: str) -> str:
+    return f"SPOT:{quote_asset.strip().upper() or 'USDT'}"
+
+
+def _spot_validation_direction(action: str) -> str:
+    if action == "buy_candidate":
+        return "long"
+    if action == "exit_watch":
+        return "wait"
+    if action == "avoid":
+        return "avoid"
+    return "wait"
+
+
+def _spot_scanner_signal_type(action: str) -> str:
+    if action == "buy_candidate":
+        return "BUY"
+    if action == "exit_watch":
+        return "SELL"
+    if action == "avoid":
+        return "AVOID"
+    return "WAIT"
+
+
+async def _build_market_wide_spot_signal_for_symbol(
+    *,
+    scanner: SpotOpportunityScanner,
+    symbol: str,
+    horizon: str,
+    repository: StorageRepository,
+    rest_client: BinanceRestClient,
+    candle_cache: dict[tuple[str, SupportedInterval], list[Candle]] | None = None,
+) -> SpotOpportunitySignal:
+    """Build one scanner signal from stored/fresh Binance Spot OHLCV data."""
+
+    started_at = time.perf_counter()
+    candles_15m = await _load_or_fetch_spot_scan_candles(
+        repository=repository,
+        rest_client=rest_client,
+        symbol=symbol,
+        interval="15m",
+        lookback_days=7,
+        candle_cache=candle_cache,
+    )
+    technical_analysis: TechnicalAnalysisSnapshot | None = None
+    feature_snapshot: FeatureSnapshot | None = None
+    if len(candles_15m) >= 24:
+        try:
+            feature_snapshot = FeatureEngine(FeatureConfig()).build_snapshot(candles_15m)
+            technical_analysis = TechnicalAnalysisService().analyze(
+                symbol=symbol,
+                candles=candles_15m,
+                feature_snapshot=feature_snapshot,
+            )
+        except Exception:
+            LOGGER.exception("Failed to build Spot scanner technical analysis for %s.", symbol)
+            technical_analysis = None
+            feature_snapshot = None
+    pattern_analysis = None
+    try:
+        pattern_analysis = HorizonPatternAnalysisService().analyze(
+            symbol=symbol,
+            horizon=horizon,
+            points=[_to_pattern_point_from_candle(candle) for candle in candles_15m],
+            runtime_active=False,
+        )
+    except Exception:
+        LOGGER.exception("Failed to build Spot scanner pattern analysis for %s.", symbol)
+    regime_analysis = None
+    try:
+        regime_analysis = RegimeAnalysisService().analyze(
+            symbol=symbol,
+            horizon=horizon,
+            candles=candles_15m,
+            technical_analysis=technical_analysis,
+            pattern_analysis=pattern_analysis,
+            feature_snapshot=feature_snapshot,
+        )
+    except Exception:
+        LOGGER.exception("Failed to build Spot scanner regime analysis for %s.", symbol)
+    validation_report = None
+    try:
+        validation_report = _signal_validation_report_for_symbol(
+            repository=repository,
+            symbol=symbol,
+            horizon=horizon,
+        )
+    except Exception:
+        LOGGER.exception("Failed to build Spot scanner validation report for %s.", symbol)
+    liquidity_bias = estimate_liquidity_bias(
+        LiquidityBiasInput(
+            symbol=symbol,
+            candles=candles_15m,
+            volatility_regime=(
+                technical_analysis.volatility_regime
+                if technical_analysis is not None and technical_analysis.data_state == "ready"
+                else None
+            ),
+        )
+    )
+    liquidity_zones = estimate_liquidity_zones(
+        symbol=symbol,
+        candles=candles_15m,
+        current_price=candles_15m[-1].close if candles_15m else None,
+        trade_direction="long",
+        liquidity_bias=liquidity_bias,
+        regime_label=regime_analysis.regime_label if regime_analysis is not None else None,
+        atr=feature_snapshot.atr if feature_snapshot is not None else None,
+    )
+    momentum_edge = _spot_expected_edge_pct(candles_15m)
+    blocker_reasons = _spot_scanner_blockers(
+        technical_analysis=technical_analysis,
+        regime_analysis=regime_analysis,
+        candles=candles_15m,
+    )
+    eligibility = evaluate_trade_eligibility(
+        TradeEligibilityInput(
+            symbol=symbol,
+            action="buy",
+            confidence=_spot_preliminary_confidence(technical_analysis=technical_analysis, candles=candles_15m),
+            risk_grade=_spot_preliminary_risk_grade(regime_analysis=regime_analysis, candles=candles_15m),
+            preferred_horizon=horizon,
+            expected_edge_pct=momentum_edge,
+            estimated_cost_pct=Decimal("0.20"),
+            blocker_reasons=blocker_reasons,
+            current_warnings=(),
+            regime_label=regime_analysis.regime_label if regime_analysis is not None else None,
+            regime_confidence=regime_analysis.confidence if regime_analysis is not None else None,
+            regime_warnings=regime_analysis.risk_warnings if regime_analysis is not None else (),
+            regime_avoid_conditions=regime_analysis.avoid_conditions if regime_analysis is not None else (),
+            similar_setup=None,
+            signal_validation=validation_report,
+            liquidity_bias=liquidity_bias,
+            liquidity_zones=liquidity_zones,
+        )
+    )
+    signal = scanner.build_signal(
+        SpotScannerContext(
+            symbol=symbol,
+            candles=candles_15m,
+            technical_analysis=technical_analysis,
+            regime_analysis=regime_analysis,
+            signal_validation=validation_report,
+            trade_eligibility=eligibility,
+            spread_ratio_pct=None,
+            current_position_quantity=Decimal("0"),
+            horizon=horizon,
+        )
+    )
+    LOGGER.info("Spot scanner analysis completed in %.3fs symbol=%s.", time.perf_counter() - started_at, symbol)
+    return signal
+
+
+async def _load_or_fetch_spot_scan_candles(
+    *,
+    repository: StorageRepository,
+    rest_client: BinanceRestClient,
+    symbol: str,
+    interval: SupportedInterval,
+    lookback_days: int,
+    candle_cache: dict[tuple[str, SupportedInterval], list[Candle]] | None = None,
+) -> list[Candle]:
+    """Load cached Spot candles before fetching Binance Spot klines."""
+
+    cache_key = (symbol.upper(), interval)
+    if candle_cache is not None and cache_key in candle_cache:
+        return candle_cache[cache_key]
+    end_time = now_utc()
+    start_time = end_time - timedelta(days=lookback_days)
+    stored = [
+        _historical_record_to_candle(record)
+        for record in repository.get_historical_candles(
+            symbol=symbol,
+            interval=interval,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    ]
+    expected_limit = max(MIN_CANDLES_FOR_FUTURES_SIGNAL, int(timedelta(days=lookback_days) / interval_to_timedelta(interval)))
+    if len(stored) >= min(expected_limit, 96):
+        if candle_cache is not None:
+            candle_cache[cache_key] = stored
+        return stored
+    rows = await rest_client.get_klines(
+        symbol=symbol,
+        interval=interval,
+        start_time_ms=int(start_time.timestamp() * 1000),
+        end_time_ms=int(end_time.timestamp() * 1000),
+        limit=min(1000, max(MIN_CANDLES_FOR_FUTURES_SIGNAL, expected_limit)),
+    )
+    fetched = [
+        parse_rest_kline(symbol, interval, row)
+        for row in rows
+        if int(row[6]) < int(now_utc().timestamp() * 1000)
+    ]
+    repository.upsert_historical_candles(fetched, source="spot_scanner_rest")
+    merged = merge_candles(
+        stored_candles=stored,
+        live_candles=fetched,
+        interval=interval,
+        limit=None,
+    ).candles
+    if candle_cache is not None:
+        candle_cache[cache_key] = merged
+    return merged
+
+
+def _spot_expected_edge_pct(candles: list[Candle]) -> Decimal | None:
+    if len(candles) < 24 or candles[-24].close <= Decimal("0"):
+        return None
+    return (((candles[-1].close - candles[-24].close) / candles[-24].close) * Decimal("100")).quantize(Decimal("0.0001"))
+
+
+def _spot_preliminary_confidence(
+    *,
+    technical_analysis: TechnicalAnalysisSnapshot | None,
+    candles: list[Candle],
+) -> int:
+    base = technical_analysis.trend_strength_score if technical_analysis is not None and technical_analysis.trend_strength_score is not None else 50
+    edge = _spot_expected_edge_pct(candles) or Decimal("0")
+    return int(max(0, min(100, Decimal(base) + edge * Decimal("5"))))
+
+
+def _spot_preliminary_risk_grade(
+    *,
+    regime_analysis: RegimeAnalysisSnapshot | None,
+    candles: list[Candle],
+) -> Literal["low", "medium", "high"]:
+    if regime_analysis is not None and regime_analysis.regime_label in {"choppy", "high_volatility", "low_liquidity", "trending_down"}:
+        return "high"
+    if len(candles) < 24:
+        return "high"
+    ranges = [
+        ((candle.high - candle.low) / candle.close) * Decimal("100")
+        for candle in candles[-24:]
+        if candle.close > Decimal("0")
+    ]
+    average_range = sum(ranges, start=Decimal("0")) / Decimal(max(1, len(ranges)))
+    if average_range >= Decimal("2.5"):
+        return "high"
+    if average_range >= Decimal("1.5"):
+        return "medium"
+    return "low"
+
+
+def _spot_scanner_blockers(
+    *,
+    technical_analysis: TechnicalAnalysisSnapshot | None,
+    regime_analysis: RegimeAnalysisSnapshot | None,
+    candles: list[Candle],
+) -> tuple[str, ...]:
+    blockers: list[str] = []
+    if len(candles) < 48:
+        blockers.append("insufficient Spot candle history")
+    if technical_analysis is not None and technical_analysis.trend_direction == "bearish":
+        blockers.append("bearish Spot trend")
+    if regime_analysis is not None and regime_analysis.regime_label in {"choppy", "low_liquidity", "high_volatility"}:
+        blockers.append(f"{regime_analysis.regime_label} Spot regime")
+    return tuple(dict.fromkeys(blockers))
+
+
+async def _build_market_wide_futures_signal_for_symbol(
+    *,
+    scanner: FuturesOpportunityScanner,
+    symbol: str,
+    horizon: str,
+    repository: StorageRepository,
+    rest_client: BinanceRestClient,
+    settings: Settings,
+    candle_cache: dict[tuple[str, SupportedInterval], list[Candle]] | None = None,
+    market_sensitivity: Literal["conservative", "balanced", "aggressive"] = "balanced",
+) -> FuturesPaperSignal:
+    """Build one scanner signal from fresh/stored market-wide OHLCV data."""
+
+    started_at = time.perf_counter()
+    candles_15m = await _load_or_fetch_futures_scan_candles(
+        repository=repository,
+        rest_client=rest_client,
+        symbol=symbol,
+        interval="15m",
+        lookback_days=7,
+        candle_cache=candle_cache,
+    )
+    candles_1h = await _load_or_fetch_futures_scan_candles(
+        repository=repository,
+        rest_client=rest_client,
+        symbol=symbol,
+        interval="1h",
+        lookback_days=7,
+        candle_cache=candle_cache,
+    )
+    technical_analysis: TechnicalAnalysisSnapshot | None = None
+    if len(candles_15m) >= 24:
+        try:
+            feature_snapshot = FeatureEngine(FeatureConfig()).build_snapshot(candles_15m)
+            technical_analysis = TechnicalAnalysisService().analyze(
+                symbol=symbol,
+                candles=candles_15m,
+                feature_snapshot=feature_snapshot,
+            )
+        except Exception:
+            LOGGER.exception("Failed to build futures scanner technical analysis for %s.", symbol)
+            technical_analysis = None
+    derivatives_data, crowd_positioning = await _load_crowd_positioning(
+        settings=settings,
+        symbol=symbol,
+    )
+    liquidity_bias = estimate_liquidity_bias(
+        LiquidityBiasInput(
+            symbol=symbol,
+            candles=candles_15m,
+            funding_rate=derivatives_data.funding_rate,
+            open_interest_change_pct=derivatives_data.oi_change_1h or derivatives_data.oi_change_24h,
+            crowd_positioning=crowd_positioning,
+            volatility_regime=(
+                technical_analysis.volatility_regime
+                if technical_analysis is not None and technical_analysis.data_state == "ready"
+                else None
+            ),
+        )
+    )
+    preliminary_liquidity_zones = estimate_liquidity_zones(
+        symbol=symbol,
+        candles=candles_15m,
+        current_price=candles_15m[-1].close if candles_15m else None,
+        liquidity_bias=liquidity_bias,
+        crowd_positioning=crowd_positioning,
+    )
+    liquidation_intelligence = _load_liquidation_intelligence(
+        symbol=symbol,
+        candles=candles_15m,
+        liquidity_zones=preliminary_liquidity_zones,
+        crowd_positioning=crowd_positioning,
+    )
+    preliminary_liquidity_zones = validate_liquidity_zones_with_liquidations(
+        zones=preliminary_liquidity_zones,
+        liquidation_signal=liquidation_intelligence.liquidation_signal,
+        dominant_side=liquidation_intelligence.dominant_side,
+    )
+
+    signal = scanner.analyze_symbol(
+        FuturesSignalContext(
+            symbol=symbol,
+            candles=candles_15m,
+            higher_timeframe_candles=candles_1h,
+            technical_analysis=technical_analysis,
+            regime_analysis=None,
+            similar_setup=None,
+            trade_eligibility=None,
+            preferred_horizon=horizon,
+            warnings=(),
+            liquidity_bias=liquidity_bias,
+            liquidity_zones=preliminary_liquidity_zones,
+            crowd_positioning=crowd_positioning,
+            funding_rate=derivatives_data.funding_rate,
+            open_interest=derivatives_data.open_interest,
+            oi_trend=derivatives_data.oi_trend,
+            liquidation_intelligence=liquidation_intelligence,
+            market_sensitivity=market_sensitivity,
+        )
+    )
+    LOGGER.info("Futures scanner analysis completed in %.3fs symbol=%s.", time.perf_counter() - started_at, symbol)
+    return signal
+
+
+async def _load_or_fetch_futures_scan_candles(
+    *,
+    repository: StorageRepository,
+    rest_client: BinanceRestClient,
+    symbol: str,
+    interval: SupportedInterval,
+    lookback_days: int,
+    candle_cache: dict[tuple[str, SupportedInterval], list[Candle]] | None = None,
+) -> list[Candle]:
+    """Load recent USD-M Futures scanner candles, fetching from Binance when local data is stale."""
+
+    cache_key = (symbol.upper(), interval)
+    if candle_cache is not None and cache_key in candle_cache:
+        return candle_cache[cache_key]
+
+    end_time = now_utc()
+    start_time = end_time - timedelta(days=lookback_days)
+    cache_started_at = time.perf_counter()
+    stored = [
+        _historical_record_to_candle(record)
+        for record in repository.get_futures_historical_candles(
+            symbol=symbol,
+            interval=interval,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    ]
+    LOGGER.info(
+        "Futures scanner candle cache read for %s %s returned %d rows in %.3fs.",
+        symbol,
+        interval,
+        len(stored),
+        time.perf_counter() - cache_started_at,
+    )
+    if len(stored) >= MIN_CANDLES_FOR_FUTURES_SIGNAL and not _futures_scan_candles_stale(stored, interval):
+        if candle_cache is not None:
+            candle_cache[cache_key] = stored
+        return stored
+
+    expected_limit = int(timedelta(days=lookback_days) / interval_to_timedelta(interval)) + 4
+    fetch_started_at = time.perf_counter()
+    rows = await rest_client.get_futures_klines(
+        symbol=symbol,
+        interval=interval,
+        start_time_ms=int(start_time.timestamp() * 1000),
+        end_time_ms=int(end_time.timestamp() * 1000),
+        limit=min(1000, max(MIN_CANDLES_FOR_FUTURES_SIGNAL, expected_limit)),
+    )
+    LOGGER.info(
+        "Futures scanner Binance USD-M candle fetch for %s %s returned %d rows in %.3fs.",
+        symbol,
+        interval,
+        len(rows),
+        time.perf_counter() - fetch_started_at,
+    )
+    fetched = [
+        parse_rest_kline(symbol, interval, row)
+        for row in rows
+        if len(row) >= 9 and int(row[6]) < int(now_utc().timestamp() * 1000)
+    ]
+    if fetched:
+        repository.upsert_futures_historical_candles(fetched, source="binance_usdm_futures")
+        if candle_cache is not None:
+            candle_cache[cache_key] = fetched
+        return fetched
+    if candle_cache is not None:
+        candle_cache[cache_key] = stored
+    return stored
+
+
+def _futures_scan_candles_stale(candles: list[Candle], interval: SupportedInterval) -> bool:
+    if not candles:
+        return True
+    return now_utc() - candles[-1].close_time > max(interval_to_timedelta(interval) * 2, timedelta(minutes=30))
+
+
+def _historical_record_to_candle(record: HistoricalCandleRecord) -> Candle:
+    return Candle(
+        symbol=record.symbol,
+        timeframe=record.interval,
+        open=record.open_price,
+        high=record.high_price,
+        low=record.low_price,
+        close=record.close_price,
+        volume=record.volume,
+        quote_volume=record.quote_volume,
+        open_time=record.open_time,
+        close_time=record.close_time,
+        event_time=record.created_at,
+        trade_count=record.trade_count,
+        is_closed=True,
+    )
+
+
+def _normalize_futures_scanner_horizon(horizon: str) -> str:
+    normalized = horizon.strip().lower()
+    if normalized in {"15m", "1h"}:
+        return normalized
+    return normalize_horizon(normalized)
+
+
+async def _load_futures_symbol_universe(
+    *,
+    rest_client: BinanceRestClient,
+    quote_asset: str,
+    limit: int,
+) -> FuturesSymbolUniverseResult:
+    """Return active USD-M Futures symbols ranked by futures market activity with cache/fallback diagnostics."""
+
+    started_at = time.perf_counter()
+    normalized_quote = quote_asset.upper()
+    cache_key = normalized_quote
+    cached = _FUTURES_SYMBOL_UNIVERSE_CACHE.get(cache_key)
+    if cached is not None and now_utc() - cached.fetched_at <= FUTURES_SYMBOL_UNIVERSE_CACHE_TTL:
+        LOGGER.debug(
+            "Futures scanner using cached USD-M symbol universe for %s (%d symbols).",
+            normalized_quote,
+            len(cached.records),
+        )
+        return FuturesSymbolUniverseResult(
+            records=cached.records[:limit],
+            source="cache",
+            last_successful_fetch_at=cached.fetched_at,
+            latest_error=cached.latest_error,
+        )
+
+    try:
+        exchange_info = await rest_client.get_futures_exchange_info()
+        symbols = _parse_futures_exchange_info_symbols(exchange_info, quote_asset=normalized_quote)
+        if not symbols:
+            raise ValueError(f"No active Binance USD-M Futures symbols found for quote asset {normalized_quote}.")
+
+        ranked = await _rank_futures_symbols_by_volume(
+            rest_client=rest_client,
+            symbols=symbols,
+        )
+        fetched_at = now_utc()
+        _FUTURES_SYMBOL_UNIVERSE_CACHE[cache_key] = FuturesSymbolUniverseCacheEntry(
+            records=ranked,
+            fetched_at=fetched_at,
+        )
+        LOGGER.info(
+            "Futures scanner USD-M symbol universe loaded live %d/%d symbols in %.3fs.",
+            min(len(ranked), limit),
+            len(ranked),
+            time.perf_counter() - started_at,
+        )
+        return FuturesSymbolUniverseResult(
+            records=ranked[:limit],
+            source="live",
+            last_successful_fetch_at=fetched_at,
+        )
+    except Exception as exc:
+        latest_error = f"{type(exc).__name__}: {exc}"
+        LOGGER.warning(
+            "Futures scanner symbol universe load failed; phase=symbol_universe endpoint=/fapi/v1/exchangeInfo exception_type=%s error=%s",
+            type(exc).__name__,
+            exc,
+        )
+        if cached is not None and cached.records:
+            cached.latest_error = latest_error
+            return FuturesSymbolUniverseResult(
+                records=cached.records[:limit],
+                source="cache",
+                last_successful_fetch_at=cached.fetched_at,
+                latest_error=latest_error,
+            )
+        fallback = _manual_futures_symbol_fallback(normalized_quote)[:limit]
+        if fallback:
+            return FuturesSymbolUniverseResult(
+                records=fallback,
+                source="fallback",
+                last_successful_fetch_at=None,
+                latest_error=latest_error,
+            )
+        return FuturesSymbolUniverseResult(
+            records=[],
+            source="unavailable",
+            last_successful_fetch_at=None,
+            latest_error=latest_error,
+        )
+
+
+def _parse_futures_exchange_info_symbols(
+    exchange_info: dict[str, object],
+    *,
+    quote_asset: str,
+) -> list[SpotSymbolRecord]:
+    symbols: list[SpotSymbolRecord] = []
+    raw_symbols = exchange_info.get("symbols", [])
+    if not isinstance(raw_symbols, list):
+        raise ValueError("Binance USD-M Futures exchangeInfo response did not include a symbol list.")
+    for raw_symbol in raw_symbols:
+        if not isinstance(raw_symbol, dict):
+            continue
+        symbol = str(raw_symbol.get("symbol", "")).upper()
+        quote = str(raw_symbol.get("quoteAsset", "")).upper()
+        status = str(raw_symbol.get("status", "")).upper()
+        contract_type = str(raw_symbol.get("contractType", "")).upper()
+        if not symbol or quote != quote_asset or status != "TRADING":
+            continue
+        if contract_type and contract_type != "PERPETUAL":
+            continue
+        symbols.append(
+            SpotSymbolRecord(
+                symbol=symbol,
+                base_asset=str(raw_symbol.get("baseAsset", "")).upper(),
+                quote_asset=quote,
+                status=status,
+            )
+        )
+    return symbols
+
+
+async def _rank_futures_symbols_by_volume(
+    *,
+    rest_client: BinanceRestClient,
+    symbols: list[SpotSymbolRecord],
+) -> list[SpotSymbolRecord]:
+    ranked = sorted(symbols, key=lambda item: item.symbol)
+    try:
+        tickers = await rest_client.get_futures_ticker_24h()
+    except Exception:
+        LOGGER.warning(
+            "Failed to rank USD-M Futures symbols by ticker volume; phase=symbol_universe endpoint=/fapi/v1/ticker/24hr",
+            exc_info=True,
+        )
+        return ranked
+
+    symbol_lookup = {record.symbol: record for record in symbols}
+    ranked_pairs: list[tuple[Decimal, SpotSymbolRecord]] = []
+    for ticker in tickers:
+        symbol = str(ticker.get("symbol", "")).upper()
+        if symbol not in symbol_lookup:
+            continue
+        try:
+            quote_volume = Decimal(str(ticker.get("quoteVolume", "0")))
+        except Exception:
+            quote_volume = Decimal("0")
+        ranked_pairs.append((quote_volume, symbol_lookup[symbol]))
+    if not ranked_pairs:
+        return ranked
+    return [record for _, record in sorted(ranked_pairs, key=lambda item: (-item[0], item[1].symbol))]
+
+
+def _manual_futures_symbol_fallback(quote_asset: str) -> list[SpotSymbolRecord]:
+    if quote_asset != "USDT":
+        return []
+    return [
+        SpotSymbolRecord(
+            symbol=symbol,
+            base_asset=symbol.removesuffix("USDT"),
+            quote_asset="USDT",
+            status="TRADING",
+        )
+        for symbol in FUTURES_SCANNER_FALLBACK_SYMBOLS
+    ]
 
 
 def _to_ai_outcome_evaluation_response(
@@ -2930,14 +6382,30 @@ async def manual_close_position(
 def get_backfill_status(
     symbol: Annotated[str, Query(min_length=1)],
     backfill_service: Annotated[HistoricalBackfillService, Depends(get_backfill_service)],
+    settings: Annotated[Settings, Depends(get_settings_dependency)],
     interval: ChartTimeframe = "1m",
     lookback_days: Annotated[int, Query(ge=1, le=30)] = 7,
+    market: SelectedMarket = "spot",
 ) -> BackfillStatusResponse:
     """Return stored historical-candle coverage for one selected symbol."""
 
+    normalized_symbol = symbol.strip().upper()
+    if market == "futures":
+        repository = StorageRepository(settings.database_url)
+        try:
+            return _to_backfill_status_response(
+                _futures_backfill_status(
+                    repository=repository,
+                    symbol=normalized_symbol,
+                    interval=interval,
+                    lookback_days=lookback_days,
+                )
+            )
+        finally:
+            repository.close()
     return _to_backfill_status_response(
         backfill_service.status(
-            symbol=symbol.strip().upper(),
+            symbol=normalized_symbol,
             interval=interval,
             lookback_days=lookback_days,
         )
@@ -2948,14 +6416,50 @@ def get_backfill_status(
 async def trigger_backfill(
     symbol: Annotated[str, Query(min_length=1)],
     backfill_service: Annotated[HistoricalBackfillService, Depends(get_backfill_service)],
+    settings: Annotated[Settings, Depends(get_settings_dependency)],
+    rest_client: Annotated[BinanceRestClient, Depends(get_rest_client)],
     interval: ChartTimeframe = "1m",
     lookback_days: Annotated[int, Query(ge=1, le=30)] = 7,
+    market: SelectedMarket = "spot",
 ) -> BackfillStatusResponse:
     """Trigger or refresh historical-candle backfill for one selected symbol."""
 
+    normalized_symbol = symbol.strip().upper()
+    if market == "futures":
+        repository = StorageRepository(settings.database_url)
+        try:
+            try:
+                await _load_or_fetch_futures_scan_candles(
+                    repository=repository,
+                    rest_client=rest_client,
+                    symbol=normalized_symbol,
+                    interval=interval,
+                    lookback_days=lookback_days,
+                )
+            except Exception as exc:
+                LOGGER.exception("USD-M Futures selected-symbol backfill failed for %s %s.", normalized_symbol, interval)
+                return _to_backfill_status_response(
+                    _futures_backfill_status(
+                        repository=repository,
+                        symbol=normalized_symbol,
+                        interval=interval,
+                        lookback_days=lookback_days,
+                        failed_message=f"Symbol not available on selected market. {type(exc).__name__}: {exc}",
+                    )
+                )
+            return _to_backfill_status_response(
+                _futures_backfill_status(
+                    repository=repository,
+                    symbol=normalized_symbol,
+                    interval=interval,
+                    lookback_days=lookback_days,
+                )
+            )
+        finally:
+            repository.close()
     return _to_backfill_status_response(
         await backfill_service.ensure_recent_history(
-            symbol=symbol.strip().upper(),
+            symbol=normalized_symbol,
             interval=interval,
             lookback_days=lookback_days,
         )
@@ -2994,6 +6498,7 @@ def get_candles(
     symbol: Annotated[str, Query(min_length=1)],
     timeframe: Annotated[ChartTimeframe, Query()] = "1m",
     limit: Annotated[int, Query(ge=20, le=240)] = 120,
+    market: SelectedMarket = "spot",
     runtime: Annotated[PaperBotRuntime, Depends(get_bot_runtime)] = None,
     settings: Annotated[Settings, Depends(get_settings_dependency)] = None,
 ) -> CandleHistoryResponse:
@@ -3004,20 +6509,28 @@ def get_candles(
     runtime_active = _runtime_matches_symbol(status, normalized_symbol)
     repository = StorageRepository(settings.database_url)
     try:
-        merged = _load_merged_candle_series(
-            repository=repository,
-            runtime=runtime,
-            symbol=normalized_symbol,
-            interval=timeframe,
-            limit=limit,
-        )
+        if market == "futures":
+            merged = _load_futures_candle_series(
+                repository=repository,
+                symbol=normalized_symbol,
+                interval=timeframe,
+                limit=limit,
+            )
+        else:
+            merged = _load_merged_candle_series(
+                repository=repository,
+                runtime=runtime,
+                symbol=normalized_symbol,
+                interval=timeframe,
+                limit=limit,
+            )
         return _to_candle_history_response(
             symbol=normalized_symbol,
             timeframe=timeframe,
             candles=merged.candles,
             source_timeframe=merged.source_interval,
             derived_from_lower_timeframe=merged.derived_from_lower_timeframe,
-            runtime_active=runtime_active,
+            runtime_active=runtime_active or market == "futures",
             limit=limit,
         )
     except Exception:
@@ -3357,6 +6870,15 @@ async def get_trading_assistant(
             symbol=normalized_symbol,
             sentiment_service=sentiment_service,
         )
+        derivatives_data, crowd_positioning = await _load_crowd_positioning(
+            settings=settings,
+            symbol=normalized_symbol,
+        )
+        _apply_crowd_positioning_to_context(
+            context=context,
+            crowd=crowd_positioning,
+            derivatives=derivatives_data,
+        )
         technical_analysis, _ = _safe_technical_analysis(
             runtime,
             repository,
@@ -3410,6 +6932,11 @@ async def get_trading_assistant(
             fusion_signal=fusion_response,
             technical_analysis=technical_response,
             workstation=workstation,
+            liquidity_bias=context.liquidity_bias,
+            crowd_positioning=context.crowd_positioning,
+            derivatives_data=context.derivatives_data,
+            candles=context.candles,
+            regime_label=regime_analysis.regime_label if regime_analysis is not None else None,
         )
         current_snapshot = _persist_signal_validation_snapshot(
             repository=repository,
@@ -3427,6 +6954,12 @@ async def get_trading_assistant(
         )
         assistant = assistant.model_copy(
             update={"similar_setup": _to_similar_setup_summary_response(similar_setup)}
+        )
+        _persist_assistant_outcome_snapshot(
+            repository=repository,
+            symbol=normalized_symbol,
+            assistant=assistant,
+            current_price=workstation.last_price,
         )
         return assistant
     finally:
@@ -3474,6 +7007,15 @@ async def get_trade_eligibility(
             repository=repository,
             symbol=normalized_symbol,
             sentiment_service=sentiment_service,
+        )
+        derivatives_data, crowd_positioning = await _load_crowd_positioning(
+            settings=settings,
+            symbol=normalized_symbol,
+        )
+        _apply_crowd_positioning_to_context(
+            context=context,
+            crowd=crowd_positioning,
+            derivatives=derivatives_data,
         )
         technical_analysis, _ = _safe_technical_analysis(
             runtime,
@@ -3533,6 +7075,11 @@ async def get_trade_eligibility(
             fusion_signal=fusion_response,
             technical_analysis=technical_response,
             workstation=workstation,
+            liquidity_bias=context.liquidity_bias,
+            crowd_positioning=context.crowd_positioning,
+            derivatives_data=context.derivatives_data,
+            candles=context.candles,
+            regime_label=regime_analysis.regime_label if regime_analysis is not None else None,
         )
         current_snapshot = _build_signal_validation_snapshot_record(
             symbol=normalized_symbol,
@@ -3553,6 +7100,27 @@ async def get_trade_eligibility(
             horizon=preferred_horizon,
         )
         blocker_reasons = current_snapshot.blocker_reasons if current_snapshot is not None else ()
+        liquidity_zones = _estimate_assistant_liquidity_zones(
+            symbol=normalized_symbol,
+            candles=context.candles,
+            workstation=workstation,
+            assistant=assistant,
+            fusion_signal=fusion_response,
+            liquidity_bias=context.liquidity_bias,
+            regime_analysis=regime_analysis,
+            crowd_positioning=context.crowd_positioning,
+        )
+        liquidation_intelligence = _load_liquidation_intelligence(
+            symbol=normalized_symbol,
+            candles=context.candles,
+            liquidity_zones=liquidity_zones,
+            crowd_positioning=context.crowd_positioning,
+        )
+        liquidity_zones = validate_liquidity_zones_with_liquidations(
+            zones=liquidity_zones,
+            liquidation_signal=liquidation_intelligence.liquidation_signal,
+            dominant_side=liquidation_intelligence.dominant_side,
+        )
         result = evaluate_trade_eligibility(
             TradeEligibilityInput(
                 symbol=normalized_symbol,
@@ -3574,9 +7142,24 @@ async def get_trade_eligibility(
                 ),
                 similar_setup=similar_setup,
                 signal_validation=validation_report,
+                liquidity_bias=context.liquidity_bias,
+                liquidity_zones=liquidity_zones,
+                crowd_positioning=context.crowd_positioning,
+                funding_rate=context.derivatives_data.funding_rate if context.derivatives_data is not None else None,
+                open_interest=context.derivatives_data.open_interest if context.derivatives_data is not None else None,
+                oi_trend=context.derivatives_data.oi_trend if context.derivatives_data is not None else "neutral",
+                liquidation_intelligence=liquidation_intelligence,
             )
         )
-        return _to_trade_eligibility_response(symbol=normalized_symbol, result=result)
+        response = _to_trade_eligibility_response(symbol=normalized_symbol, result=result)
+        _persist_eligibility_outcome_snapshot(
+            repository=repository,
+            symbol=normalized_symbol,
+            assistant=assistant,
+            eligibility=response,
+            current_price=workstation.last_price,
+        )
+        return response
     finally:
         repository.close()
 
@@ -3621,6 +7204,518 @@ async def get_opportunities(
         return ranked[:limit]
     finally:
         repository.close()
+
+
+@router.post("/bot/spot-opportunities/scan", response_model=SpotOpportunityScanJobResponse)
+async def start_spot_opportunity_scan(
+    payload: SpotOpportunityScanStartRequest,
+    settings: Annotated[Settings, Depends(get_settings_dependency)] = None,
+    rest_client: Annotated[BinanceRestClient, Depends(get_rest_client)] = None,
+) -> SpotOpportunityScanJobResponse:
+    """Start a background paper-only Spot opportunity scan."""
+
+    try:
+        _normalize_futures_scanner_horizon(payload.horizon)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    job = _SPOT_SCANNER_JOB_MANAGER.create(payload)
+    worker_rest_client = None if isinstance(rest_client, BinanceRestClient) else rest_client
+    thread = Thread(
+        target=lambda: asyncio.run(
+            _run_spot_opportunity_scan_job(
+                scan_id=job.scan_id,
+                settings=settings,
+                rest_client=worker_rest_client,
+            )
+        ),
+        name=f"spot-opportunity-scan-{job.scan_id}",
+        daemon=True,
+    )
+    _SPOT_SCANNER_JOB_MANAGER.set_thread(job.scan_id, thread)
+    thread.start()
+    return _to_spot_scan_job_response(job)
+
+
+@router.get("/bot/spot-opportunities/scan/{scan_id}", response_model=SpotOpportunityScanJobResponse)
+async def get_spot_opportunity_scan_job(scan_id: str) -> SpotOpportunityScanJobResponse:
+    """Return the latest progress snapshot for a background Spot opportunity scan."""
+
+    job = _SPOT_SCANNER_JOB_MANAGER.get(scan_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Spot scanner job not found.")
+    return _to_spot_scan_job_response(job)
+
+
+@router.post("/bot/spot-opportunities/scan/{scan_id}/cancel", response_model=SpotOpportunityScanJobResponse)
+async def cancel_spot_opportunity_scan_job(scan_id: str) -> SpotOpportunityScanJobResponse:
+    """Cancel a running background Spot opportunity scan."""
+
+    job = _SPOT_SCANNER_JOB_MANAGER.cancel(scan_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Spot scanner job not found.")
+    return _to_spot_scan_job_response(job)
+
+
+@router.post("/bot/futures-opportunities/scan", response_model=FuturesOpportunityScanJobResponse)
+async def start_futures_opportunity_scan(
+    payload: FuturesOpportunityScanStartRequest,
+    settings: Annotated[Settings, Depends(get_settings_dependency)] = None,
+    rest_client: Annotated[BinanceRestClient, Depends(get_rest_client)] = None,
+) -> FuturesOpportunityScanJobResponse:
+    """Start a background paper-only futures opportunity scan."""
+
+    try:
+        _normalize_futures_scanner_horizon(payload.horizon)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    job = _FUTURES_SCANNER_JOB_MANAGER.create(payload)
+    worker_rest_client = None if isinstance(rest_client, BinanceRestClient) else rest_client
+    thread = Thread(
+        target=lambda: asyncio.run(
+            _run_futures_opportunity_scan_job(
+                scan_id=job.scan_id,
+                settings=settings,
+                rest_client=worker_rest_client,
+            )
+        ),
+        name=f"futures-opportunity-scan-{job.scan_id}",
+        daemon=True,
+    )
+    _FUTURES_SCANNER_JOB_MANAGER.set_thread(job.scan_id, thread)
+    thread.start()
+    return _to_futures_scan_job_response(job)
+
+
+@router.get("/bot/futures-opportunities/scan/{scan_id}", response_model=FuturesOpportunityScanJobResponse)
+async def get_futures_opportunity_scan_job(scan_id: str) -> FuturesOpportunityScanJobResponse:
+    """Return the latest progress snapshot for a background futures opportunity scan."""
+
+    job = _FUTURES_SCANNER_JOB_MANAGER.get(scan_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Scanner job not found.")
+    return _to_futures_scan_job_response(job)
+
+
+@router.post("/bot/futures-opportunities/scan/{scan_id}/cancel", response_model=FuturesOpportunityScanJobResponse)
+async def cancel_futures_opportunity_scan_job(scan_id: str) -> FuturesOpportunityScanJobResponse:
+    """Cancel a running background futures opportunity scan."""
+
+    job = _FUTURES_SCANNER_JOB_MANAGER.cancel(scan_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Scanner job not found.")
+    return _to_futures_scan_job_response(job)
+
+
+@router.get("/bot/futures-opportunities", response_model=FuturesOpportunityScanResponse)
+async def get_futures_opportunities(
+    quote_asset: str = "USDT",
+    limit: Annotated[int | None, Query(ge=1)] = None,
+    max_symbols: Annotated[int | None, Query(ge=1)] = None,
+    concurrency: Annotated[int, Query(ge=1, le=10)] = 5,
+    symbol_timeout_seconds: Annotated[float, Query(ge=1, le=8)] = 7.0,
+    scan_timeout_seconds: Annotated[float, Query(ge=5, le=90)] = 45.0,
+    horizon: str = Query(default="7d"),
+    min_opportunity_score: Annotated[int, Query(ge=0, le=100)] = 0,
+    min_confidence: Annotated[int, Query(ge=0, le=100)] = 0,
+    include_weak_evidence: bool = True,
+    include_avoid: bool = True,
+    market_sensitivity: Literal["conservative", "balanced", "aggressive"] = "balanced",
+    settings: Annotated[Settings, Depends(get_settings_dependency)] = None,
+    rest_client: Annotated[BinanceRestClient, Depends(get_rest_client)] = None,
+) -> FuturesOpportunityScanResponse:
+    """Scan symbols for paper-only futures long/short opportunities."""
+
+    scan_id = uuid4().hex
+    normalized_quote = quote_asset.strip().upper() or "USDT"
+    scan_limit = min(max_symbols if max_symbols is not None else limit if limit is not None else 50, 100)
+    try:
+        normalized_horizon = _normalize_futures_scanner_horizon(horizon)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    scanner = FuturesOpportunityScanner()
+    total_started_at = time.perf_counter()
+    repository = StorageRepository(settings.database_url)
+    signals: list[FuturesPaperSignal] = []
+    failed_symbols: list[str] = []
+    candle_cache: dict[tuple[str, SupportedInterval], list[Candle]] = {}
+    semaphore = asyncio.Semaphore(concurrency)
+    threshold_floor = 60 if market_sensitivity == "aggressive" else 0
+    sensitivity_discount = 8 if market_sensitivity == "aggressive" else 0
+    current_threshold = max(threshold_floor, max(min_opportunity_score, min_confidence) - sensitivity_discount)
+    fallback_symbol_count = len(_manual_futures_symbol_fallback(normalized_quote))
+
+    universe_started_at = time.perf_counter()
+    universe = await _load_futures_symbol_universe(
+        rest_client=rest_client,
+        quote_asset=normalized_quote,
+        limit=scan_limit,
+    )
+    LOGGER.info(
+        "Futures scanner universe load %.3fs source=%s symbols=%d scan_id=%s.",
+        time.perf_counter() - universe_started_at,
+        universe.source,
+        len(universe.records),
+        scan_id,
+    )
+    candidates = universe.records
+    if universe.source == "unavailable" or not candidates:
+        latest_error = universe.latest_error or "No USD-M Futures symbol universe is available."
+        LOGGER.warning(
+            "Futures scanner degraded; scan_id=%s phase=symbol_universe endpoint=/fapi/v1/exchangeInfo exception_type=Unavailable error=%s",
+            scan_id,
+            latest_error,
+        )
+        cached_response = _latest_successful_scanner_response(
+            repository=repository,
+            quote_asset=normalized_quote,
+            horizon=normalized_horizon,
+            latest_error=latest_error,
+            universe_source=universe.source,
+            fallback_symbol_count=fallback_symbol_count,
+        )
+        if cached_response is not None:
+            repository.close()
+            return cached_response
+        repository.close()
+        return _empty_degraded_scanner_response(
+            universe_source=universe.source,
+            latest_error=latest_error,
+            fallback_symbol_count=fallback_symbol_count,
+        )
+
+    universe_warnings: list[str] = []
+    if universe.source == "cache":
+        universe_warnings.append(
+            "Using cached USD-M Futures symbol universe because live Binance exchangeInfo is unavailable or recently cached."
+        )
+    elif universe.source == "fallback":
+        universe_warnings.append("Live USD-M symbol universe unavailable; using curated fallback list.")
+
+    async def scan_symbol(record: SpotSymbolRecord) -> FuturesPaperSignal | None:
+        async with semaphore:
+            symbol_started_at = time.perf_counter()
+            try:
+                signal = await asyncio.wait_for(
+                    _build_market_wide_futures_signal_for_symbol(
+                        scanner=scanner,
+                        symbol=record.symbol,
+                        horizon=normalized_horizon,
+                        repository=repository,
+                        rest_client=rest_client,
+                        settings=settings,
+                        candle_cache=candle_cache,
+                        market_sensitivity=market_sensitivity,
+                    ),
+                    timeout=symbol_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                LOGGER.warning(
+                    "Timed out futures-paper scan; scan_id=%s phase=symbol_scan symbol=%s endpoint=/fapi/v1/klines exception_type=TimeoutError timeout_seconds=%.1f",
+                    scan_id,
+                    record.symbol,
+                    symbol_timeout_seconds,
+                )
+                failed_symbols.append(record.symbol)
+                return None
+            except Exception:
+                LOGGER.exception(
+                    "Failed to scan paper futures opportunity; scan_id=%s phase=symbol_scan symbol=%s endpoint=/fapi/v1/klines",
+                    scan_id,
+                    record.symbol,
+                )
+                failed_symbols.append(record.symbol)
+                return None
+            finally:
+                LOGGER.debug(
+                    "Futures scanner symbol %s finished in %.3fs.",
+                    record.symbol,
+                    time.perf_counter() - symbol_started_at,
+                )
+
+            weak_validation = signal.evidence_strength in {"insufficient", "unvalidated", "weak"}
+            if signal.direction in {"long", "short"}:
+                if signal.opportunity_score < current_threshold:
+                    return None
+                if weak_validation and not include_weak_evidence:
+                    return None
+                return signal
+            if signal.direction == "wait" or include_avoid:
+                return signal
+            return None
+
+    try:
+        scan_started_at = time.perf_counter()
+        if candidates:
+            task_by_symbol = {
+                asyncio.create_task(scan_symbol(record), name=f"futures-scan-{record.symbol}"): record.symbol
+                for record in candidates
+            }
+            done, pending = await asyncio.wait(task_by_symbol.keys(), timeout=scan_timeout_seconds)
+            for task in pending:
+                symbol = task_by_symbol[task]
+                task.cancel()
+                failed_symbols.append(symbol)
+                LOGGER.warning(
+                    "Futures scanner request timed out; scan_id=%s phase=scan_timeout symbol=%s endpoint=/bot/futures-opportunities exception_type=TimeoutError timeout_seconds=%.1f",
+                    scan_id,
+                    symbol,
+                    scan_timeout_seconds,
+                )
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                result = task.result()
+                if result is not None:
+                    signals.append(result)
+        LOGGER.info(
+            "Futures scanner analyzed %d/%d symbols in %.3fs with concurrency=%d scan_id=%s.",
+            len(signals),
+            len(candidates),
+            time.perf_counter() - scan_started_at,
+            concurrency,
+            scan_id,
+        )
+        ranking_started_at = time.perf_counter()
+        report = scanner.build_report(
+            signals=signals,
+            failed_symbols=failed_symbols,
+            include_avoid=include_avoid,
+        )
+        LOGGER.info(
+            "Futures scanner ranking completed in %.3fs scan_id=%s candidates=%d.",
+            time.perf_counter() - ranking_started_at,
+            scan_id,
+            len(signals),
+        )
+        report.warnings.extend(universe_warnings)
+        report.futures_symbol_universe_source = universe.source
+        report.symbol_count = len(candidates)
+        report.last_successful_fetch_at = universe.last_successful_fetch_at
+        report.latest_error = universe.latest_error
+        if universe.source in {"cache", "fallback"} and report.scan_state == "ready":
+            report.scan_state = "partial"
+        if pending:
+            report.scan_state = "partial" if signals else "degraded"
+            report.warnings.append("Scanner request timed out before all symbols completed; partial results are shown.")
+        if not signals and failed_symbols:
+            latest_error = universe.latest_error or "futures_klines_unavailable: no requested futures symbols returned candles."
+            cached_response = _latest_successful_scanner_response(
+                repository=repository,
+                quote_asset=normalized_quote,
+                horizon=normalized_horizon,
+                latest_error=latest_error,
+                universe_source=universe.source,
+                fallback_symbol_count=fallback_symbol_count,
+            )
+            if cached_response is not None:
+                return cached_response
+            return _empty_degraded_scanner_response(
+                universe_source=universe.source,
+                latest_error=latest_error,
+                fallback_symbol_count=fallback_symbol_count,
+                failed_symbols=failed_symbols,
+            )
+        response = _to_futures_scan_response(report)
+        try:
+            _persist_scanner_run_candidates(
+                repository=repository,
+                scan_id=scan_id,
+                report=report,
+                response=response,
+                quote_asset=normalized_quote,
+                horizon=normalized_horizon,
+                max_symbols=scan_limit,
+                min_opportunity_score=min_opportunity_score,
+            )
+        except Exception:
+            LOGGER.exception("Failed to persist futures scanner run candidates.")
+            response.warnings.append("Scanner candidate persistence failed; visible results are still usable for this session.")
+        try:
+            persist_scanner_validation_snapshots(repository=repository, report=report)
+        except Exception:
+            LOGGER.exception("Failed to persist futures scanner validation snapshots.")
+            response.warnings.append(
+                "Scanner validation snapshot persistence failed; this scan will not be included in paper validation reports."
+            )
+        _persist_scanner_outcome_snapshots(repository=repository, report=report)
+        LOGGER.info("Futures scanner total scan time %.3fs scan_id=%s.", time.perf_counter() - total_started_at, scan_id)
+        return response
+    finally:
+        repository.close()
+
+
+@router.get("/bot/futures-opportunities/live-prices", response_model=FuturesLivePriceResponse)
+async def get_futures_opportunity_live_prices(
+    symbols: Annotated[str, Query(min_length=1)],
+    rest_client: Annotated[BinanceRestClient, Depends(get_rest_client)] = None,
+    heartbeat_service: Annotated[
+        FuturesScannerWebSocketHeartbeatService | None,
+        Depends(get_futures_scanner_heartbeat_service),
+    ] = None,
+) -> FuturesLivePriceResponse:
+    """Return lightweight live prices for visible futures-paper scanner cards."""
+
+    requested = list(sanitize_scanner_symbols(symbols.split(","), max_symbols=100))
+    if not requested:
+        raise HTTPException(status_code=400, detail="symbols must include at least one symbol")
+
+    updated_at = datetime.now(tz=UTC)
+    cached = heartbeat_service.latest_prices(requested, now=updated_at) if heartbeat_service is not None else {}
+    fresh_websocket = {
+        symbol: item
+        for symbol, item in cached.items()
+        if item.source == "websocket" and not item.stale and item.live_price is not None
+    }
+    rest_symbols = [symbol for symbol in requested if symbol not in fresh_websocket]
+    rest_prices: dict[str, tuple[Decimal, Literal["mark_price", "futures_last_price"]]] = {}
+    warnings: list[str] = []
+    try:
+        rows = await rest_client.get_futures_mark_prices(rest_symbols) if rest_symbols else []
+    except Exception:
+        LOGGER.exception("Failed to fetch USD-M Futures mark prices for scanner heartbeat.")
+        try:
+            rows = await rest_client.get_futures_ticker_prices(rest_symbols) if rest_symbols else []
+        except Exception:
+            LOGGER.exception("Failed to fetch USD-M Futures last prices for scanner heartbeat.")
+            rows = []
+            warnings.append("Futures REST price fallback is temporarily unavailable; stale WebSocket cache may be shown.")
+        else:
+            rest_prices = _futures_price_map(rows, price_key="price", price_type="futures_last_price")
+    else:
+        rest_prices = _futures_price_map(rows, price_key="markPrice", price_type="mark_price")
+        missing_symbols = [symbol for symbol in rest_symbols if symbol not in rest_prices]
+        if missing_symbols:
+            try:
+                ticker_rows = await rest_client.get_futures_ticker_prices(missing_symbols)
+            except Exception:
+                LOGGER.exception("Failed to fetch missing USD-M Futures last prices for scanner heartbeat.")
+            else:
+                rest_prices.update(
+                    _futures_price_map(ticker_rows, price_key="price", price_type="futures_last_price")
+                )
+
+    return FuturesLivePriceResponse(
+        items=[
+            _to_futures_live_price_response(
+                symbol=symbol,
+                cached=cached.get(symbol),
+                rest_price=rest_prices.get(symbol),
+                fallback_updated_at=updated_at,
+            )
+            for symbol in requested
+        ],
+        warnings=warnings,
+    )
+
+
+def _futures_price_map(
+    rows: list[dict],
+    *,
+    price_key: str,
+    price_type: Literal["mark_price", "futures_last_price"],
+) -> dict[str, tuple[Decimal, Literal["mark_price", "futures_last_price"]]]:
+    price_by_symbol: dict[str, tuple[Decimal, Literal["mark_price", "futures_last_price"]]] = {}
+    for row in rows:
+        symbol = str(row.get("symbol", "")).upper()
+        raw_price = row.get(price_key)
+        if symbol and raw_price is not None:
+            try:
+                price_by_symbol[symbol] = (Decimal(str(raw_price)), price_type)
+            except Exception:
+                LOGGER.warning("Ignoring invalid USD-M Futures price for %s: %s", symbol, raw_price)
+    return price_by_symbol
+
+
+def _to_futures_live_price_response(
+    *,
+    symbol: str,
+    cached: FuturesScannerLivePrice | None,
+    rest_price: tuple[Decimal, Literal["mark_price", "futures_last_price"]] | None,
+    fallback_updated_at: datetime,
+) -> FuturesLivePriceItemResponse:
+    if cached is not None and cached.source == "websocket" and not cached.stale and cached.live_price is not None:
+        return FuturesLivePriceItemResponse(
+            symbol=symbol,
+            live_price=cached.live_price,
+            updated_at=cached.updated_at,
+            source="websocket",
+            data_source=cached.data_source,
+            price_type=cached.price_type,
+            stale=False,
+            warning=None,
+        )
+    if rest_price is not None:
+        price, price_type = rest_price
+        return FuturesLivePriceItemResponse(
+            symbol=symbol,
+            live_price=price,
+            updated_at=fallback_updated_at,
+            source="rest",
+            data_source="binance_usdm_futures",
+            price_type=price_type,
+            stale=False,
+            warning=None,
+        )
+    if cached is not None and cached.live_price is not None:
+        return FuturesLivePriceItemResponse(
+            symbol=symbol,
+            live_price=cached.live_price,
+            updated_at=cached.updated_at,
+            source="cache",
+            data_source=cached.data_source,
+            price_type=cached.price_type,
+            stale=True,
+            warning=cached.warning or "Cached WebSocket price is stale and REST fallback did not return a price.",
+        )
+    return FuturesLivePriceItemResponse(
+        symbol=symbol,
+        live_price=None,
+        updated_at=cached.updated_at if cached is not None else fallback_updated_at,
+        source="unavailable",
+        data_source="binance_usdm_futures",
+        price_type=cached.price_type if cached is not None else "mark_price",
+        stale=True,
+        warning=(
+            cached.warning if cached is not None and cached.warning else "Live price heartbeat is temporarily unavailable."
+        ),
+    )
+
+
+@router.post("/bot/futures-opportunities/live-subscriptions", response_model=FuturesLiveSubscriptionResponse)
+async def update_futures_opportunity_live_subscriptions(
+    payload: FuturesLiveSubscriptionRequest,
+    heartbeat_service: Annotated[
+        FuturesScannerWebSocketHeartbeatService | None,
+        Depends(get_futures_scanner_heartbeat_service),
+    ] = None,
+) -> FuturesLiveSubscriptionResponse:
+    """Subscribe the scanner heartbeat to currently visible paper scanner symbols."""
+
+    if heartbeat_service is None:
+        sanitized = list(sanitize_scanner_symbols(payload.symbols, max_symbols=100))
+        return FuturesLiveSubscriptionResponse(
+            symbols=sanitized,
+            count=len(sanitized),
+            websocket_enabled=False,
+            warning="WebSocket heartbeat service is unavailable; REST live price fallback remains active.",
+        )
+    try:
+        subscribed = await heartbeat_service.update_subscriptions(payload.symbols)
+    except Exception:
+        LOGGER.exception("Failed to update futures scanner websocket subscriptions.")
+        return FuturesLiveSubscriptionResponse(
+            symbols=[],
+            count=0,
+            websocket_enabled=False,
+            warning="WebSocket heartbeat subscription update failed; REST live price fallback remains active.",
+        )
+    return FuturesLiveSubscriptionResponse(
+        symbols=list(subscribed),
+        count=len(subscribed),
+        websocket_enabled=True,
+        warning=None,
+    )
 
 
 @router.get("/bot/ai-signal", response_model=AISignalResponse | None)

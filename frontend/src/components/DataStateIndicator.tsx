@@ -22,10 +22,10 @@ function dataStateLabel(dataState: WorkstationDataState): string {
     return 'Ready';
   }
   if (dataState === 'waiting_for_runtime') {
-    return 'Waiting for Runtime';
+    return 'Start Runtime';
   }
   if (dataState === 'waiting_for_history') {
-    return 'Waiting for History';
+    return 'Collecting History';
   }
   return 'Degraded Storage';
 }

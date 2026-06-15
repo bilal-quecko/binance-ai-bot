@@ -2,6 +2,197 @@
 
 Chronological implementation checkpoints for Binance AI Bot.
 
+## No. 41 - Spot Paper Opportunity Scanner
+
+- Status: Completed
+- Scope:
+  - added a dedicated paper-only Spot Opportunity Scanner service for Binance Spot USDT symbols
+  - ranked Spot symbols as `buy_candidate`, `watch`, `exit_watch`, or `avoid` instead of Futures-style LONG/SHORT
+  - scored candidates using Spot candles, technical trend, momentum, volatility, liquidity, support/resistance structure, regime analysis, validation evidence, and trade-eligibility evidence
+  - added async progressive Spot scan jobs with start, status, and cancel endpoints
+  - persisted completed Spot scanner runs, candidate rows, scanner-validation snapshots, and post-signal outcome snapshots for later usefulness measurement
+  - added a Discover-tab Spot scanner UI with candidate groups, filters, progress, cancel, and `Simulate Spot Paper Trade` handoff into the existing Spot paper simulation flow
+- Backend:
+  - added `app/monitoring/spot_opportunity_scanner.py`
+  - added `POST /bot/spot-opportunities/scan`
+  - added `GET /bot/spot-opportunities/scan/{scan_id}`
+  - added `POST /bot/spot-opportunities/scan/{scan_id}/cancel`
+  - reused existing scanner persistence tables under a Spot-specific quote key (`SPOT:USDT`) so Futures scanner cache/replay remains separate
+- Frontend:
+  - added typed Spot scanner API helpers and response types
+  - added `SpotPaperScannerSection` to the Discover tab above the Futures Paper Scanner
+  - `Simulate Spot Paper Trade` selects the candidate symbol in Spot context and opens the Spot Paper Simulation tab
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `app/monitoring/spot_opportunity_scanner.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/SpotPaperScannerSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_bot_api.py`
+  - `README.md`
+  - `ROADMAP.md`
+  - `PROGRESS.md`
+- Validation Run:
+  - `.\.venv\Scripts\python.exe -m ruff check app\api\bot_api.py app\monitoring\spot_opportunity_scanner.py tests\test_bot_api.py` passed
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py -q` passed (`52 passed`)
+  - `npm run build` from `frontend/` passed
+- Safety:
+  - no live trading, Spot shorting, real futures execution, Binance order placement, autonomous AI execution, or profitability claim was added
+  - Spot scanner output is advisory-only and paper-only
+  - manual Spot paper execution remains behind the existing deterministic paper trade controls
+- Remaining Limitations:
+  - Spot scan jobs are in-memory process-local state and are not recoverable across backend restarts
+  - Spot scanner simulation handoff opens the existing Spot paper simulation flow; it does not create persistent scanner-owned Spot simulation drafts
+
+## No. 40 - Selected Symbol Analysis + Spot/Futures Paper Simulation Flow
+
+- Status: Completed
+- Scope:
+  - added selected market context (`spot` / `futures`) to keep sidebar Spot selections separate from Futures scanner simulation selections
+  - improved selected-symbol backfill flow so backfill starts while runtime is stopped, status is shown, and analysis refreshes again when candles become available
+  - added market-aware selected-symbol candle/backfill API support for USD-M Futures via futures klines without changing scanner scoring or validation formulas
+  - split the Simulate tab into Spot Paper Simulation and Futures Paper Simulation flows
+- Frontend:
+  - sidebar/watchlist selections default to Spot context and clear prior Futures simulation drafts
+  - Futures scanner Simulate stores scanner candidate context: symbol, direction, entry/live price, stop, take profit, leverage guidance, confidence, opportunity score, reason, and risk grade
+  - Futures Paper Simulation pre-fills scanner values and makes stop loss/take profit editable before simulation review
+  - Spot Paper Simulation uses existing manual spot paper trade controls and shows readable blockers for waiting candles, missing entry, missing stop, missing take profit, and ineligible signals
+- Backend:
+  - `GET /bot/candles` accepts `market=spot|futures`
+  - `GET /bot/backfill-status` accepts `market=spot|futures`
+  - `POST /bot/backfill` accepts `market=spot|futures`
+  - futures selected-symbol backfill uses USD-M Futures klines and returns “Symbol not available on selected market.” when futures candles cannot be loaded
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `tests/test_bot_api.py`
+  - `README.md`
+  - `ROADMAP.md`
+  - `PROGRESS.md`
+- Validation Run:
+  - `npx tsc -b` from `frontend/` passed
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py -k "selected_futures_backfill" -q` passed (`2 passed`)
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py -q` passed (`50 passed`)
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_futures_opportunity_scanner.py -q` passed (`16 passed`)
+  - `.\.venv\Scripts\python.exe -m ruff check app\api\bot_api.py tests\test_bot_api.py` passed; Ruff cache write warnings were sandbox-related
+  - `npm run build` from `frontend/` passed after sandbox escalation for Vite/esbuild worker spawning
+- Safety:
+  - no live trading, real futures execution, Binance order placement, scanner scoring changes, signal formula changes, or validation formula changes were added
+  - Futures Paper Simulation is frontend-only review state in this slice and does not call the Spot manual paper order path
+- Remaining Limitations:
+  - persistent backend futures paper positions were not added in this reviewable slice
+  - Futures selected-symbol analysis currently uses futures candles/backfill plus scanner candidate context; deeper selected-symbol futures technical/advisory modules remain a later backend expansion
+
+## Latest - Async Progressive Futures Scanner Jobs
+
+- Status: Completed
+- Scope:
+  - added process-local background Futures Paper Scanner jobs with `queued`, `running`, `partial`, `completed`, `failed`, and `cancelled` state
+  - added progressive scan progress fields: scanned/total symbols, current phase, current symbol, warnings, failed symbols, timestamps, and partial candidate payloads
+  - kept the old `GET /bot/futures-opportunities` endpoint intact for backward compatibility
+  - preserved existing scanner scoring, LONG/SHORT/WAIT/AVOID classification, validation formulas, USD-M Futures data-source boundaries, and paper-only/advisory-only behavior
+- Backend:
+  - added `POST /bot/futures-opportunities/scan`
+  - added `GET /bot/futures-opportunities/scan/{scan_id}`
+  - added `POST /bot/futures-opportunities/scan/{scan_id}/cancel`
+  - processes symbols in 5-10 symbol batches, updates partial reports after each batch, skips failed symbols, and persists scanner run candidates plus validation snapshots only once after completion
+- Frontend:
+  - Refresh now starts an async scan job and polls every 1.5 seconds
+  - prior completed results stay visible until new partial or final results arrive
+  - progress shows scanned X/Y, current phase, current symbol, and a progress bar
+  - Cancel Scan is available while the scanner job is active
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_bot_api.py`
+  - `README.md`
+  - `ROADMAP.md`
+  - `PROGRESS.md`
+- Validation Run:
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py -k "async_futures_scan" -q` passed (`6 passed`)
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_futures_opportunity_scanner.py tests\test_scanner_validation_report.py -q` passed (`22 passed`)
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py -q` passed (`48 passed`)
+  - `.\.venv\Scripts\python.exe -m ruff check app\api\bot_api.py tests\test_bot_api.py` passed; Ruff cache write warnings were sandbox-related
+  - `npm run build` from `frontend/` passed after sandbox escalation for Vite/esbuild worker spawning
+- Safety:
+  - no live trading, real futures execution, Binance order placement, autonomous AI execution, or profitability claim was added
+  - scanner score/classification logic and validation formulas were not changed in this slice
+- Remaining Limitations:
+  - scanner jobs are in-memory process-local state; jobs are not recoverable across backend restarts
+  - cancellation is cooperative and stops persistence/finalization, but an already-running per-symbol fetch may finish before the worker notices the cancel flag
+
+## Latest - Analysis Runtime Separation and Slow-Market Scanner Sensitivity
+
+- Status: Completed
+- Scope:
+  - separated selected-symbol analysis from paper trading runtime controls in the frontend
+  - added paper-only Market Sensitivity labeling, with Active mode mapped to the existing aggressive paper profile
+  - added deterministic slow-market setup detection to the Futures Paper Scanner without adding live trading or futures execution
+  - improved scanner timing logs and verified USD-M Futures candle cache usage before Binance fetches
+  - improved readable no-trade blocker wording for low volatility, weak liquidity, and fee/slippage edge failures
+- Frontend:
+  - `Start`, `Pause`, `Resume`, and `Stop` no longer overwrite the selected analysis symbol with the backend runtime symbol after a runtime action
+  - selected-symbol UI now labels `Analyze Symbol`, `Paper Trading Controls`, `Loading core signal`, and `Advanced details updating`
+  - Futures Paper Scanner keeps prior results visible during refresh and exposes Market Sensitivity plus slow-market setup details on candidate cards
+- Backend:
+  - Futures scanner accepts `market_sensitivity=conservative|balanced|aggressive`
+  - Active sensitivity can surface smaller slow-market paper candidates only when deterministic structure is clean
+  - slow-market setup labels include range breakout, liquidity sweep reversal, compression breakout, mean reversion from range edge, low-volatility continuation, and low-volatility no-edge
+  - scanner remains USD-M Futures only for candles and live scanner prices
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `app/monitoring/futures_opportunity_scanner.py`
+  - `app/runner/strategy_runner.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/BotControlPanel.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/blocker-explanations.js`
+  - `frontend/src/lib/types.ts`
+  - `frontend/tests/blocker-explanations.test.mjs`
+  - `tests/test_bot_api.py`
+  - `tests/test_futures_opportunity_scanner.py`
+- Validation Run:
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_futures_opportunity_scanner.py -q` passed (`16 passed`)
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py::test_futures_opportunities_response_shape_and_safety_flags tests\test_bot_api.py::test_futures_opportunities_uses_cached_usdm_candles_before_fetching tests\test_bot_api.py::test_futures_opportunities_returns_partial_when_symbol_scan_fails -q` passed (`3 passed`)
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_strategy_runner.py tests\test_trend_following_strategy.py -q` passed (`10 passed`)
+  - `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py tests\test_futures_opportunity_scanner.py tests\test_trade_eligibility.py tests\test_scanner_validation_report.py -q` passed (`74 passed`)
+  - `node --test frontend\tests` passed after sandbox escalation for Node worker spawning (`5 passed`)
+  - `npm run build` from `frontend/` passed after sandbox escalation for Vite/esbuild worker spawning
+  - Ruff on touched Python paths passed; pytest/Ruff cache write warnings were sandbox-related
+- Safety:
+  - no live trading, real futures execution, Binance order placement, autonomous AI execution, or profitability claim was added
+  - paper runtime controls remain paper-only and deterministic
+  - scanner scoring inputs, validation snapshots, funding/OI, heatmap, liquidation intelligence, and USD-M Futures data-source boundaries were preserved
+- Remaining Limitations:
+  - scanner HTTP responses still return when the backend request completes; existing visible results stay on screen during refresh, and partial backend results appear when slower symbols time out
+  - Active sensitivity is intentionally conservative: it can surface watch/eligible slow-market candidates, but it does not force paper trades or bypass risk/liquidity/cost gates
+
+## Latest - Futures Scanner Fallback Bootstrap
+
+- Status: Completed
+- Scope:
+  - made the Futures Paper Scanner degrade gracefully when Binance USD-M APIs are temporarily unavailable
+  - persisted the full successful scanner response with scanner run metadata so failures can replay the last successful result
+  - added cached/fallback symbol-universe diagnostics, curated first-run fallback symbols, and stable empty degraded responses when no scan exists yet
+- Backend:
+  - returns `data_source=last_successful_cache` with `scan_state=degraded` when a live scan fails after a persisted successful run
+  - uses cached USD-M symbol universe first, then the curated USDT fallback list when `exchangeInfo` is unavailable
+  - skips failing futures kline symbols and returns an empty degraded state instead of a hard 500 when no cached scanner result exists
+- Frontend:
+  - shows cached degraded scanner results with a warning badge when candidates exist
+  - shows a clear no-results retry state when Binance is unavailable and no persisted result exists
+  - removed misleading "previous results remain visible" copy when there are no previous candidates
+- Validation:
+  - added backend regression coverage for cached universe fallback, curated fallback, last-successful replay, empty degraded startup, and persisted reload behavior
+  - added frontend helper coverage for cached-result and no-result scanner messaging
+
 ## No. 1 — AI Advisory History Persistence
 
 - Status: Completed
@@ -751,3 +942,843 @@ Chronological implementation checkpoints for Binance AI Bot.
   - prevented recovered runtime symbols from being re-selected repeatedly after the operator clears or changes the symbol
   - cleared stale selected-symbol signal state immediately when a new symbol is selected so ETH data does not remain visible while BNB is loading
   - frontend production build after hardening: `npm run build` passed
+
+## No. 30 - Futures Paper Long/Short Opportunity Scanner
+
+- Status: Completed
+- What Changed:
+  - added a paper-only futures intelligence scanner that ranks Binance quote-asset symbols as `long`, `short`, `wait`, or `avoid`
+  - added deterministic long/short scoring from stored/live candles, technical structure, momentum, regime, similar-setup evidence, trade eligibility, blockers, fee/spread impact, and risk filters
+  - added a typed futures-paper signal model with direction, confidence, evidence strength, best horizon, risk grade, regime, current price, reason, invalidation hint, entry/stop/take-profit guidance, estimated fee impact, leverage suggestion, liquidation safety note, similar setup summary, eligibility status, warnings, and timestamp
+  - added conservative safety behavior: insufficient evidence never becomes LONG/SHORT, choppy and low-liquidity regimes are AVOID, leverage suggestions stay at `1x paper-only`, and reported max leverage is capped at `3x paper-only`
+  - added `GET /bot/futures-opportunities` with `quote_asset`, `limit`, `horizon`, `min_confidence`, and `include_avoid` filters
+  - added a visible `Futures Paper Scanner` UI section with Paper Futures Mode, Advisory Only, No Real Orders, and Long/Short Simulation labels
+  - rendered LONG candidates in green, SHORT candidates in red, and WAIT/AVOID candidates in neutral styling without blocking the V1 main signal screen
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `app/monitoring/futures_opportunity_scanner.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_bot_api.py`
+  - `tests/test_futures_opportunity_scanner.py`
+  - `PROGRESS.md`
+- Endpoint Added:
+  - `GET /bot/futures-opportunities`
+- Tests Run:
+  - focused scanner/API tests: `.\.venv\Scripts\python.exe -m pytest tests\test_futures_opportunity_scanner.py tests\test_bot_api.py -k "futures_opportunit"` (`8 passed`)
+  - bot API tests: `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py` (`24 passed`)
+  - Ruff lint: `.\.venv\Scripts\python.exe -m ruff check app\api\bot_api.py app\monitoring\futures_opportunity_scanner.py tests\test_futures_opportunity_scanner.py tests\test_bot_api.py` passed
+  - frontend production build: `npm run build` passed
+- Safety Limitations:
+  - no real futures trading, live futures execution, Binance futures order placement, or AI execution path was added
+  - this is an advisory paper scanner only; it does not open, close, or simulate persistent futures positions
+  - leverage guidance is conservative and report-only, with default `1x paper-only` and max `3x paper-only`
+  - original implementation was evidence-gated; see No. 30 correction below for the market-wide opportunity-scanner behavior
+  - existing spot paper mode and the V1 signal-provider screen remain intact
+- Next Suggested Phase:
+  - add a paper-only futures watchlist/session simulator that records hypothetical long/short outcomes from scanner signals, then validate whether scanner-ranked LONG/SHORT candidates outperform WAIT/AVOID without enabling live execution
+
+## No. 30 Correction - Market-Wide Futures Paper Opportunity Scanner
+
+- Status: Completed
+- Correction Summary:
+  - updated the No. 30 scanner from a validation-gated, selected-symbol-dependent scanner into a market-wide opportunity scanner
+  - scanner now fetches fresh Binance 15m and 1h OHLCV candles for scanned USDT symbols when local data is missing or stale
+  - fetched scanner candles are cached in historical candle storage with source `futures_scanner_rest`
+  - LONG/SHORT classification now comes from current market structure, trend, momentum, volatility quality, liquidity, and risk scores
+  - missing internal signal-validation or similar-setup evidence no longer blocks LONG/SHORT candidates
+  - candidates with limited internal evidence are labeled `unvalidated` or weak instead of being suppressed
+  - final ranking now primarily uses `opportunity_score`, with validation only adjusting confidence
+  - replaced the old insufficient-evidence wording with current-filter wording and weak-validation warnings
+- Added Scores:
+  - `opportunity_score`
+  - `direction_score`
+  - `trend_score`
+  - `momentum_score`
+  - `volatility_quality_score`
+  - `liquidity_score`
+  - `risk_score`
+  - optional `validation_score`
+- Frontend:
+  - added scanner controls for minimum opportunity score, max symbols, weak evidence inclusion, WAIT/AVOID inclusion, and horizon
+  - added spinner/progress messaging while a scan request is active
+  - kept prior partial results visible while refreshing
+  - candidate cards now show opportunity score, confidence, evidence strength, trend, momentum, best horizon, reason, warning, stop loss, and take profit
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `app/monitoring/futures_opportunity_scanner.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_bot_api.py`
+  - `tests/test_futures_opportunity_scanner.py`
+  - `PROGRESS.md`
+- Tests Run:
+  - focused scanner tests: `.\.venv\Scripts\python.exe -m pytest tests\test_futures_opportunity_scanner.py --basetemp=tests\.tmp_pytest_futures` (`10 passed`)
+  - bot API tests: `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py --basetemp=tests\.tmp_pytest_bot` (`24 passed`)
+  - Ruff: `.\.venv\Scripts\python.exe -m ruff check app\monitoring\futures_opportunity_scanner.py app\api\bot_api.py tests\test_futures_opportunity_scanner.py tests\test_bot_api.py` passed
+  - frontend production build: `npm run build` passed
+- Safety:
+  - no real futures trading, live futures execution, Binance futures order placement, or autonomous AI execution was added
+  - scanner remains paper-only and advisory-only
+
+## No. 31 - SQLite Persistence Path Hardening and Documentation Alignment
+
+- Status: Completed
+- SQLite Persistence Path Hardening:
+  - changed the default local database URL from `sqlite:///./binance_ai_bot.db` to `sqlite:///./data/binance_ai_bot.db`
+  - kept the SQLite database repo-local and stable for local development while allowing `.env` overrides
+  - ensured the configured SQLite parent directory is created automatically during path resolution
+  - changed storage path resolution so WAL unavailability no longer forces temp storage when the configured database path is writable
+  - kept WAL as the preferred journal mode where supported
+  - added a clear warning when WAL is unavailable but persistent SQLite default journaling is used
+  - kept temp storage only for paths that cannot support persistent SQLite writes, with a warning that paper sessions, signal history, and validation data may not survive cleanup or restart
+- Documentation Alignment:
+  - updated `README.md` to describe the current AI-Assisted Binance Signal Intelligence Platform, V1 signal dashboard, Advanced Details - Pro, local SQLite setup, endpoints, paper limitations, safety disclaimers, and SQLite troubleshooting
+  - updated `AGENTS.md` with current development priorities, paper-only and AI-advisory rules, V1 UI rules, Advanced Details - Pro guidance, futures paper scanner rules, documentation requirements, and persistence rules
+  - updated `ROADMAP.md` to mark V1 Signal Provider, signal validation, regime analysis, similar setup outcomes, trade eligibility, adaptive recommendations, and the current futures paper scanner state accurately
+- Files Changed:
+  - `.env.example`
+  - `.gitignore`
+  - `AGENTS.md`
+  - `README.md`
+  - `ROADMAP.md`
+  - `PROGRESS.md`
+  - `app/config/settings.py`
+  - `app/storage/db.py`
+  - `app/storage/repositories.py`
+  - `tests/test_settings.py`
+  - `tests/test_storage.py`
+- Tests Run:
+  - focused storage/config tests: `.\.venv\Scripts\python.exe -m pytest tests\test_storage.py tests\test_settings.py --basetemp=tests\.tmp_pytest` (`16 passed`)
+  - relevant backend tests: `.\.venv\Scripts\python.exe -m pytest tests\test_dashboard_api.py tests\test_health.py --basetemp=tests\.tmp_pytest` (`6 passed`)
+  - persistence/status backend slice: `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py -k "status or persistence" --basetemp=tests\.tmp_pytest_bot` (`4 passed, 20 deselected`)
+  - Ruff on touched Python paths: `.\.venv\Scripts\python.exe -m ruff check app\storage\db.py app\storage\repositories.py app\config\settings.py tests\test_storage.py tests\test_settings.py` passed
+- Remaining Limitations:
+  - the current sandbox reports SQLite `disk I/O error` for direct workspace database writes, so real repository tests may still use the existing temp fallback in this environment
+  - no live trading, real futures execution, or autonomous AI execution was added
+  - no profitability guarantees were added
+
+## No. 31 - Scanner Signal Outcome Validation Report
+
+- Status: Completed
+- Scope:
+  - added isolated paper-validation storage for Futures Paper Scanner snapshots and fixed-horizon outcomes
+  - scanner runs now persist validation snapshots for top LONG, top SHORT, neutral, and random-baseline candidates without changing scanner scoring or ranking
+  - added deterministic outcome evaluation after `15m`, `1h`, `4h`, and `24h` using stored candles
+  - calculated gross return, estimated fees, estimated slippage, estimated net return, direction correctness, MFE, MAE, TP/SL hits, and TP/SL first state
+  - added scanner-vs-random-baseline, opportunity-score bucket, LONG/SHORT, horizon, symbol, regime, and TP/SL report summaries
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `app/api/dashboard_api.py`
+  - `app/monitoring/scanner_validation_report.py`
+  - `app/storage/db.py`
+  - `app/storage/models.py`
+  - `app/storage/repositories.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/ScannerValidationReportSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_bot_api.py`
+  - `tests/test_scanner_validation_report.py`
+  - `PROGRESS.md`
+- Endpoints Added:
+  - `GET /performance/scanner-validation-report`
+  - `POST /performance/scanner-validation/evaluate`
+- What Is Now Possible:
+  - the bot can store every market-wide futures scanner run as paper-validation evidence
+  - pending scanner snapshots can be evaluated manually when enough stored candles exist
+  - the operator can see whether scanner picks outperform random baseline and whether higher opportunity scores correlate with better estimated net returns
+  - the UI has a separate `Scanner Validation Report` tab with paper-validation wording, estimated net return labels, warnings, and an `Evaluate Pending Results` action
+- Limitations:
+  - evaluation depends on stored candles being available for the target horizon
+  - results are paper validation only and use estimated fees/slippage
+  - no live trading, real futures execution, autonomous AI execution, or guaranteed profitability claim was added
+- Next Suggested Phase:
+  - build a 7-day paper validation report that combines V1 signals, trade eligibility, futures scanner outcomes, and adaptive recommendations into one sample-size-gated operator report
+
+## No. 32 - Futures Paper Scanner Live Heartbeat
+
+- Status: Completed
+- Scope:
+  - added lightweight live-price heartbeat updates for visible Futures Paper Scanner candidates
+  - added `GET /bot/futures-opportunities/live-prices` for display-only latest ticker prices by comma-separated symbols
+  - kept full scanner analysis separate from heartbeat updates so scoring is not recomputed every tick
+  - added display-only heartbeat calculations for live movement since scan, distance to stop, distance to take profit, signal age, price age, and card status
+  - added statuses: `active`, `near_take_profit`, `take_profit_touched`, `near_stop`, `invalidated`, and `stale`
+  - added UI auto-rescan options: Off, Every 5 minutes, and Every 15 minutes
+  - kept previous scanner results visible while analysis refreshes
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `app/exchange/binance_rest.py`
+  - `app/monitoring/futures_scanner_heartbeat.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_bot_api.py`
+  - `tests/test_futures_scanner_heartbeat.py`
+  - `PROGRESS.md`
+- Tests Run:
+  - Ruff lint: `.\.venv\Scripts\python.exe -m ruff check app\api\bot_api.py app\exchange\binance_rest.py app\monitoring\futures_scanner_heartbeat.py tests\test_bot_api.py tests\test_futures_scanner_heartbeat.py` passed
+  - focused heartbeat/scanner validation tests: `.\.venv\Scripts\python.exe -m pytest tests\test_futures_scanner_heartbeat.py tests\test_futures_opportunity_scanner.py tests\test_scanner_validation_report.py tests\test_bot_api.py -k "heartbeat or futures_opportunit or scanner_validation" --basetemp=tests\.tmp_pytest_heartbeat` (`24 passed, 22 deselected`)
+  - bot API tests: `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py --basetemp=tests\.tmp_pytest_bot` (`26 passed`)
+  - frontend production build: `npm run build` passed
+- Limitations:
+  - heartbeat currently uses efficient Binance REST ticker polling as the fallback path; a dedicated multi-symbol WebSocket fanout can be added later
+  - live price heartbeat is display-only and does not update No. 31 scanner-validation scan prices
+  - no real futures trading, Binance futures orders, autonomous AI execution, or profitability guarantee was added
+
+## No. 33 - Futures Paper Scanner WebSocket Heartbeat
+
+- Status: Completed
+- Scope:
+  - added a lightweight Binance miniTicker WebSocket cache for visible Futures Paper Scanner symbols only
+  - added subscription management so the backend subscribes only to currently visible scanner candidates and caps subscriptions at 50 symbols
+  - updated `GET /bot/futures-opportunities/live-prices` to prefer fresh WebSocket prices, fall back to REST ticker prices when WebSocket data is missing or stale, and report `websocket`, `rest`, `cache`, or `unavailable`
+  - added `POST /bot/futures-opportunities/live-subscriptions` for debounced visible-symbol subscription updates
+  - updated scanner cards to show WS/REST/Cache source badges and stale warnings without triggering full scanner re-analysis
+  - preserved scan-time prices for No. 31 scanner validation snapshots
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `app/main.py`
+  - `app/monitoring/futures_scanner_ws_heartbeat.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_bot_api.py`
+  - `tests/test_futures_scanner_ws_heartbeat.py`
+  - `PROGRESS.md`
+- Tests Run:
+  - Ruff lint: `.\.venv\Scripts\python.exe -m ruff check app\api\bot_api.py app\main.py app\monitoring\futures_scanner_ws_heartbeat.py tests\test_bot_api.py tests\test_futures_scanner_ws_heartbeat.py` passed
+  - focused WebSocket heartbeat/API tests: `.\.venv\Scripts\python.exe -m pytest tests\test_futures_scanner_ws_heartbeat.py tests\test_bot_api.py -k "live_prices or live_subscriptions or ws_heartbeat or futures_opportunities" --basetemp=tests\.tmp_pytest_ws_heartbeat` (`13 passed, 22 deselected`)
+  - scanner and validation tests: `.\.venv\Scripts\python.exe -m pytest tests\test_futures_opportunity_scanner.py tests\test_scanner_validation_report.py tests\test_futures_scanner_heartbeat.py tests\test_futures_scanner_ws_heartbeat.py --basetemp=tests\.tmp_pytest_scanner_ws_full` (`25 passed`)
+  - bot API tests: `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py --basetemp=tests\.tmp_pytest_bot_ws` (`30 passed`)
+  - frontend production build: `npm run build` passed
+- Limitations:
+  - WebSocket prices depend on Binance stream availability; REST ticker polling remains the recovery path
+  - heartbeat remains display-only and does not recompute scanner scores or overwrite scanner-validation snapshot prices
+  - no real futures trading, Binance futures order placement, autonomous AI execution, or profitability guarantee was added
+
+### No. 33 WebSocket Data Flow Correction
+
+- Status: Completed
+- Summary:
+  - fixed Binance stream casing so scanner subscriptions use `<symbol lowercase>@miniTicker`
+  - preserved combined stream URLs as `wss://stream.binance.com:9443/stream?streams=symbol1@miniTicker/symbol2@miniTicker`
+  - added nested combined-payload parsing for `{ stream, data: { s, c } }` while retaining support for already-unwrapped payloads
+  - lowered WebSocket stale detection to 5 seconds so REST fallback activates quickly when the stream is empty or disconnected
+  - added temporary connection, subscription, message, and price-update logging for heartbeat debugging
+- Tests Run:
+  - Ruff lint: `.\.venv\Scripts\python.exe -m ruff check app\exchange\binance_ws.py app\monitoring\futures_scanner_ws_heartbeat.py tests\test_futures_scanner_ws_heartbeat.py tests\test_stream_manager.py` passed
+  - WebSocket flow tests: `.\.venv\Scripts\python.exe -m pytest tests\test_futures_scanner_ws_heartbeat.py tests\test_stream_manager.py --basetemp=tests\.tmp_pytest_ws_flow` (`9 passed`)
+  - focused bot API heartbeat tests: `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py -k "live_prices or live_subscriptions or futures_opportunities" --basetemp=tests\.tmp_pytest_bot_ws_flow` (`8 passed, 22 deselected`)
+  - scanner validation report tests: `.\.venv\Scripts\python.exe -m pytest tests\test_scanner_validation_report.py --basetemp=tests\.tmp_pytest_validation_ws_flow` (`6 passed`)
+  - live BTCUSDT WebSocket smoke test outside sandbox: received a fresh BTCUSDT miniTicker price from `wss://stream.binance.com:9443/stream?streams=btcusdt@miniTicker`
+- Safety:
+  - scanner scoring, validation snapshots, UI layout, and execution flows were not changed
+  - no live trading, real futures execution, Binance order placement, autonomous execution, or profitability claim was added
+
+## No. 34 - Futures Scanner Coverage and Paper Leverage Simulation
+
+- Status: Completed
+- Max-Symbol Scan Expansion:
+  - backend scanner requests now accept `max_symbols` and cap requested scan size at 100 instead of rejecting larger values
+  - frontend scanner control now offers 20, 50, and 100-symbol scan sizes with 50 as the default
+  - 100-symbol scans show the warning: `Large scan may take longer and use more Binance requests.`
+  - existing refresh behavior keeps previous scanner results visible while the new scan is running
+  - scanner processing remains rate-limit conservative by avoiding excessive simultaneous Binance requests and still returns partial/degraded results when symbols fail
+- Paper Leverage Simulator:
+  - added a display-only leverage simulator for LONG/SHORT scanner cards
+  - global leverage selector supports 1x, 2x, 3x, 5x, 10x, 25x, 50x, and 100x with 5x as the default
+  - cards show selected leverage, fee-adjusted TP estimate, fee-adjusted SL estimate, live estimate, risk label, and high/extreme leverage warnings
+  - 50x and 100x show: `Extreme paper leverage. Small adverse moves can wipe out simulated margin.`
+  - leverage does not alter opportunity score, confidence, LONG/SHORT classification, ranking, validation snapshots, or scan-time prices
+- Files Changed:
+  - `AGENTS.md`
+  - `README.md`
+  - `ROADMAP.md`
+  - `PROGRESS.md`
+  - `app/api/bot_api.py`
+  - `app/monitoring/futures_leverage_simulator.py`
+  - `app/monitoring/futures_scanner_ws_heartbeat.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/futuresLeverage.ts`
+  - `tests/test_bot_api.py`
+  - `tests/test_futures_leverage_simulator.py`
+- Tests Run:
+  - Ruff lint: `.\.venv\Scripts\python.exe -m ruff check app\api\bot_api.py app\monitoring\futures_leverage_simulator.py app\monitoring\futures_scanner_ws_heartbeat.py tests\test_bot_api.py tests\test_futures_leverage_simulator.py` passed
+  - focused scanner/leverage tests: `.\.venv\Scripts\python.exe -m pytest tests\test_futures_leverage_simulator.py tests\test_futures_opportunity_scanner.py tests\test_bot_api.py -k "futures_opportunit or leverage" --basetemp=tests\.tmp_pytest_scanner_leverage` (`24 passed, 22 deselected`)
+  - bot API tests: `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py --basetemp=tests\.tmp_pytest_bot_leverage` (`32 passed`)
+  - scanner validation report tests: `.\.venv\Scripts\python.exe -m pytest tests\test_scanner_validation_report.py --basetemp=tests\.tmp_pytest_scanner_validation_leverage` (`6 passed`)
+  - frontend production build: `npm run build` passed
+- Safety Limitations:
+  - leverage simulation is paper-only and display-only
+  - no scanner scoring, classification, validation snapshot, V1 dashboard, or execution flow was changed
+  - no real futures trading, Binance futures order placement, autonomous execution, or profitability guarantee was added
+
+## No. 33 - Full UX Refactor: Decision-First Trading Assistant
+
+- Status: Completed
+- UX structure changed:
+  - reorganized the frontend into five primary tabs: Discover, Signal, Simulate, Validate, and Advanced
+  - made Discover the market-wide Futures Paper Scanner entry point
+  - made Signal a single selected-symbol decision card with reason, risk, eligibility, horizon, and paper/advisory badges
+  - made Simulate the paper execution and leverage-risk simulation workspace
+  - made Validate the trust/proof workspace with summary-first paper validation
+  - moved power-user analytics and diagnostics into Advanced Details - Pro sections
+- Components reorganized:
+  - redesigned scanner cards to show decision-first fields on the main card
+  - preserved hidden scanner metrics, heartbeat details, stop/TP context, and internal scores inside Advanced Details - Pro
+  - kept manual paper buy/close controls in Simulate
+  - kept technical analysis, sentiment, adaptive recommendations, paper analytics, diagnostics, persistence health, AI history, and profile calibration functional in Advanced
+- Safety:
+  - backend logic, scanner scoring, validation snapshots, and trading calculations were not intentionally changed
+  - paper-only and advisory-only positioning remains visible
+  - no live trading, real futures execution, real order placement, autonomous AI execution, or profitability claims were added
+- Files changed:
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/futuresLeverage.ts`
+  - `PROGRESS.md`
+- Validation:
+  - frontend production build: `npm run build` passed
+  - frontend tests: no frontend test script is defined in `frontend/package.json`
+- Remaining limitations:
+  - this is a frontend UX refactor; it does not add new backend analysis or execution capabilities
+  - validation statistics remain paper validation and estimated net return only
+
+## No. 34 - Liquidity Bias Engine
+
+- Status: Completed
+- Scope:
+  - added a liquidity-positioning estimator for advisory leverage context
+  - estimates bullish, bearish, or neutral liquidity bias without requiring exact liquidation-map data
+  - uses optional funding-rate and open-interest trend inputs when available
+  - falls back to structure-based estimation from recent candles, range compression, price extension, and volatility regime
+- Backend:
+  - added `app/monitoring/liquidity_bias.py`
+  - integrated liquidity bias into the Trading Assistant as a confidence and BUY-to-WAIT adjustment when high downside sweep risk conflicts with a long entry
+  - integrated liquidity bias into Trade Eligibility as a watch-only adjustment and warning source
+  - integrated liquidity fields into Futures Paper Scanner candidates without changing opportunity-score ranking or technical scoring formulas
+  - extended `TradingAssistantResponse` and `FuturesPaperSignalResponse` with liquidity bias, pressure, likely liquidation direction, trap risk, and explanation fields
+- Frontend:
+  - added a simple main Signal view liquidity summary such as `Liquidity: High downside sweep risk` or `Liquidity: Short squeeze risk`
+  - moved detailed liquidity fields into Advanced Details - Pro for Trading Assistant and scanner cards
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `app/monitoring/liquidity_bias.py`
+  - `app/monitoring/trade_eligibility.py`
+  - `app/monitoring/futures_opportunity_scanner.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/TradingAssistantSection.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_liquidity_bias.py`
+  - `tests/test_trade_eligibility.py`
+  - `tests/test_futures_opportunity_scanner.py`
+  - `tests/test_bot_api.py`
+  - `PROGRESS.md`
+- Tests Run:
+  - focused liquidity/eligibility/scanner tests: `.\.venv\Scripts\python.exe -m pytest tests\test_liquidity_bias.py tests\test_trade_eligibility.py tests\test_futures_opportunity_scanner.py --basetemp=tests\.tmp_pytest_liquidity` (`21 passed`)
+  - bot API tests: `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py --basetemp=tests\.tmp_pytest_bot_liquidity` (`32 passed`)
+  - signal/scanner tests: `.\.venv\Scripts\python.exe -m pytest tests\test_fusion_signal.py tests\test_signal_validation.py tests\test_futures_opportunity_scanner.py --basetemp=tests\.tmp_pytest_signal_liquidity` (`21 passed`)
+  - Ruff lint: `.\.venv\Scripts\python.exe -m ruff check app\monitoring\liquidity_bias.py app\monitoring\trade_eligibility.py app\monitoring\futures_opportunity_scanner.py app\api\bot_api.py tests\test_liquidity_bias.py tests\test_trade_eligibility.py tests\test_futures_opportunity_scanner.py tests\test_bot_api.py` passed
+  - frontend production build: `npm run build` passed
+- Safety:
+  - liquidity bias is advisory and estimated only
+  - no existing technical scoring logic was changed
+  - no current signals were removed
+  - no live trading, real futures execution, autonomous AI execution, or guaranteed profitability claim was added
+- Remaining Limitations:
+  - funding rate and open-interest inputs are optional placeholders until a dedicated futures-market-data source is added
+  - fallback estimates are structure-based and should be treated as contextual risk signals, not exact liquidation levels
+
+## No. 35 - Liquidity Zone Detection + TP/SL Alignment
+
+- Status: Completed
+- Scope:
+  - added estimated upside and downside liquidity-zone detection from recent highs/lows, equal high/low clusters, range extremes, swing structure, compression, and No. 34 liquidity-bias context
+  - added nearest estimated liquidity target, sweep risk, trade timing adjustment, TP/SL alignment, and concise liquidity-zone explanation
+  - kept zones explicitly estimated areas, not exact liquidation prices
+- Backend:
+  - added `app/monitoring/liquidity_zones.py`
+  - integrated liquidity-zone context into Trading Assistant as a small confidence/WAIT adjustment when sweep risk directly opposes a paper entry
+  - integrated liquidity-zone context into Trade Eligibility as watch-only/not-eligible guidance for stop-too-close, wait-for-sweep, and avoid-chop cases
+  - added liquidity-zone fields to Futures Paper Scanner candidates without changing opportunity-score ranking, technical scoring, scanner classification, validation snapshots, or execution behavior
+  - extended Trading Assistant, Trade Eligibility, and Futures Paper Scanner API response shapes with safe liquidity-zone fallback fields
+- Frontend:
+  - Signal main view now uses simple liquidity wording such as `Liquidity: Downside sweep risk`, `Liquidity: Upside liquidity target nearby`, `Liquidity: Choppy both-side liquidity`, or `Liquidity: Clean path`
+  - Futures Paper Scanner cards show one simple liquidity line on the main card
+  - detailed upside/downside zone, nearest target, sweep risk, trade timing, TP/SL alignment, and explanations are preserved inside Advanced Details - Pro
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `app/monitoring/liquidity_zones.py`
+  - `app/monitoring/trade_eligibility.py`
+  - `app/monitoring/futures_opportunity_scanner.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/TradingAssistantSection.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_liquidity_zones.py`
+  - `tests/test_liquidity_bias.py`
+  - `tests/test_trade_eligibility.py`
+  - `tests/test_futures_opportunity_scanner.py`
+  - `tests/test_bot_api.py`
+  - `PROGRESS.md`
+- Tests Run:
+  - liquidity/eligibility/scanner tests: `.\.venv\Scripts\python.exe -m pytest tests\test_liquidity_bias.py tests\test_liquidity_zones.py tests\test_trade_eligibility.py tests\test_futures_opportunity_scanner.py --basetemp=tests\.tmp_pytest_liquidity_zones` (`34 passed`)
+  - bot API tests: `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py --basetemp=tests\.tmp_pytest_bot_liquidity_zones` (`32 passed`)
+  - scanner validation report tests: `.\.venv\Scripts\python.exe -m pytest tests\test_scanner_validation_report.py --basetemp=tests\.tmp_pytest_scanner_validation_liquidity_zones` (`6 passed`)
+  - Ruff lint: `.\.venv\Scripts\python.exe -m ruff check app\monitoring\liquidity_bias.py app\monitoring\liquidity_zones.py app\monitoring\trade_eligibility.py app\monitoring\futures_opportunity_scanner.py app\api\bot_api.py tests\test_liquidity_bias.py tests\test_liquidity_zones.py tests\test_trade_eligibility.py tests\test_futures_opportunity_scanner.py tests\test_bot_api.py` passed
+  - frontend production build: `npm run build` passed
+- Safety:
+  - liquidity zones remain advisory estimated areas only
+  - no exact liquidation map, live trading, real futures execution, real order placement, autonomous AI execution, or profitability claim was added
+  - existing scanner scoring/ranking, No. 31 validation snapshots, and paper execution flows were preserved
+- Remaining Limitations:
+  - estimates use available candles and optional liquidity-bias context; exact liquidation pools, order-book depth, funding, and open interest still require dedicated futures data sources
+  - TP/SL alignment is contextual guidance and does not guarantee execution quality or outcomes
+
+## No. 36 - Post-Signal Outcome Tracking
+
+- Status: Completed
+- Scope:
+  - added analysis-only tracking for generated Trading Assistant, Futures Opportunity Scanner, and Trade Eligibility signals
+  - persists every tracked generated signal as a UUID snapshot with symbol, timestamp, source, signal type, confidence, entry price, liquidity bias, sweep risk, nearest liquidity zones, optional funding/open-interest placeholders, and notes
+  - evaluates stored signals over `5m`, `15m`, `1h`, `4h`, and `24h` horizons from stored OHLCV candles
+- Outcome Evaluation:
+  - added `app/monitoring/signal_outcomes.py`
+  - computes price change percent, max upside, max downside, TP hit, SL hit, first TP/SL hit, time to hit, direction correctness, volatility range, actual sweep direction, and liquidity sweep prediction correctness
+  - uses a deterministic lightweight TP/SL model: BUY TP `+1.5%`, BUY SL `-1%`, SELL TP `-1.5%`, SELL SL `+1%`
+  - added a background `SignalOutcomeBackgroundService` that evaluates matured snapshots from SQLite without changing execution behavior
+- Performance Summary:
+  - added `app/monitoring/performance_summary.py`
+  - computes total signals, evaluated signals, win rate, average return, average max upside, average max drawdown, TP hit rate, and SL hit rate
+  - segments metrics by signal type, confidence bucket, liquidity bias, and source
+- API:
+  - added `GET /performance/summary`
+  - added `GET /performance/signal-history`
+  - added `GET /performance/signal/{id}`
+  - endpoints return paper-validation JSON only and do not place or simulate real orders
+- Frontend:
+  - added a minimal Validate-tab Performance section with win rate, average return, TP vs SL ratio, recent signal history, and signal detail view
+  - signal detail shows entry price, current outcome, max upside/downside, TP/SL hit state, and liquidity prediction result
+  - Futures Paper Scanner cards now show a compact `Historically Accurate` tag from existing validation score context
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `app/api/dashboard_api.py`
+  - `app/main.py`
+  - `app/monitoring/signal_outcomes.py`
+  - `app/monitoring/performance_summary.py`
+  - `app/storage/db.py`
+  - `app/storage/models.py`
+  - `app/storage/repositories.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_signal_outcomes.py`
+  - `tests/test_performance_summary.py`
+  - `PROGRESS.md`
+- Tests Run:
+  - post-signal outcome and summary tests: `.\.venv\Scripts\python.exe -m pytest tests\test_signal_outcomes.py tests\test_performance_summary.py --basetemp=tests\.tmp_pytest_signal_outcomes` (`6 passed`)
+  - bot/dashboard API tests: `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py tests\test_dashboard_api.py --basetemp=tests\.tmp_pytest_outcome_api` (`37 passed`)
+  - scanner/scanner-validation tests: `.\.venv\Scripts\python.exe -m pytest tests\test_futures_opportunity_scanner.py tests\test_scanner_validation_report.py --basetemp=tests\.tmp_pytest_outcome_scanner` (`18 passed`)
+  - Ruff lint: `.\.venv\Scripts\python.exe -m ruff check app\monitoring\signal_outcomes.py app\monitoring\performance_summary.py app\storage\db.py app\storage\models.py app\storage\repositories.py app\api\bot_api.py app\api\dashboard_api.py app\main.py tests\test_signal_outcomes.py tests\test_performance_summary.py` passed
+  - frontend production build: `npm run build` passed
+- Safety:
+  - no live trading, real futures execution, Binance order placement, autonomous AI execution, scanner ranking change, or profitability claim was added
+  - outcome tracking is analysis-only and uses stored candle data
+- Remaining Limitations:
+  - funding rate and open interest are stored as optional placeholders until dedicated futures-market-data collection exists
+  - outcomes depend on stored candles being available for each horizon
+  - TP/SL and sweep validation are deterministic approximations, not exchange execution records
+
+## No. 36.5 - Heatmap Integration & Validation Layer
+
+- Status: Completed
+- Scope:
+  - added `app/data/heatmap_provider.py` as a liquidation heatmap data-source abstraction
+  - default heatmap mode is deterministic/local mock data so the system works without Coinglass/Hyblock credentials
+  - optional real-provider configuration was added for `HEATMAP_PROVIDER`, `HEATMAP_API_KEY`, and `HEATMAP_BASE_URL`
+- Estimated vs Real Liquidity:
+  - No. 35 liquidity zones remain candle-structure estimates
+  - heatmap fields are stored separately as external/mock liquidation-cluster context: liquidity above, liquidity below, intensity score, and heatmap bias
+  - no exact liquidation prices are fabricated; mock data is clearly treated as validation scaffolding until real credentials are configured
+- Dual Signal Mode:
+  - every tracked signal now stores base signal type/confidence and parallel heatmap-enhanced signal type/confidence
+  - heatmap metadata is attached to Trading Assistant and Futures Paper Scanner responses
+  - heatmap reads do not change scanner ranking, core scoring, validation snapshots, execution flow, or live behavior
+- Outcome Comparison:
+  - post-signal outcomes now track `base_signal_correct`, `heatmap_signal_correct`, `did_heatmap_improve_result`, and `did_heatmap_reduce_loss`
+  - sweep validation stores predicted and actual sweep direction and checks heatmap sweep accuracy where a heatmap bias exists
+- Performance Metrics:
+  - `/performance/summary` now includes base win rate, heatmap win rate, delta win rate, base/heatmap average return, heatmap sweep accuracy, and heatmap false-signal rate
+  - Validate tab shows base-vs-heatmap metrics and signal detail comparison
+- Frontend:
+  - Futures Paper Scanner and Trading Assistant surfaces show `Heatmap Confirmed` / `Heatmap Conflict` tags
+  - Advanced Details - Pro shows base signal vs heatmap signal, heatmap bias, intensity, nearby heatmap levels, and explanation
+- Files Changed:
+  - `.gitignore`
+  - `.env.example`
+  - `app/data/heatmap_provider.py`
+  - `app/config/settings.py`
+  - `app/api/bot_api.py`
+  - `app/api/dashboard_api.py`
+  - `app/monitoring/signal_outcomes.py`
+  - `app/monitoring/performance_summary.py`
+  - `app/storage/db.py`
+  - `app/storage/models.py`
+  - `app/storage/repositories.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/components/TradingAssistantSection.tsx`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_heatmap_integration.py`
+  - `tests/test_performance_summary.py`
+  - `PROGRESS.md`
+- Tests Run:
+  - heatmap/outcome/summary tests: `.\.venv\Scripts\python.exe -m pytest tests\test_heatmap_integration.py tests\test_signal_outcomes.py tests\test_performance_summary.py --basetemp=tests\.tmp_pytest_heatmap` (`11 passed`)
+  - bot/dashboard API tests: `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py tests\test_dashboard_api.py --basetemp=tests\.tmp_pytest_heatmap_api` (`37 passed`)
+  - scanner/scanner-validation tests: `.\.venv\Scripts\python.exe -m pytest tests\test_futures_opportunity_scanner.py tests\test_scanner_validation_report.py --basetemp=tests\.tmp_pytest_heatmap_scanner` (`18 passed`)
+  - Ruff lint: `.\.venv\Scripts\python.exe -m ruff check app\data\heatmap_provider.py app\monitoring\signal_outcomes.py app\monitoring\performance_summary.py app\storage\db.py app\storage\models.py app\storage\repositories.py app\api\bot_api.py app\api\dashboard_api.py app\config\settings.py tests\test_heatmap_integration.py tests\test_signal_outcomes.py tests\test_performance_summary.py` passed
+  - frontend production build: `npm run build` passed
+- Safety:
+  - no live trading, real futures execution, real order placement, autonomous AI execution, scanner ranking change, or profitability claim was added
+  - heatmap confidence is stored for comparison and validation only; it is not used to blindly increase the active base decision
+- Remaining Limitations:
+  - real liquidation heatmap data requires a configured external provider and credentials
+  - mock heatmap data is useful for integration and validation plumbing, not market truth
+  - effectiveness metrics become meaningful only after enough evaluated post-signal outcomes accumulate
+
+## Futures Scanner Fetch Failure Recovery + Symbol Universe Fallback
+
+- Status: Completed
+- Scope:
+  - fixed intermittent frontend `Failed to fetch` scanner state replacing the whole Futures Paper Scanner screen
+  - made Binance USD-M symbol-universe failures recover through cache/fallback diagnostics instead of blocking the UI
+  - kept futures scanner paper-only/advisory-only and did not change scanner scoring or ranking logic
+- Backend:
+  - added bounded per-request timeouts and small retry/backoff handling for Binance USD-M Futures REST market-data calls
+  - added request-level scanner timeout handling so `/bot/futures-opportunities` returns partial/degraded responses instead of hanging indefinitely
+  - added structured scanner failure logging with `scan_id`, phase, symbol where applicable, endpoint, and exception type
+  - cached the USD-M Futures symbol universe for 20 minutes
+  - when live `/fapi/v1/exchangeInfo` fails, scanner now uses the last cached USD-M universe when available
+  - when no cache exists, scanner falls back to major USD-M symbols: BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, XRPUSDT, DOGEUSDT, ADAUSDT, AVAXUSDT, LINKUSDT, LTCUSDT
+  - when no cache/fallback is available, scanner returns `scan_state=degraded` with a clear warning instead of using Spot symbols
+  - scanner response diagnostics now include `futures_symbol_universe_source`, `symbol_count`, `last_successful_fetch_at`, and `latest_error`
+- Frontend:
+  - added request timeout handling around API calls, with a longer bounded timeout for futures scanner refreshes
+  - classified scanner refresh errors as backend unavailable, scanner timed out, Binance temporarily unavailable, network/proxy error, or generic HTTP error
+  - failed refreshes no longer replace previous successful scanner results
+  - scanner cards remain visible with a `last refresh failed` warning and diagnostic text
+  - Advanced Details - Pro exposes futures symbol universe diagnostics
+- Files Changed:
+  - `app/api/bot_api.py`
+  - `app/exchange/binance_rest.py`
+  - `app/monitoring/futures_opportunity_scanner.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/api.ts`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_bot_api.py`
+  - `PROGRESS.md`
+- Tests Run:
+  - futures scanner/heartbeat/API/validation tests: `.\.venv\Scripts\python.exe -m pytest tests\test_futures_scanner_ws_heartbeat.py tests\test_futures_scanner_heartbeat.py tests\test_futures_opportunity_scanner.py tests\test_scanner_validation_report.py tests\test_bot_api.py -q` (`68 passed`)
+  - Ruff lint on touched Python paths: passed
+  - frontend production build: `npm run build` from `frontend/` passed
+- Safety:
+  - no live futures trading, order placement, scanner scoring change, scanner ranking change, Spot symbol universe reuse, or paper execution behavior change was added
+  - `/health` and `/bot/status` remain separate lightweight endpoints; long scanner work is bounded and awaits network calls without intentionally blocking those routes
+- Remaining Limitations:
+  - frontend has no configured test runner in `frontend/package.json`, so the previous-results-on-fetch-failure behavior is covered by implementation and production build rather than an executable frontend unit test
+  - fallback symbols are a conservative major-market subset and may omit newer USD-M contracts while Binance exchangeInfo is unavailable
+
+## Futures Scanner USD-M Data Source + Performance Fix
+
+- Status: Completed
+- Scope:
+  - corrected Futures Paper Scanner market data to use Binance USD-M Futures sources only
+  - made scanner refresh concurrent, timeout-tolerant, and partial-result friendly
+  - kept Spot symbol search, Spot candles, paper trading, scanner scoring, ranking, and validation logic separate
+- Backend:
+  - added USD-M Futures REST methods for exchange info, 24h ticker ranking, klines, futures last price, and mark price
+  - added a dedicated `futures_historical_candles` SQLite cache so futures candles do not overwrite or reuse Spot historical candles
+  - changed market-wide futures scanning to load active USD-M perpetual symbols and fetch `/fapi/v1/klines`
+  - added bounded scanner concurrency with a default of 5, maximum of 10, and per-symbol timeout handling
+  - added lightweight timing logs for symbol universe loading, candle cache reads, futures candle fetches, per-symbol analysis, and total scan time
+  - changed futures scanner heartbeat subscriptions to USD-M Futures mark-price streams (`<symbol>@markPrice`) through the futures WebSocket base
+  - changed REST live price fallback to futures mark price first, then futures last price, and kept fallback warnings heartbeat-only
+  - scanner validation snapshots now store `data_source=binance_usdm_futures`; old snapshots without source remain readable
+- Frontend:
+  - scanner cards now label `Futures Scan Price`, `Futures Price`, or `Futures Mark Price`
+  - Advanced Details - Pro shows `data_source` and `price_type`
+  - refreshes with existing results now show a small updating badge instead of a full stuck loading panel
+- Files Changed:
+  - `app/exchange/binance_rest.py`
+  - `app/api/bot_api.py`
+  - `app/main.py`
+  - `app/monitoring/futures_opportunity_scanner.py`
+  - `app/monitoring/futures_scanner_ws_heartbeat.py`
+  - `app/monitoring/scanner_validation_report.py`
+  - `app/storage/db.py`
+  - `app/storage/models.py`
+  - `app/storage/repositories.py`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_bot_api.py`
+  - `tests/test_futures_scanner_ws_heartbeat.py`
+- Tests Run:
+  - futures scanner/heartbeat/API/validation tests: `.\.venv\Scripts\python.exe -m pytest tests\test_futures_scanner_ws_heartbeat.py tests\test_futures_scanner_heartbeat.py tests\test_futures_opportunity_scanner.py tests\test_scanner_validation_report.py tests\test_bot_api.py -q` (`64 passed`)
+  - Ruff lint on touched Python paths: passed
+  - frontend production build: `npm run build` from `frontend/` passed
+- Safety:
+  - no opportunity scoring formula, LONG/SHORT/WAIT/AVOID classification, scanner ranking, validation scoring, Spot data path, paper broker behavior, live trading path, or Binance order placement was changed
+  - futures scanner remains paper-only and advisory-only
+- Remaining Limitations:
+  - performance still depends on Binance USD-M endpoint latency and local SQLite write speed
+  - mark-price WebSocket heartbeat only tracks currently visible scanner symbols
+  - historical validation rows created before this change may have no `data_source`
+
+## No. 40 - Symbol Switch Stability and Scanner Persistence Hardening
+
+- Status: Completed
+- Scope:
+  - stabilized frontend symbol switching after the V2 dashboard refactor
+  - split selected-symbol refresh into critical signal data first and delayed advanced analytics second
+  - added persistent scanner run/candidate and symbol cache storage for production-style review and later PostgreSQL migration
+- Frontend:
+  - added per-refresh `AbortController` cancellation and request sequence guards so old-symbol responses cannot overwrite the current symbol
+  - added 350ms selected-symbol debounce and debounced backfill triggering to avoid repeated refresh/backfill storms during rapid switching
+  - kept selected-symbol headers responsive while clearing old symbol-scoped data, so stale HYPEUSDT data does not appear under SOLUSDT
+  - moved AI history, AI evaluation, validation, edge report, module attribution, similar setups, adaptive recommendations, paper performance, and related analytics into delayed/lazy refresh paths
+  - added one non-blocking advanced-data warning instead of repeated timeout panels for non-critical analytics
+  - distinguished caller-canceled requests from real backend timeouts in the frontend API helper
+- Backend:
+  - added SQLite tables and repository methods for `scanner_runs`, `scanner_candidates`, `scanner_candidate_prices`, `symbol_candle_cache`, `symbol_analysis_cache`, and `symbol_backfill_jobs`
+  - persisted Futures Paper Scanner run metadata and candidate rows alongside existing validation snapshots and post-signal scanner snapshots
+  - mirrored stored historical candles into `symbol_candle_cache` for fast selected-symbol cache reads
+  - persisted selected-symbol backfill job state and limited concurrent backfill jobs while preserving existing stale-while-revalidate response behavior
+- Validation Run:
+  - frontend production build: `npm run build` from `frontend/` passed
+  - frontend tests: `node --test frontend\tests` passed
+  - targeted backend tests: `.\.venv\Scripts\python.exe -m pytest tests\test_storage.py tests\test_historical_backfill.py` passed
+  - full backend tests: `.\.venv\Scripts\python.exe -m pytest` passed (`264 passed`)
+  - Ruff lint: `.\.venv\Scripts\python.exe -m ruff check app tests` passed, with cache-write warnings only
+- Safety:
+  - no trading logic, scanner scoring, signal synthesis, validation math, paper broker behavior, live trading path, real futures execution, or Binance order placement was changed
+  - paper-only and advisory-only scanner behavior remains unchanged
+
+## No. 39 - Premium Trading Dashboard UX Redesign
+
+- Status: Completed
+- Scope:
+  - redesigned the frontend shell to follow the provided V2 dashboard reference using a premium dark trading cockpit layout
+  - kept the change frontend-only; no backend logic, scanner scoring, trading calculations, validation calculations, or execution paths were changed
+- Components Changed:
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx` remains wired into the new Discover layout
+  - existing signal, chart, validation, scanner, simulation, paper trading, diagnostics, and analytics components remain available through the new shell
+  - `README.md`
+  - `PROGRESS.md`
+- Layout Changes:
+  - added a top navigation bar with `CEX AI`, `Paper Trading Intelligence`, Discover/Signal/Simulate/Validate/Advanced tabs, Paper Mode badge, refresh, auto-refresh, and placeholder theme/settings controls
+  - added a left sidebar with compact Market Overview, Top Opportunities, and Watchlist/search cards
+  - added a right sidebar with compact Data State, Signal Validation Summary, Paper Trading Performance, and Trade Quality cards
+  - rebuilt the Signal tab around a decision-first header, AI Trading Assistant primary card, candle chart panel, key insight cards, and secondary analysis tabs
+  - moved dense selected-symbol detail into `Advanced Details - Pro` and secondary tabs so the first screen stays readable
+  - preserved responsive behavior: desktop sidebars, stacked tablet layout, and single-column mobile cards
+- Preserved Functionality:
+  - symbol search/select
+  - runtime start/pause/stop controls
+  - manual paper buy/close controls
+  - Futures Paper Scanner and WebSocket heartbeat
+  - scanner validation report
+  - signal validation
+  - trade eligibility
+  - adaptive recommendations
+  - advanced analytics and diagnostics
+  - error boundaries
+- Validation Run:
+  - frontend production build: `npm run build` from `frontend/` passed
+  - frontend tests: no frontend test script is defined in `frontend/package.json`
+- Safety:
+  - paper-only and advisory-only messaging remains visible
+  - no live trading, real futures execution, Binance order placement, autonomous AI execution, scanner scoring change, or backend behavior change was added
+
+## No. 38 - Liquidation Event Intelligence
+
+- Status: Completed
+- Modules Added:
+  - added `app/monitoring/liquidation_intelligence.py`
+  - added rolling liquidation-event aggregation for 30-second and 5-minute windows
+  - normalized long-liquidation volume, short-liquidation volume, imbalance ratio, event frequency, event count, intensity, dominant side, interpretation confidence, and explanation
+- Core Logic:
+  - detects `cascade_down` when long liquidations dominate during downside price movement
+  - detects `cascade_up` when short liquidations dominate during upside price movement
+  - detects `exhaustion` when liquidation spikes occur while price movement stalls
+  - detects `sweep_confirmation` when event-based force-order activity occurs near an estimated liquidity sweep zone
+  - classifies tiny low-frequency activity as `noise` and returns `none` when no recent events are available
+  - keeps Binance force-order data explicitly event-based and retrospective, not predictive liquidation-map data
+- Integration Points:
+  - Trading Assistant now loads recent Binance force-order events, adjusts confidence for aligned/opposing cascades, downgrades wrong-way cascade setups to WAIT, and warns on exhaustion risk
+  - Trade Eligibility now blocks or watch-lists wrong-way cascades and exhaustion, carries liquidation fields, and slightly improves the minimum-confidence gate when a sweep is confirmed by real events
+  - Futures Paper Scanner now exposes `liquidation_signal`, `liquidation_intensity`, `dominant_side`, raw liquidation volumes, imbalance, event frequency, and explanation without changing opportunity score or ranking
+  - Liquidity Zones can be validated by `sweep_confirmation`, raising the relevant nearest liquidity target confidence and moving wait-for-sweep into wait-for-confirmation
+- API and UI:
+  - extended Trading Assistant, Trade Eligibility, and Futures Paper Scanner payloads with optional-safe liquidation intelligence fields
+  - Trading Assistant and scanner main cards show one simple liquidation line
+  - Advanced Details - Pro shows long/short liquidation volume, imbalance ratio, event frequency, intensity, dominant side, and explanation
+- Files Changed:
+  - `README.md`
+  - `ROADMAP.md`
+  - `PROGRESS.md`
+  - `app/api/bot_api.py`
+  - `app/monitoring/liquidation_intelligence.py`
+  - `app/monitoring/liquidity_zones.py`
+  - `app/monitoring/trade_eligibility.py`
+  - `app/monitoring/futures_opportunity_scanner.py`
+  - `frontend/src/components/TradingAssistantSection.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_liquidation_intelligence.py`
+  - `tests/test_liquidity_zones.py`
+  - `tests/test_trade_eligibility.py`
+  - `tests/test_futures_opportunity_scanner.py`
+- Tests Run:
+  - focused liquidation/liquidity/scanner/API tests: `.\.venv\Scripts\python.exe -m pytest tests\test_liquidation_intelligence.py tests\test_liquidity_bias.py tests\test_liquidity_zones.py tests\test_trade_eligibility.py tests\test_futures_opportunity_scanner.py tests\test_bot_api.py --basetemp=tests\.tmp_pytest_liquidation_intelligence` (`78 passed`)
+  - Binance force-order feed tests: `.\.venv\Scripts\python.exe -m pytest tests\test_binance_liquidation_feed.py --basetemp=tests\.tmp_pytest_liquidation_feed` (`3 passed`)
+  - Ruff lint: `.\.venv\Scripts\python.exe -m ruff check app\monitoring\liquidation_intelligence.py app\monitoring\liquidity_zones.py app\monitoring\trade_eligibility.py app\monitoring\futures_opportunity_scanner.py app\api\bot_api.py tests\test_liquidation_intelligence.py tests\test_liquidity_zones.py tests\test_trade_eligibility.py tests\test_futures_opportunity_scanner.py tests\test_bot_api.py` passed
+  - frontend production build: `npm run build` from `frontend/` passed
+- Safety:
+  - no existing technical scoring logic, scanner opportunity score, scanner ranking, validation snapshot scoring, execution path, or paper broker behavior was changed
+  - no live trading, real futures execution, Binance order placement, autonomous AI execution, predictive liquidation fabrication, or profitability claim was added
+- Remaining Limitations:
+  - Binance force-order events arrive after liquidations occur; they are not a forward-looking heatmap
+  - event usefulness depends on the Binance liquidation feed being configured and running
+  - stored liquidation snapshots remain optional future validation/backtesting work beyond the in-memory recent-event feed
+
+## No. 37 - Real Heatmap Data Source Integration
+
+- Status: Completed
+- Provider Modes:
+  - `mock` remains the default and is explicitly labeled as mock/non-real data
+  - `binance_force_orders` can consume Binance USD-M Futures force-liquidation websocket events and convert recent events into event-based liquidation pressure
+  - `vendor_http` supports a configurable vendor endpoint, API key, vendor name, clusters path, symbol parameter, and request timeout
+- Binance Force-Order Distinction:
+  - Binance force-order streams provide actual liquidation events after they happen via symbol streams such as `<symbol>@forceOrder` and all-market `!forceOrder@arr`
+  - these events are not future liquidation heatmap clusters
+  - the bot labels this source as `event_based` real data and uses it only as validation/advisory heatmap context
+- Normalized Heatmap Model:
+  - added `HeatmapSnapshot` with provider, provider status, timestamp, current price, nearest liquidity above/below, intensity values, heatmap bias, liquidation pressure, liquidation imbalance, data quality, real-data flag, and explanation
+  - data-quality labels include `mock`, `estimated`, `event_based`, `vendor_heatmap`, and `unavailable`
+- Signal Enrichment:
+  - assistant/scanner heatmap enrichment now exposes provider, data quality, real-data flag, provider status, liquidation pressure, liquidation imbalance, and explanation
+  - base-vs-heatmap validation behavior remains parallel and does not change scanner ranking or core scoring
+  - heatmap confidence remains validation/display metadata and is not used to blindly increase active decisions
+- Performance Validation:
+  - post-signal snapshots now persist heatmap provider/data-quality metadata
+  - performance summary now segments heatmap signal count, heatmap win rate, sweep accuracy, and average return by heatmap data quality so mock data does not pollute real-source analysis
+- API:
+  - added `GET /heatmap/status`
+  - added `GET /heatmap/snapshot/{symbol}`
+  - performance summary responses now include heatmap data-quality breakdowns
+- Frontend:
+  - Advanced Details - Pro now shows heatmap provider, data quality, real-data yes/no, liquidation pressure, heatmap bias, and heatmap explanation
+  - mock/non-real heatmap data is explicitly labeled: `Heatmap data is mock/estimated. Do not treat as real market heatmap.`
+- Files Changed:
+  - `.env.example`
+  - `app/config/settings.py`
+  - `app/main.py`
+  - `app/api/bot_api.py`
+  - `app/api/dashboard_api.py`
+  - `app/data/heatmap_models.py`
+  - `app/data/heatmap_provider.py`
+  - `app/data/binance_liquidation_feed.py`
+  - `app/data/vendor_heatmap_provider.py`
+  - `app/monitoring/signal_outcomes.py`
+  - `app/monitoring/performance_summary.py`
+  - `app/storage/db.py`
+  - `app/storage/models.py`
+  - `app/storage/repositories.py`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/components/TradingAssistantSection.tsx`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_real_heatmap_provider.py`
+  - `tests/test_binance_liquidation_feed.py`
+  - `tests/test_heatmap_status_api.py`
+  - `tests/test_heatmap_integration.py`
+  - `tests/test_performance_summary.py`
+  - `PROGRESS.md`
+- Tests Run:
+  - focused heatmap/provider/API/performance tests: `.\.venv\Scripts\python.exe -m pytest tests\test_real_heatmap_provider.py tests\test_binance_liquidation_feed.py tests\test_heatmap_status_api.py tests\test_heatmap_integration.py tests\test_performance_summary.py --basetemp=tests\.tmp_pytest_heatmap_real` (`17 passed`)
+  - regression tests: `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py tests\test_dashboard_api.py tests\test_futures_opportunity_scanner.py tests\test_scanner_validation_report.py tests\test_signal_outcomes.py --basetemp=tests\.tmp_pytest_heatmap_real_regression` (`59 passed`)
+  - Ruff lint: `.\.venv\Scripts\python.exe -m ruff check app\data\heatmap_models.py app\data\heatmap_provider.py app\data\binance_liquidation_feed.py app\data\vendor_heatmap_provider.py app\config\settings.py app\main.py app\monitoring\signal_outcomes.py app\monitoring\performance_summary.py app\storage\db.py app\storage\models.py app\storage\repositories.py app\api\bot_api.py app\api\dashboard_api.py tests\test_real_heatmap_provider.py tests\test_binance_liquidation_feed.py tests\test_heatmap_status_api.py tests\test_heatmap_integration.py tests\test_performance_summary.py` passed
+  - frontend production build: `npm run build` passed
+- Safety:
+  - no live trading, real futures execution, real order placement, autonomous AI execution, scanner ranking change, or profitability claim was added
+  - vendor endpoints are configurable only; no paid or unverified endpoint paths are hardcoded
+  - provider failures fall back safely and log warnings rather than crashing the app
+- Remaining Limitations:
+  - Binance force-order data is event-based and retrospective, not a true forward-looking liquidation heatmap
+  - vendor heatmap usefulness depends on configured provider response quality and enough evaluated outcomes
+
+## No. 36 - Funding + Open Interest Integration for Crowd Positioning
+
+- Status: Completed
+- Data Sources Added:
+  - added Binance USD-M Futures funding-rate support through `/fapi/v1/fundingRate`
+  - added Binance USD-M Futures open-interest support through `/fapi/v1/openInterest`
+  - added optional open-interest trend support through `/futures/data/openInterestHist`
+  - added `BINANCE_FUTURES_BASE_URL` and `BINANCE_DERIVATIVES_DATA_ENABLED` configuration with safe fallback behavior
+- Modules Added:
+  - `app/data/binance_derivatives_data.py` normalizes funding rate, funding bias, open interest, OI change, OI trend, and data quality
+  - `app/monitoring/crowd_positioning.py` converts funding/OI context into crowd side, crowd strength, positioning confidence, squeeze risk, and explanation
+- Integration Points:
+  - Liquidity Bias now uses crowd positioning to improve long-trap/short-trap and likely liquidation-direction estimates
+  - Liquidity Zones can prioritize the more relevant upside/downside liquidity target from crowd positioning
+  - Trading Assistant exposes crowd side, crowd strength, squeeze risk, funding rate, open interest, OI trend, and positioning explanation
+  - Trading Assistant can reduce confidence slightly and downgrade risky BUY setups to WAIT when long crowding creates high downside squeeze risk
+  - Trade Eligibility adds warnings and watch-only handling for strong same-side crowding risk
+  - Futures Paper Scanner payloads include crowd side, crowd strength, squeeze risk, funding rate, open interest, and OI trend without changing opportunity score or ranking
+  - frontend scanner and assistant views show a simple crowd line on main cards and raw funding/OI detail inside Advanced Details - Pro
+- Files Changed:
+  - `.env.example`
+  - `app/config/settings.py`
+  - `app/data/binance_derivatives_data.py`
+  - `app/monitoring/crowd_positioning.py`
+  - `app/monitoring/liquidity_bias.py`
+  - `app/monitoring/liquidity_zones.py`
+  - `app/monitoring/trade_eligibility.py`
+  - `app/monitoring/futures_opportunity_scanner.py`
+  - `app/api/bot_api.py`
+  - `frontend/src/App.tsx`
+  - `frontend/src/components/FuturesPaperScannerSection.tsx`
+  - `frontend/src/components/TradingAssistantSection.tsx`
+  - `frontend/src/lib/types.ts`
+  - `tests/test_binance_derivatives_data.py`
+  - `tests/test_crowd_positioning.py`
+  - `tests/test_futures_opportunity_scanner.py`
+  - `tests/test_trade_eligibility.py`
+- Tests Run:
+  - focused funding/crowd/liquidity/scanner tests: `.\.venv\Scripts\python.exe -m pytest tests\test_binance_derivatives_data.py tests\test_crowd_positioning.py tests\test_liquidity_bias.py tests\test_liquidity_zones.py tests\test_trade_eligibility.py tests\test_futures_opportunity_scanner.py --basetemp=tests\.tmp_pytest_crowd_positioning` (`43 passed`)
+  - bot API tests: `.\.venv\Scripts\python.exe -m pytest tests\test_bot_api.py --basetemp=tests\.tmp_pytest_bot_crowd` (`32 passed`)
+  - final trade eligibility/API wiring regression: `.\.venv\Scripts\python.exe -m pytest tests\test_trade_eligibility.py tests\test_bot_api.py --basetemp=tests\.tmp_pytest_trade_crowd_final` (`41 passed`)
+  - Ruff lint: `.\.venv\Scripts\python.exe -m ruff check app\data\binance_derivatives_data.py app\monitoring\crowd_positioning.py app\monitoring\liquidity_bias.py app\monitoring\liquidity_zones.py app\monitoring\trade_eligibility.py app\monitoring\futures_opportunity_scanner.py app\api\bot_api.py app\config\settings.py tests\test_binance_derivatives_data.py tests\test_crowd_positioning.py tests\test_trade_eligibility.py tests\test_futures_opportunity_scanner.py` passed
+  - final Ruff regression: `.\.venv\Scripts\python.exe -m ruff check app\monitoring\trade_eligibility.py app\api\bot_api.py tests\test_trade_eligibility.py` passed
+  - frontend production build: `npm run build` passed
+- Safety:
+  - no live trading, real futures execution, real order placement, autonomous AI execution, scanner scoring change, or scanner ranking change was added
+  - funding and OI are advisory enhancement signals only
+  - Binance failures return fallback derivatives context instead of crashing the app
+- Remaining Limitations:
+  - derivatives fetching is disabled by default in code config for test/local safety and enabled in `.env.example` for users who want real Binance futures context
+  - open-interest trend quality depends on Binance historical endpoint availability and enough returned samples
+  - crowd positioning improves liquidity context, but it is not treated as a standalone profitability edge

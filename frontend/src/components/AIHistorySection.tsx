@@ -63,13 +63,13 @@ export function AIHistorySection({
   if (history.length === 0) {
     return (
       <StatePanel
-        title="No AI history yet"
+        title="AI history pending"
         message={
           statusMessage
           ?? (
             dataState === 'waiting_for_runtime'
-              ? 'Start the live runtime for the selected symbol to generate advisory history.'
-              : 'The selected symbol does not have persisted advisory snapshots yet. Wait for closed candles to accumulate history.'
+              ? 'AI history will appear after the runtime generates advisory snapshots.'
+              : 'AI history will appear after enough closed candles generate advisory snapshots.'
           )
         }
         tone="empty"

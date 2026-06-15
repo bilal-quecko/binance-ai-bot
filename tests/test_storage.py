@@ -7,17 +7,36 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.ai.models import AIFeatureVector, AISignalSnapshot
+from app.market_data.candles import Candle
 from app.paper.models import Position
 from app.paper.models import FillResult
 from app.risk.models import RiskDecision
 from app.storage import StorageRepository
+from app.storage import db as storage_db
 from app.storage.db import resolve_sqlite_path
+from app.storage.models import (
+    ScannerCandidatePriceRecord,
+    ScannerCandidateRecord,
+    ScannerRunRecord,
+    SymbolAnalysisCacheRecord,
+    SymbolBackfillJobRecord,
+)
 
 
 def _db_path(name: str) -> Path:
     base = Path("tests/.tmp_storage")
     base.mkdir(parents=True, exist_ok=True)
     return (base / f"{name}_{uuid4().hex}.sqlite").resolve()
+
+
+def _tmp_dir(name: str) -> Path:
+    path = Path("tests/.tmp_storage") / f"{name}_{uuid4().hex}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path.resolve()
+
+
+def _clear_sqlite_path_cache() -> None:
+    storage_db._SQLITE_PATH_FALLBACK_CACHE.clear()  # noqa: SLF001 - storage path regression coverage
 
 
 def _ai_snapshot(
@@ -88,8 +107,201 @@ def test_storage_repository_creates_required_tables() -> None:
         "positions_snapshots",
         "runner_events",
         "runtime_session_state",
+        "scanner_candidate_prices",
+        "scanner_candidates",
+        "scanner_runs",
+        "symbol_analysis_cache",
+        "symbol_backfill_jobs",
+        "symbol_candle_cache",
         "trades",
     } <= table_names
+
+
+def test_resolve_sqlite_path_creates_repo_local_data_directory(
+    monkeypatch,
+) -> None:
+    _clear_sqlite_path_cache()
+    workspace = _tmp_dir("repo_local_data")
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(storage_db, "_sqlite_path_accepts_persistent_writes", lambda path: True)
+    monkeypatch.setattr(storage_db, "_sqlite_path_supports_wal", lambda path: True)
+
+    db_path = resolve_sqlite_path("sqlite:///./data/binance_ai_bot.db")
+
+    assert db_path == (workspace / "data" / "binance_ai_bot.db").resolve()
+    assert db_path.parent.is_dir()
+
+
+def test_storage_repository_persists_scanner_runs_and_symbol_caches() -> None:
+    db_path = _db_path("scanner_symbol_cache")
+    database_url = f"sqlite:///{db_path}"
+    generated_at = datetime(2026, 5, 11, 10, 0, tzinfo=UTC)
+    repository = StorageRepository(database_url)
+
+    repository.upsert_scanner_run(
+        ScannerRunRecord(
+            id="scan-1",
+            generated_at=generated_at,
+            quote_asset="USDT",
+            horizon="7d",
+            max_symbols=50,
+            min_opportunity_score=70,
+            scan_state="ready",
+            scanned_count=1,
+            failed_symbols_json="[]",
+            warnings_json="[]",
+            result_json='{"scan_state":"ready","long_candidates":[{"symbol":"SOLUSDT"}]}',
+            candidate_count=1,
+        )
+    )
+    repository.upsert_scanner_candidates(
+        [
+            ScannerCandidateRecord(
+                id="scan-1:SOLUSDT:long",
+                scanner_run_id="scan-1",
+                symbol="SOLUSDT",
+                direction="long",
+                opportunity_score=82,
+                confidence=77,
+                evidence_strength="validated",
+                current_price=Decimal("150.25"),
+                entry_zone="149.50-151.00",
+                stop_loss=Decimal("145"),
+                take_profit=Decimal("158"),
+                risk_grade="medium",
+                regime="trending_up",
+                reason="Momentum and trend are aligned.",
+                warnings_json="[]",
+                timestamp=generated_at,
+            )
+        ]
+    )
+    repository.upsert_scanner_candidate_prices(
+        [
+            ScannerCandidatePriceRecord(
+                id=None,
+                scanner_candidate_id="scan-1:SOLUSDT:long",
+                symbol="SOLUSDT",
+                price=Decimal("150.25"),
+                price_type="mark_price",
+                source="binance_usdm_futures",
+                recorded_at=generated_at,
+            )
+        ]
+    )
+    repository.upsert_symbol_analysis_cache(
+        SymbolAnalysisCacheRecord(
+            symbol="SOLUSDT",
+            analysis_type="fusion_signal",
+            horizon="15m",
+            payload_json='{"data_state":"ready"}',
+            generated_at=generated_at,
+            expires_at=generated_at + timedelta(minutes=5),
+            data_state="ready",
+        )
+    )
+    repository.upsert_symbol_backfill_job(
+        SymbolBackfillJobRecord(
+            id="job-1",
+            symbol="SOLUSDT",
+            interval="1m",
+            lookback_days=7,
+            status="loading",
+            started_at=generated_at,
+            completed_at=None,
+            error_message=None,
+            candles_inserted=0,
+        )
+    )
+    repository.upsert_symbol_candle_cache(
+        [
+            Candle(
+                symbol="SOLUSDT",
+                timeframe="1m",
+                open=Decimal("150"),
+                high=Decimal("151"),
+                low=Decimal("149"),
+                close=Decimal("150.25"),
+                volume=Decimal("1000"),
+                quote_volume=Decimal("150250"),
+                open_time=generated_at,
+                close_time=generated_at + timedelta(minutes=1),
+                event_time=generated_at + timedelta(minutes=1),
+                trade_count=100,
+                is_closed=True,
+            )
+        ],
+        source="test",
+    )
+
+    runs = repository.get_scanner_runs()
+    latest_successful = repository.get_latest_successful_scanner_run(quote_asset="USDT", horizon="7d")
+    candidates = repository.get_scanner_candidates(scanner_run_id="scan-1")
+    analysis_cache = repository.get_symbol_analysis_cache(
+        symbol="SOLUSDT",
+        analysis_type="fusion_signal",
+        horizon="15m",
+    )
+    active_job = repository.get_active_symbol_backfill_job(symbol="SOLUSDT", interval="1m", lookback_days=7)
+    repository.close()
+
+    assert runs[0].id == "scan-1"
+    assert runs[0].candidate_count == 1
+    assert runs[0].result_json is not None
+    assert latest_successful is not None
+    assert latest_successful.id == "scan-1"
+    assert candidates[0].symbol == "SOLUSDT"
+    assert candidates[0].opportunity_score == 82
+    assert analysis_cache is not None
+    assert analysis_cache.data_state == "ready"
+    assert active_job is not None
+    assert active_job.status == "loading"
+
+    connection = sqlite3.connect(str(resolve_sqlite_path(database_url)))
+    try:
+        count = connection.execute("SELECT COUNT(*) FROM symbol_candle_cache WHERE symbol = 'SOLUSDT'").fetchone()[0]
+    finally:
+        connection.close()
+    assert count == 1
+
+
+def test_resolve_sqlite_path_keeps_writable_path_when_wal_is_unavailable(
+    monkeypatch,
+    caplog,
+) -> None:
+    _clear_sqlite_path_cache()
+    workspace = _tmp_dir("wal_fallback")
+    monkeypatch.setattr(storage_db, "_sqlite_path_accepts_persistent_writes", lambda path: True)
+    monkeypatch.setattr(storage_db, "_sqlite_path_supports_wal", lambda requested_path: False)
+    database_url = f"sqlite:///{workspace / 'data' / 'wal_fallback.sqlite'}"
+
+    db_path = resolve_sqlite_path(database_url)
+
+    assert db_path == (workspace / "data" / "wal_fallback.sqlite").resolve()
+    assert "using persistent SQLite default journaling instead" in caplog.text
+    assert "using temp storage" not in caplog.text
+
+
+def test_resolve_sqlite_path_uses_temp_only_when_persistent_path_is_unusable(
+    monkeypatch,
+    caplog,
+) -> None:
+    _clear_sqlite_path_cache()
+    workspace = _tmp_dir("unusable_path")
+    temp_root = _tmp_dir("temp_fallback")
+    requested_path = workspace / "data" / "unusable.sqlite"
+    monkeypatch.setattr(
+        storage_db,
+        "_sqlite_path_accepts_persistent_writes",
+        lambda path: False,
+    )
+    monkeypatch.setattr(storage_db.tempfile, "gettempdir", lambda: str(temp_root))
+
+    db_path = resolve_sqlite_path(f"sqlite:///{requested_path}")
+
+    assert db_path != requested_path.resolve()
+    assert db_path.parent.name == "sqlite"
+    assert "using temp storage" in caplog.text
 
 
 def test_storage_repository_persists_and_reads_trade_history() -> None:

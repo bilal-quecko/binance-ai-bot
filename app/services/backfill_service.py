@@ -14,6 +14,7 @@ from app.data.historical_candles import SupportedInterval, interval_to_timedelta
 from app.exchange.binance_rest import BinanceRestClient
 from app.storage import StorageRepository
 from app.storage.candle_repository import CandleBackfillStatus, CandleRepository
+from app.storage.models import SymbolBackfillJobRecord
 
 LOGGER = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ class _TaskState:
     started_at: datetime | None = None
     finished_at: datetime | None = None
     effective_interval: SupportedInterval | None = None
+    job_id: str | None = None
 
 
 class HistoricalBackfillService:
@@ -39,6 +41,7 @@ class HistoricalBackfillService:
         self._tasks: dict[tuple[str, SupportedInterval, int], asyncio.Task[None]] = {}
         self._states: dict[tuple[str, SupportedInterval, int], _TaskState] = {}
         self._lock = asyncio.Lock()
+        self._semaphore = asyncio.Semaphore(3)
 
     def status(
         self,
@@ -78,10 +81,26 @@ class HistoricalBackfillService:
             async with self._lock:
                 task = self._tasks.get(key)
                 if task is None or task.done():
+                    started_at = now_utc()
+                    job_id = f"{normalized_symbol}:{interval}:{lookback_days}:{int(started_at.timestamp() * 1000)}"
                     self._states[key] = _TaskState(
                         status="loading",
                         message=f"Historical {interval} backfill is loading for {normalized_symbol}.",
-                        started_at=now_utc(),
+                        started_at=started_at,
+                        job_id=job_id,
+                    )
+                    self._persist_backfill_job(
+                        SymbolBackfillJobRecord(
+                            id=job_id,
+                            symbol=normalized_symbol,
+                            interval=interval,
+                            lookback_days=lookback_days,
+                            status="loading",
+                            started_at=started_at,
+                            completed_at=None,
+                            error_message=None,
+                            candles_inserted=0,
+                        )
                     )
                     self._tasks[key] = asyncio.create_task(
                         self._run_backfill(symbol=normalized_symbol, interval=interval, lookback_days=lookback_days),
@@ -98,40 +117,87 @@ class HistoricalBackfillService:
     ) -> None:
         key = (symbol, interval, lookback_days)
         effective_interval: SupportedInterval = interval
-        try:
-            await self._fetch_and_persist(symbol=symbol, interval=interval, lookback_days=lookback_days)
-        except httpx.HTTPError as exc:
-            if interval == "1m":
-                effective_interval = "5m"
-                await self._fetch_and_persist(symbol=symbol, interval="5m", lookback_days=lookback_days)
+        state = self._states.get(key)
+        started_at = state.started_at if state is not None and state.started_at is not None else now_utc()
+        job_id = state.job_id if state is not None and state.job_id is not None else f"{symbol}:{interval}:{lookback_days}:{int(started_at.timestamp() * 1000)}"
+        candles_inserted = 0
+        async with self._semaphore:
+            try:
+                candles_inserted = await self._fetch_and_persist(symbol=symbol, interval=interval, lookback_days=lookback_days)
+            except httpx.HTTPError as exc:
+                if interval == "1m":
+                    effective_interval = "5m"
+                    candles_inserted = await self._fetch_and_persist(symbol=symbol, interval="5m", lookback_days=lookback_days)
+                    self._states[key] = _TaskState(
+                        status="partial",
+                        message=f"Fetched 7 days of 5m candles for {symbol} because 1m backfill was unavailable.",
+                        started_at=started_at,
+                        finished_at=now_utc(),
+                        effective_interval="5m",
+                        job_id=job_id,
+                    )
+                    self._persist_backfill_job(
+                        SymbolBackfillJobRecord(
+                            id=job_id,
+                            symbol=symbol,
+                            interval=interval,
+                            lookback_days=lookback_days,
+                            status="partial",
+                            started_at=started_at,
+                            completed_at=now_utc(),
+                            error_message=None,
+                            candles_inserted=candles_inserted,
+                        )
+                    )
+                    return
+                raise exc
+            except Exception as exc:
+                LOGGER.exception("Historical candle backfill failed for %s %s.", symbol, interval)
                 self._states[key] = _TaskState(
-                    status="partial",
-                    message=f"Fetched 7 days of 5m candles for {symbol} because 1m backfill was unavailable.",
-                    started_at=self._states.get(key).started_at if key in self._states else now_utc(),
+                    status="failed",
+                    message=f"Historical {interval} backfill failed for {symbol}.",
+                    last_error=str(exc),
+                    started_at=started_at,
                     finished_at=now_utc(),
-                    effective_interval="5m",
+                    effective_interval=effective_interval,
+                    job_id=job_id,
+                )
+                self._persist_backfill_job(
+                    SymbolBackfillJobRecord(
+                        id=job_id,
+                        symbol=symbol,
+                        interval=interval,
+                        lookback_days=lookback_days,
+                        status="failed",
+                        started_at=started_at,
+                        completed_at=now_utc(),
+                        error_message=str(exc),
+                        candles_inserted=candles_inserted,
+                    )
                 )
                 return
-            raise exc
-        except Exception as exc:
-            LOGGER.exception("Historical candle backfill failed for %s %s.", symbol, interval)
-            self._states[key] = _TaskState(
-                status="failed",
-                message=f"Historical {interval} backfill failed for {symbol}.",
-                last_error=str(exc),
-                started_at=self._states.get(key).started_at if key in self._states else now_utc(),
-                finished_at=now_utc(),
-                effective_interval=effective_interval,
-            )
-            return
 
         state = self.status(symbol=symbol, interval=interval, lookback_days=lookback_days)
         self._states[key] = _TaskState(
             status=state.status,
             message=state.message,
-            started_at=self._states.get(key).started_at if key in self._states else now_utc(),
+            started_at=started_at,
             finished_at=now_utc(),
             effective_interval=effective_interval,
+            job_id=job_id,
+        )
+        self._persist_backfill_job(
+            SymbolBackfillJobRecord(
+                id=job_id,
+                symbol=symbol,
+                interval=interval,
+                lookback_days=lookback_days,
+                status=state.status,
+                started_at=started_at,
+                completed_at=now_utc(),
+                error_message=None,
+                candles_inserted=candles_inserted,
+            )
         )
 
     async def _fetch_and_persist(
@@ -140,13 +206,14 @@ class HistoricalBackfillService:
         symbol: str,
         interval: SupportedInterval,
         lookback_days: int,
-    ) -> None:
+    ) -> int:
         start_time, end_time = lookback_window(days=lookback_days)
         page_limit = 1000
         cursor_ms = int(start_time.timestamp() * 1000)
         end_ms = int(end_time.timestamp() * 1000)
         interval_ms = int(interval_to_timedelta(interval).total_seconds() * 1000)
         repository = StorageRepository(self._database_url)
+        candles_inserted = 0
         try:
             candle_repository = CandleRepository(repository)
             while cursor_ms < end_ms:
@@ -164,7 +231,7 @@ class HistoricalBackfillService:
                     for row in rows
                     if int(row[6]) < int(now_utc().timestamp() * 1000)
                 ]
-                candle_repository.upsert(candles, source="historical_rest")
+                candles_inserted += candle_repository.upsert(candles, source="historical_rest")
                 last_open_ms = int(rows[-1][0])
                 next_cursor = last_open_ms + interval_ms
                 if next_cursor <= cursor_ms:
@@ -172,6 +239,14 @@ class HistoricalBackfillService:
                 cursor_ms = next_cursor
                 if len(rows) < page_limit:
                     break
+            return candles_inserted
+        finally:
+            repository.close()
+
+    def _persist_backfill_job(self, job: SymbolBackfillJobRecord) -> None:
+        repository = StorageRepository(self._database_url)
+        try:
+            repository.upsert_symbol_backfill_job(job)
         finally:
             repository.close()
 

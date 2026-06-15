@@ -92,8 +92,8 @@ async def test_binance_websocket_client_reconnects_and_yields_combined_payload_d
             break
 
     assert connector.urls == [
-        "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/btcusdt@bookticker",
-        "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/btcusdt@bookticker",
+        "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/btcusdt@bookTicker",
+        "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/btcusdt@bookTicker",
     ]
     assert sleep_calls == [0.25]
     assert messages[0]["e"] == "trade"
