@@ -151,3 +151,31 @@ def test_balanced_profile_allows_entry_where_conservative_profile_waits() -> Non
     assert conservative_signal.side == "HOLD"
     assert conservative_signal.reason_codes in {("VOL_TOO_LOW",), ("MICROSTRUCTURE_UNHEALTHY",)}
     assert balanced_signal.side == "BUY"
+
+
+def test_aggressive_profile_allows_momentum_entry_before_full_regime_confirmation() -> None:
+    strategy = TrendFollowingStrategy(
+        TrendFollowingConfig(
+            allow_early_momentum_entry=True,
+            min_momentum_ratio=Decimal("0.0005"),
+            min_ema_gap_ratio=Decimal("0.0005"),
+            min_atr_ratio=Decimal("0.0001"),
+            max_atr_ratio=Decimal("0.075"),
+            max_spread_ratio=Decimal("0.007"),
+            min_order_book_imbalance=Decimal("-0.75"),
+        )
+    )
+
+    signal = strategy.evaluate(
+        build_snapshot(
+            regime="neutral",
+            ema_fast=Decimal("100.20"),
+            ema_slow=Decimal("100.00"),
+            atr=Decimal("0.05"),
+            bid_ask_spread=Decimal("0.20"),
+            order_book_imbalance=Decimal("-0.70"),
+        )
+    )
+
+    assert signal.side == "BUY"
+    assert signal.reason_codes == ("AGGRESSIVE_MOMENTUM_ENTRY", "EMA_BULLISH", "RISK_FILTERS_PASS")

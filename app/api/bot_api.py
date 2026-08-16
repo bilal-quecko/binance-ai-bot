@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import asdict, dataclass, field as dataclass_field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 import json
@@ -49,6 +49,8 @@ from app.data import MarketContextService
 from app.features.feature_store import FeatureEngine
 from app.features.models import FeatureConfig, FeatureSnapshot
 from app.exchange.symbol_service import SpotSymbolRecord, SpotSymbolService
+from app.futures_paper import FuturesPaperService
+from app.futures_paper.models import FuturesFillResult, FuturesPosition, FuturesSignal, FuturesSignalInput
 from app.fusion import FusionInputs, FusionSignalSnapshot, UnifiedSignalFusionEngine
 from app.market_data.candles import Candle
 from app.runner.models import ManualTradeResult, TradeReadiness, TradingProfile
@@ -118,6 +120,18 @@ from app.monitoring.liquidation_intelligence import (
 )
 from app.monitoring.scanner_validation_report import persist_scanner_validation_snapshots
 from app.monitoring.signal_outcomes import SignalSnapshotInput, persist_signal_snapshot
+from app.monitoring.signal_timing_baseline import (
+    TIMING_HORIZONS,
+    SignalTimingAggregate,
+    build_signal_timing_baseline_report,
+    evaluate_pending_signal_timing_baselines,
+)
+from app.monitoring.continuous_market_intelligence import (
+    ContinuousIntelligenceCandidate,
+    ContinuousIntelligenceConfig,
+    ContinuousIntelligenceStatus,
+    ContinuousMarketIntelligenceService,
+)
 from app.monitoring.futures_scanner_ws_heartbeat import (
     FuturesScannerLivePrice,
     FuturesScannerWebSocketHeartbeatService,
@@ -1058,6 +1072,14 @@ class TradeReadinessResponse(BaseModel):
     risk_reason_codes: tuple[str, ...] = ()
     expected_edge_pct: Decimal | None = None
     estimated_round_trip_cost_pct: Decimal | None = None
+    latest_signal_side: str | None = None
+    latest_signal_reasons: tuple[str, ...] = ()
+    risk_decision: str | None = None
+    execution_status: str | None = None
+    blocker_category: str | None = None
+    blocker_message: str | None = None
+    next_possible_trigger: str | None = None
+    last_trade_attempt_at: str | None = None
 
 
 class ManualTradeRequest(BaseModel):
@@ -1081,6 +1103,91 @@ class ManualTradeResponse(BaseModel):
     current_position_quantity: Decimal = Decimal("0")
     current_position_open: bool = False
     current_pnl: Decimal = Decimal("0")
+
+
+class FuturesPaperPositionResponse(BaseModel):
+    """Serialized paper Futures position."""
+
+    symbol: str
+    side: str
+    quantity: Decimal
+    entry_price: Decimal
+    mark_price: Decimal
+    leverage: int
+    margin_mode: str
+    margin_used: Decimal
+    unrealized_pnl: Decimal
+    realized_pnl: Decimal
+    liquidation_price_estimate: Decimal
+    liquidation_estimate_label: str = "Estimated paper liquidation reference only."
+    opened_at: datetime
+    updated_at: datetime
+
+
+class FuturesPaperStatusResponse(BaseModel):
+    """Paper Futures runtime status."""
+
+    active: bool
+    mode: Literal["paper"] = "paper"
+    paper_only: bool = True
+    live_futures_trading_enabled: bool = False
+    positions: list[FuturesPaperPositionResponse]
+    realized_pnl: Decimal
+
+
+class FuturesPaperExecutionSignalResponse(BaseModel):
+    """Deterministic paper Futures signal."""
+
+    symbol: str
+    signal: str
+    confidence: int
+    risk_grade: str
+    reason_codes: tuple[str, ...]
+    blocker_reason: str | None = None
+    paper_only: bool = True
+    ai_execution_authority: bool = False
+
+
+class FuturesPaperOrderRequest(BaseModel):
+    """Manual paper Futures request."""
+
+    symbol: str = Field(min_length=1)
+    quantity: Decimal = Field(default=Decimal("0.001"), gt=Decimal("0"))
+    market_price: Decimal = Field(gt=Decimal("0"))
+    leverage: int = Field(default=2, ge=1, le=3)
+
+
+class FuturesPaperCloseRequest(BaseModel):
+    """Manual paper Futures close request."""
+
+    symbol: str = Field(min_length=1)
+    market_price: Decimal = Field(gt=Decimal("0"))
+
+
+class FuturesPaperFillResponse(BaseModel):
+    """Serialized paper Futures fill result."""
+
+    order_id: str
+    status: str
+    symbol: str
+    side: str
+    filled_quantity: Decimal
+    fill_price: Decimal
+    fee_paid: Decimal
+    realized_pnl: Decimal
+    reason_codes: tuple[str, ...]
+    paper_only: bool = True
+
+
+class FuturesPaperPerformanceResponse(BaseModel):
+    """Paper Futures performance summary."""
+
+    symbol: str | None
+    paper_only: bool
+    total_fills: int
+    realized_pnl: Decimal
+    positions: list[FuturesPaperPositionResponse]
+    recent_fills: list[FuturesPaperFillResponse]
 
 
 class TechnicalTimeframeSummaryResponse(BaseModel):
@@ -1269,6 +1376,195 @@ class AIOutcomeEvaluationResponse(BaseModel):
     recent_samples: list[AIOutcomeSampleResponse]
     data_state: DataState
     status_message: str | None = None
+
+
+class SignalTimingAggregateResponse(BaseModel):
+    """Aggregated Phase 1 timing-quality metrics for one bucket."""
+
+    label: str
+    sample_size: int
+    average_move_consumed_pct: Decimal | None = None
+    average_move_capture_ratio_pct: Decimal | None = None
+    average_entry_efficiency_pct: Decimal | None = None
+    average_lead_time_seconds: Decimal | None = None
+    average_net_return_after_costs_pct: Decimal | None = None
+    late_rate_pct: Decimal
+    chase_rate_pct: Decimal
+    useful_rate_pct: Decimal
+
+
+class SignalTimingSampleResponse(BaseModel):
+    """One persisted actionable-signal timing measurement."""
+
+    signal_id: str
+    horizon: str
+    symbol: str
+    source: str
+    direction: str
+    signal_time: datetime
+    setup_start_time: datetime | None = None
+    setup_start_price: Decimal | None = None
+    activation_price: Decimal | None = None
+    recent_swing_low: Decimal | None = None
+    recent_swing_high: Decimal | None = None
+    horizon_end_price: Decimal | None = None
+    max_favorable_price: Decimal | None = None
+    max_adverse_price: Decimal | None = None
+    move_before_signal_pct: Decimal | None = None
+    move_after_signal_pct: Decimal | None = None
+    max_favorable_excursion_pct: Decimal | None = None
+    max_adverse_excursion_pct: Decimal | None = None
+    full_move_pct: Decimal | None = None
+    move_already_consumed_pct: Decimal | None = None
+    move_capture_ratio_pct: Decimal | None = None
+    entry_efficiency_pct: Decimal | None = None
+    pre_move_lead_time_seconds: int | None = None
+    signal_to_entry_latency_seconds: int | None = None
+    time_to_target_seconds: int | None = None
+    time_to_stop_seconds: int | None = None
+    expiry_seconds: int
+    net_return_after_costs_pct: Decimal | None = None
+    estimated_round_trip_cost_pct: Decimal
+    realized_volatility_pct: Decimal | None = None
+    regime_label: str | None = None
+    liquidity_context: str | None = None
+    classification: str
+    classification_reasons: list[str]
+    outcome_state: str
+    evaluated_at: datetime
+
+
+class SignalTimingBaselineResponse(BaseModel):
+    """Phase 1 baseline report proving current signal timing quality."""
+
+    generated_at: datetime
+    data_state: Literal["ready", "insufficient_data", "degraded_storage"]
+    status_message: str
+    actionable_snapshot_count: int
+    evaluated_count: int
+    pending_count: int
+    insufficient_data_count: int
+    classification_counts: dict[str, int]
+    overall: SignalTimingAggregateResponse
+    by_horizon: list[SignalTimingAggregateResponse]
+    by_source: list[SignalTimingAggregateResponse]
+    recent_samples: list[SignalTimingSampleResponse]
+    definitions: dict[str, str]
+
+
+class ContinuousIntelligenceConfigResponse(BaseModel):
+    """Serialized continuous intelligence configuration."""
+
+    enabled: bool
+    markets: list[Literal["spot", "futures"]]
+    quote_asset: str
+    universe_limit: int
+    cycle_interval_seconds: int
+    universe_refresh_seconds: int
+    deep_candidate_limit: int
+    fast_score_threshold: int
+    concurrency: int
+    request_interval_ms: int
+    initial_delay_seconds: int
+
+
+class ContinuousIntelligenceStatusResponse(BaseModel):
+    """Continuous scanner lifecycle, progress, lag, and recovery health."""
+
+    enabled: bool
+    status: str
+    cycle_id: str | None = None
+    started_at: datetime | None = None
+    last_cycle_started_at: datetime | None = None
+    last_cycle_completed_at: datetime | None = None
+    last_full_universe_pass_at: datetime | None = None
+    last_universe_refresh_at: datetime | None = None
+    last_websocket_event_at: datetime | None = None
+    next_cycle_at: datetime | None = None
+    last_error: str | None = None
+    universe_source: str
+    total_symbols: int
+    fast_screened_symbols: int
+    deep_analyzed_symbols: int
+    deep_queue_depth: int
+    successful_cycles: int
+    failed_cycles: int
+    consecutive_failures: int
+    websocket_events: int
+    websocket_state: str
+    data_lag_seconds: int | None = None
+    warnings: list[str]
+    config: ContinuousIntelligenceConfigResponse
+    advisory_only: bool
+    paper_only: bool
+
+
+class ContinuousIntelligenceCandidateResponse(BaseModel):
+    """Latest fast/deep continuous intelligence for one symbol."""
+
+    market: Literal["spot", "futures"]
+    symbol: str
+    stage: str
+    fast_score: int
+    deep_score: int | None = None
+    direction_hint: str
+    current_price: Decimal | None = None
+    triggers: list[str]
+    metrics: dict[str, object]
+    reasons: list[str]
+    warnings: list[str]
+    screened_at: datetime
+    deep_analyzed_at: datetime | None = None
+    data_source: str
+
+
+class ContinuousIntelligenceCandidatesResponse(BaseModel):
+    """Latest persisted continuous candidate collection."""
+
+    generated_at: datetime
+    count: int
+    candidates: list[ContinuousIntelligenceCandidateResponse]
+    advisory_only: bool = True
+    paper_only: bool = True
+
+
+class ContinuousIntelligenceCycleResponse(BaseModel):
+    """One persisted continuous scan-cycle summary."""
+
+    cycle_id: str
+    started_at: datetime
+    completed_at: datetime | None = None
+    status: str
+    universe_source: str
+    total_symbols: int
+    fast_screened_symbols: int
+    deep_analyzed_symbols: int
+    candidate_count: int
+    failed_symbols: list[str]
+    error_message: str | None = None
+    duration_ms: int | None = None
+
+
+class ContinuousIntelligenceCyclesResponse(BaseModel):
+    """Recent persistent full-universe cycle history."""
+
+    generated_at: datetime
+    cycles: list[ContinuousIntelligenceCycleResponse]
+
+
+class ContinuousIntelligenceConfigRequest(BaseModel):
+    """Validated operator configuration for later continuous cycles."""
+
+    markets: list[Literal["spot", "futures"]] | None = None
+    quote_asset: str | None = Field(default=None, min_length=2, max_length=12)
+    universe_limit: int | None = Field(default=None, ge=1, le=100)
+    cycle_interval_seconds: int | None = Field(default=None, ge=30, le=3600)
+    universe_refresh_seconds: int | None = Field(default=None, ge=300, le=86400)
+    deep_candidate_limit: int | None = Field(default=None, ge=1, le=30)
+    fast_score_threshold: int | None = Field(default=None, ge=0, le=100)
+    concurrency: int | None = Field(default=None, ge=1, le=10)
+    request_interval_ms: int | None = Field(default=None, ge=0, le=2000)
+    initial_delay_seconds: int | None = Field(default=None, ge=0, le=300)
 
 
 class WorkstationResponse(BaseModel):
@@ -2062,6 +2358,16 @@ def get_bot_runtime(request: Request) -> PaperBotRuntime:
     return request.app.state.bot_runtime
 
 
+def get_futures_paper_service(request: Request) -> FuturesPaperService:
+    """Return the shared paper-only Futures service."""
+
+    if not hasattr(request.app.state, "futures_paper_service"):
+        request.app.state.futures_paper_service = FuturesPaperService(
+            repository=StorageRepository(get_settings().database_url)
+        )
+    return request.app.state.futures_paper_service
+
+
 def get_backfill_service(request: Request) -> HistoricalBackfillService:
     """Return the shared historical backfill service from app state."""
 
@@ -2114,6 +2420,16 @@ def get_settings_dependency() -> Settings:
     """Return application settings for bot control routes."""
 
     return get_settings()
+
+
+def get_continuous_intelligence_service(
+    request: Request,
+) -> ContinuousMarketIntelligenceService:
+    """Return the backend-owned continuous intelligence service."""
+
+    if hasattr(request.app.state, "continuous_intelligence_service"):
+        return request.app.state.continuous_intelligence_service
+    raise HTTPException(status_code=503, detail="Continuous market intelligence is unavailable.")
 
 
 def _to_symbol_response(record: SpotSymbolRecord) -> SymbolResponse:
@@ -2568,6 +2884,22 @@ def _default_trade_readiness_response(symbol: str, status: BotStatus) -> TradeRe
         ),
         signal_reason_codes=(),
         risk_reason_codes=(),
+        latest_signal_side=None,
+        latest_signal_reasons=(),
+        risk_decision="skipped",
+        execution_status="skipped",
+        blocker_category="insufficient_history" if runtime_active else "unknown",
+        blocker_message=(
+            status.recovery_message
+            if status.recovered_from_prior_session and status.symbol == symbol and status.mode == "paused"
+            else None
+        ),
+        next_possible_trigger=(
+            "Resume the recovered paper runtime."
+            if status.recovered_from_prior_session and status.symbol == symbol and status.mode == "paused"
+            else ("Start the paper runtime." if not runtime_active else "More closed candles and feature context.")
+        ),
+        last_trade_attempt_at=None,
     )
 
 
@@ -2610,6 +2942,14 @@ def _to_trade_readiness_response(
         risk_reason_codes=readiness.risk_reason_codes,
         expected_edge_pct=readiness.expected_edge_pct,
         estimated_round_trip_cost_pct=readiness.estimated_round_trip_cost_pct,
+        latest_signal_side=readiness.latest_signal_side,
+        latest_signal_reasons=readiness.latest_signal_reasons,
+        risk_decision=readiness.risk_decision,
+        execution_status=readiness.execution_status,
+        blocker_category=readiness.blocker_category,
+        blocker_message=readiness.blocker_message,
+        next_possible_trigger=readiness.next_possible_trigger,
+        last_trade_attempt_at=readiness.last_trade_attempt_at,
     )
 
 
@@ -2636,6 +2976,72 @@ def _to_manual_trade_response(result: ManualTradeResult) -> ManualTradeResponse:
         current_position_quantity=current_position_quantity,
         current_position_open=current_position_quantity > Decimal("0"),
         current_pnl=result.current_pnl,
+    )
+
+
+def _to_futures_position_response(position: FuturesPosition) -> FuturesPaperPositionResponse:
+    """Convert a paper Futures position to API response."""
+
+    return FuturesPaperPositionResponse(
+        symbol=position.symbol,
+        side=position.side,
+        quantity=position.quantity,
+        entry_price=position.entry_price,
+        mark_price=position.mark_price,
+        leverage=position.leverage,
+        margin_mode=position.margin_mode,
+        margin_used=position.margin_used,
+        unrealized_pnl=position.unrealized_pnl,
+        realized_pnl=position.realized_pnl,
+        liquidation_price_estimate=position.liquidation_price_estimate,
+        opened_at=position.opened_at,
+        updated_at=position.updated_at,
+    )
+
+
+def _to_futures_status_response(service: FuturesPaperService) -> FuturesPaperStatusResponse:
+    """Convert paper Futures service status to API response."""
+
+    status = service.status()
+    return FuturesPaperStatusResponse(
+        active=status.active,
+        mode="paper",
+        paper_only=True,
+        live_futures_trading_enabled=False,
+        positions=[_to_futures_position_response(position) for position in status.positions],
+        realized_pnl=status.realized_pnl,
+    )
+
+
+def _to_futures_signal_engine_response(signal: FuturesSignal) -> FuturesPaperExecutionSignalResponse:
+    """Convert deterministic Futures engine signal to API response."""
+
+    return FuturesPaperExecutionSignalResponse(
+        symbol=signal.symbol,
+        signal=signal.side,
+        confidence=signal.confidence,
+        risk_grade=signal.risk_grade,
+        reason_codes=signal.reason_codes,
+        blocker_reason=signal.blocker_reason,
+        paper_only=True,
+        ai_execution_authority=False,
+    )
+
+
+def _to_futures_fill_response(result: FuturesFillResult) -> FuturesPaperFillResponse:
+    """Convert a paper Futures fill to API response."""
+
+    return FuturesPaperFillResponse(
+        order_id=result.order_id,
+        status=result.status,
+        symbol=result.symbol,
+        side=result.side,
+        filled_quantity=result.filled_quantity,
+        fill_price=result.fill_price,
+        fee_paid=result.fee_paid,
+        realized_pnl=result.realized_pnl,
+        reason_codes=result.reason_codes,
+        paper_only=True,
     )
 
 
@@ -6378,6 +6784,137 @@ async def manual_close_position(
         )
 
 
+@router.get("/bot/futures/status", response_model=FuturesPaperStatusResponse)
+def get_futures_paper_status(
+    service: Annotated[FuturesPaperService, Depends(get_futures_paper_service)],
+) -> FuturesPaperStatusResponse:
+    """Return paper-only Futures runtime status."""
+
+    return _to_futures_status_response(service)
+
+
+@router.post("/bot/futures/start", response_model=FuturesPaperStatusResponse)
+def start_futures_paper(
+    service: Annotated[FuturesPaperService, Depends(get_futures_paper_service)],
+) -> FuturesPaperStatusResponse:
+    """Start paper-only Futures runtime."""
+
+    service.start()
+    return _to_futures_status_response(service)
+
+
+@router.post("/bot/futures/stop", response_model=FuturesPaperStatusResponse)
+def stop_futures_paper(
+    service: Annotated[FuturesPaperService, Depends(get_futures_paper_service)],
+) -> FuturesPaperStatusResponse:
+    """Stop paper-only Futures runtime."""
+
+    service.stop()
+    return _to_futures_status_response(service)
+
+
+@router.get("/bot/futures/signal", response_model=FuturesPaperExecutionSignalResponse)
+def get_futures_paper_signal(
+    symbol: Annotated[str, Query(min_length=1)],
+    service: Annotated[FuturesPaperService, Depends(get_futures_paper_service)],
+) -> FuturesPaperExecutionSignalResponse:
+    """Return a deterministic paper Futures LONG/SHORT signal."""
+
+    normalized_symbol = symbol.strip().upper()
+    position = service.broker.get_position(normalized_symbol)
+    signal_input = FuturesSignalInput(
+        symbol=normalized_symbol,
+        technical_bias="neutral",
+        regime="unknown",
+        market_sentiment="unknown",
+        symbol_sentiment="unknown",
+        pattern_bias="unknown",
+        current_position_side=position.side if position is not None else None,
+    )
+    return _to_futures_signal_engine_response(service.signal(signal_input))
+
+
+@router.post("/bot/futures/manual-long", response_model=FuturesPaperFillResponse)
+def manual_futures_long(
+    payload: FuturesPaperOrderRequest,
+    service: Annotated[FuturesPaperService, Depends(get_futures_paper_service)],
+) -> FuturesPaperFillResponse:
+    """Open a manual paper Futures LONG."""
+
+    result = service.manual_open(
+        symbol=payload.symbol,
+        side="LONG",
+        quantity=payload.quantity,
+        market_price=payload.market_price,
+        leverage=payload.leverage,
+    )
+    return _to_futures_fill_response(result)
+
+
+@router.post("/bot/futures/manual-short", response_model=FuturesPaperFillResponse)
+def manual_futures_short(
+    payload: FuturesPaperOrderRequest,
+    service: Annotated[FuturesPaperService, Depends(get_futures_paper_service)],
+) -> FuturesPaperFillResponse:
+    """Open a manual paper Futures SHORT."""
+
+    result = service.manual_open(
+        symbol=payload.symbol,
+        side="SHORT",
+        quantity=payload.quantity,
+        market_price=payload.market_price,
+        leverage=payload.leverage,
+    )
+    return _to_futures_fill_response(result)
+
+
+@router.post("/bot/futures/manual-close", response_model=FuturesPaperFillResponse)
+def manual_futures_close(
+    payload: FuturesPaperCloseRequest,
+    service: Annotated[FuturesPaperService, Depends(get_futures_paper_service)],
+) -> FuturesPaperFillResponse:
+    """Close the current manual paper Futures position."""
+
+    return _to_futures_fill_response(
+        service.manual_close(symbol=payload.symbol, market_price=payload.market_price)
+    )
+
+
+@router.get("/performance/futures-paper", response_model=FuturesPaperPerformanceResponse)
+def get_futures_paper_performance(
+    service: Annotated[FuturesPaperService, Depends(get_futures_paper_service)],
+    symbol: str | None = Query(default=None, min_length=1),
+) -> FuturesPaperPerformanceResponse:
+    """Return paper-only Futures performance."""
+
+    report = service.performance(symbol=symbol)
+    return FuturesPaperPerformanceResponse(
+        symbol=report["symbol"],  # type: ignore[arg-type]
+        paper_only=True,
+        total_fills=int(report["total_fills"]),
+        realized_pnl=report["realized_pnl"],  # type: ignore[arg-type]
+        positions=[
+            _to_futures_position_response(position)
+            for position in report["positions"]  # type: ignore[union-attr]
+        ],
+        recent_fills=[
+            FuturesPaperFillResponse(
+                order_id=fill.order_id,
+                status=fill.status,
+                symbol=fill.symbol,
+                side=fill.side,
+                filled_quantity=fill.filled_quantity,
+                fill_price=fill.fill_price,
+                fee_paid=fill.fee_paid,
+                realized_pnl=fill.realized_pnl,
+                reason_codes=fill.reason_codes,
+                paper_only=True,
+            )
+            for fill in report["recent_fills"]  # type: ignore[union-attr]
+        ],
+    )
+
+
 @router.get("/bot/backfill-status", response_model=BackfillStatusResponse)
 def get_backfill_status(
     symbol: Annotated[str, Query(min_length=1)],
@@ -7916,4 +8453,100 @@ def get_ai_signal_evaluation(
         recent_samples=evaluation.recent_samples,
         data_state=data_state,
         status_message=status_message,
+    )
+
+
+def _to_signal_timing_aggregate_response(
+    aggregate: SignalTimingAggregate,
+) -> SignalTimingAggregateResponse:
+    return SignalTimingAggregateResponse(**asdict(aggregate))
+
+
+@router.get("/bot/signal-timing-baseline", response_model=SignalTimingBaselineResponse)
+def get_signal_timing_baseline(
+    settings: Annotated[Settings, Depends(get_settings_dependency)],
+    symbol: Annotated[str | None, Query(min_length=1)] = None,
+    source: Annotated[str | None, Query(min_length=1)] = None,
+    horizon: Annotated[str | None, Query()] = None,
+    recent_limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> SignalTimingBaselineResponse:
+    """Return the measured Phase 1 baseline for actionable signal timing quality."""
+
+    if horizon is not None and horizon not in TIMING_HORIZONS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported timing horizon. Use one of: {', '.join(TIMING_HORIZONS)}.",
+        )
+    normalized_symbol = symbol.strip().upper() if symbol else None
+    normalized_source = source.strip() if source else None
+    try:
+        repository = StorageRepository(settings.database_url)
+    except Exception:
+        LOGGER.exception("Failed to open Phase 1 signal timing baseline storage.")
+        return SignalTimingBaselineResponse(
+            generated_at=datetime.now(tz=UTC),
+            data_state="degraded_storage",
+            status_message="Signal timing baseline storage is unavailable.",
+            actionable_snapshot_count=0,
+            evaluated_count=0,
+            pending_count=0,
+            insufficient_data_count=0,
+            classification_counts={},
+            overall=SignalTimingAggregateResponse(
+                label="overall",
+                sample_size=0,
+                late_rate_pct=Decimal("0"),
+                chase_rate_pct=Decimal("0"),
+                useful_rate_pct=Decimal("0"),
+            ),
+            by_horizon=[],
+            by_source=[],
+            recent_samples=[],
+            definitions={},
+        )
+    try:
+        evaluate_pending_signal_timing_baselines(
+            repository=repository,
+            retry_insufficient=True,
+        )
+        report = build_signal_timing_baseline_report(
+            repository=repository,
+            symbol=normalized_symbol,
+            source=normalized_source,
+            horizon=horizon,
+            recent_limit=recent_limit,
+        )
+        storage_degraded = repository.optional_storage_degraded
+        storage_message = repository.optional_storage_message
+    except Exception:
+        LOGGER.exception("Failed to build Phase 1 signal timing baseline report.")
+        repository.close()
+        raise HTTPException(status_code=503, detail="Signal timing baseline evaluation failed.") from None
+    repository.close()
+    if storage_degraded:
+        data_state = "degraded_storage"
+        status_message = storage_message or "Signal timing baseline persistence is degraded."
+    elif report.evaluated_count:
+        data_state = "ready"
+        status_message = "Current actionable signals have measured timing-quality evidence."
+    else:
+        data_state = "insufficient_data"
+        status_message = (
+            "Actionable snapshots need both pre-signal and matured post-signal candle history "
+            "before timing quality can be measured."
+        )
+    return SignalTimingBaselineResponse(
+        generated_at=report.generated_at,
+        data_state=data_state,
+        status_message=status_message,
+        actionable_snapshot_count=report.actionable_snapshot_count,
+        evaluated_count=report.evaluated_count,
+        pending_count=report.pending_count,
+        insufficient_data_count=report.insufficient_data_count,
+        classification_counts=report.classification_counts,
+        overall=_to_signal_timing_aggregate_response(report.overall),
+        by_horizon=[_to_signal_timing_aggregate_response(item) for item in report.by_horizon],
+        by_source=[_to_signal_timing_aggregate_response(item) for item in report.by_source],
+        recent_samples=[SignalTimingSampleResponse(**asdict(item)) for item in report.recent_samples],
+        definitions=report.definitions,
     )

@@ -16,6 +16,10 @@
   FuturesLiveSubscriptionResponse,
   FuturesOpportunityScanJobResponse,
   FuturesOpportunityScanResponse,
+  FuturesPaperFillResponse,
+  FuturesPaperPerformanceResponse,
+  FuturesPaperExecutionSignalResponse,
+  FuturesPaperStatusResponse,
   HealthResponse,
   HistoryFilters,
   MetricsResponse,
@@ -54,6 +58,7 @@
   SymbolSummaryItem,
   SymbolSentimentResponse,
   TradeItem,
+  BlockerAnalyticsResponse,
 } from './types';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '/api';
@@ -218,6 +223,84 @@ export function getPerformanceAnalytics(
   const params = buildRangeParams(filters);
   params.set('symbol', symbol.trim().toUpperCase());
   return requestJson<PerformanceAnalyticsResponse>('/performance', params, advancedRequestOptions(options));
+}
+
+export function getBlockerAnalytics(
+  symbol: string,
+  limit = 100,
+  options?: ApiRequestOptions,
+): Promise<BlockerAnalyticsResponse> {
+  const params = new URLSearchParams();
+  params.set('symbol', symbol.trim().toUpperCase());
+  params.set('limit', String(limit));
+  return requestJson<BlockerAnalyticsResponse>('/performance/blockers', params, advancedRequestOptions(options));
+}
+
+export function getFuturesPaperStatus(options?: ApiRequestOptions): Promise<FuturesPaperStatusResponse> {
+  return requestJson<FuturesPaperStatusResponse>('/bot/futures/status', undefined, requestOptions(options));
+}
+
+export function startFuturesPaper(): Promise<FuturesPaperStatusResponse> {
+  return requestJson<FuturesPaperStatusResponse>('/bot/futures/start', undefined, { method: 'POST' });
+}
+
+export function stopFuturesPaper(): Promise<FuturesPaperStatusResponse> {
+  return requestJson<FuturesPaperStatusResponse>('/bot/futures/stop', undefined, { method: 'POST' });
+}
+
+export function getFuturesPaperSignal(symbol: string, options?: ApiRequestOptions): Promise<FuturesPaperExecutionSignalResponse> {
+  const params = new URLSearchParams();
+  params.set('symbol', symbol.trim().toUpperCase());
+  return requestJson<FuturesPaperExecutionSignalResponse>('/bot/futures/signal', params, requestOptions(options));
+}
+
+function futuresPaperPayload(symbol: string, marketPrice: string, quantity: string, leverage: number) {
+  return {
+    symbol: symbol.trim().toUpperCase(),
+    market_price: marketPrice,
+    quantity,
+    leverage,
+  };
+}
+
+export function manualFuturesLong(
+  symbol: string,
+  marketPrice: string,
+  quantity: string,
+  leverage: number,
+): Promise<FuturesPaperFillResponse> {
+  return requestJson<FuturesPaperFillResponse>('/bot/futures/manual-long', undefined, {
+    method: 'POST',
+    body: JSON.stringify(futuresPaperPayload(symbol, marketPrice, quantity, leverage)),
+  });
+}
+
+export function manualFuturesShort(
+  symbol: string,
+  marketPrice: string,
+  quantity: string,
+  leverage: number,
+): Promise<FuturesPaperFillResponse> {
+  return requestJson<FuturesPaperFillResponse>('/bot/futures/manual-short', undefined, {
+    method: 'POST',
+    body: JSON.stringify(futuresPaperPayload(symbol, marketPrice, quantity, leverage)),
+  });
+}
+
+export function manualFuturesClose(symbol: string, marketPrice: string): Promise<FuturesPaperFillResponse> {
+  return requestJson<FuturesPaperFillResponse>('/bot/futures/manual-close', undefined, {
+    method: 'POST',
+    body: JSON.stringify({ symbol: symbol.trim().toUpperCase(), market_price: marketPrice }),
+  });
+}
+
+export function getFuturesPaperPerformance(
+  symbol: string,
+  options?: ApiRequestOptions,
+): Promise<FuturesPaperPerformanceResponse> {
+  const params = new URLSearchParams();
+  params.set('symbol', symbol.trim().toUpperCase());
+  return requestJson<FuturesPaperPerformanceResponse>('/performance/futures-paper', params, advancedRequestOptions(options));
 }
 
 export function getPostSignalPerformanceSummary(horizon = '15m'): Promise<PostSignalPerformanceSummaryResponse> {

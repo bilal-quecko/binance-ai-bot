@@ -40,13 +40,13 @@ PROFILE_THRESHOLDS: dict[str, dict[str, Decimal]] = {
         "take_profit_atr_multiple": Decimal("2.4"),
     },
     "aggressive": {
-        "min_atr_ratio": Decimal("0.0002"),
-        "max_spread_ratio": Decimal("0.0050"),
-        "min_order_book_imbalance": Decimal("-0.60"),
-        "min_expected_edge_buffer_pct": Decimal("0.0003"),
-        "min_stop_distance_ratio": Decimal("0.0005"),
-        "stop_loss_atr_multiple": Decimal("1.4"),
-        "take_profit_atr_multiple": Decimal("2.0"),
+        "min_atr_ratio": Decimal("0.00012"),
+        "max_spread_ratio": Decimal("0.0070"),
+        "min_order_book_imbalance": Decimal("-0.75"),
+        "min_expected_edge_buffer_pct": Decimal("0.00015"),
+        "min_stop_distance_ratio": Decimal("0.0003"),
+        "stop_loss_atr_multiple": Decimal("1.25"),
+        "take_profit_atr_multiple": Decimal("1.8"),
     },
 }
 

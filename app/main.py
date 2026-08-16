@@ -20,6 +20,7 @@ from app.data.binance_liquidation_feed import (
 )
 from app.exchange.symbol_service import SpotSymbolService
 from app.monitoring.futures_scanner_ws_heartbeat import FuturesScannerWebSocketHeartbeatService
+from app.monitoring.continuous_market_intelligence import ContinuousMarketIntelligenceService
 from app.monitoring.logging import configure_logging
 from app.monitoring.signal_outcomes import SignalOutcomeBackgroundService
 from app.services import HistoricalBackfillService
@@ -51,6 +52,13 @@ async def lifespan(app: FastAPI):
         settings=settings,
         websocket_client=websocket_client,
     )
+    continuous_intelligence_service = ContinuousMarketIntelligenceService(
+        settings=settings,
+        rest_client=rest_client,
+        spot_symbol_service=symbol_service,
+        spot_websocket_client=websocket_client,
+        futures_websocket_client=futures_websocket_client,
+    )
 
     app.state.rest_client = rest_client
     app.state.symbol_service = symbol_service
@@ -60,11 +68,14 @@ async def lifespan(app: FastAPI):
     app.state.futures_scanner_heartbeat_service = futures_scanner_heartbeat_service
     app.state.liquidation_feed_service = liquidation_feed_service
     app.state.signal_outcome_service = signal_outcome_service
+    app.state.continuous_intelligence_service = continuous_intelligence_service
     signal_outcome_service.start()
+    await continuous_intelligence_service.start(auto_recover=True)
 
     try:
         yield
     finally:
+        await continuous_intelligence_service.close()
         await signal_outcome_service.close()
         if liquidation_feed_service is not None:
             await liquidation_feed_service.close()

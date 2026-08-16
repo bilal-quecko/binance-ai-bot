@@ -19,6 +19,7 @@ from app.monitoring.adaptive_recommendations import (
     AdaptiveRecommendationReport,
     build_adaptive_recommendation_report,
 )
+from app.monitoring.blocker_analytics import summarize_blockers
 from app.monitoring.metrics import build_performance_analytics
 from app.monitoring.outcome_review import (
     BlockerFrequency,
@@ -244,6 +245,38 @@ class EventPageResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class BlockerGroupResponse(BaseModel):
+    """Grouped no-trade blocker count."""
+
+    category: str
+    count: int
+    percentage: float
+    explanation: str
+
+
+class RecentBlockerResponse(BaseModel):
+    """Recent no-trade blocker event."""
+
+    symbol: str
+    event_type: str
+    category: str
+    message: str
+    reason_codes: tuple[str, ...]
+    event_time: datetime
+
+
+class BlockerAnalyticsResponse(BaseModel):
+    """Recent no-trade blocker summary."""
+
+    symbol: str | None
+    total_events: int
+    groups: list[BlockerGroupResponse]
+    most_common_blocker: str | None
+    explanation: str
+    next_suggested_action: str
+    recent_blockers: list[RecentBlockerResponse]
 
 
 class SymbolSummaryResponse(BaseModel):
@@ -1989,6 +2022,49 @@ def get_metrics(
     trades = data_access.get_all_trades()
     latest_pnl = data_access.get_latest_equity()
     return _build_metrics(trades, latest_pnl)
+
+
+@router.get("/performance/blockers", response_model=BlockerAnalyticsResponse)
+def get_blocker_analytics(
+    data_access: Annotated[DashboardDataAccess, Depends(get_dashboard_data_access)],
+    symbol: str | None = Query(default=None, min_length=1),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> BlockerAnalyticsResponse:
+    """Return recent no-trade blocker analytics for paper-mode operation."""
+
+    normalized_symbol = symbol.upper() if symbol is not None else None
+    report = summarize_blockers(
+        data_access.get_events(symbol=normalized_symbol),
+        symbol=normalized_symbol,
+        limit=limit,
+    )
+    return BlockerAnalyticsResponse(
+        symbol=report.symbol,
+        total_events=report.total_events,
+        groups=[
+            BlockerGroupResponse(
+                category=group.category,
+                count=group.count,
+                percentage=group.percentage,
+                explanation=group.explanation,
+            )
+            for group in report.groups
+        ],
+        most_common_blocker=report.most_common_blocker,
+        explanation=report.explanation,
+        next_suggested_action=report.next_suggested_action,
+        recent_blockers=[
+            RecentBlockerResponse(
+                symbol=blocker.symbol,
+                event_type=blocker.event_type,
+                category=blocker.category,
+                message=blocker.message,
+                reason_codes=blocker.reason_codes,
+                event_time=blocker.event_time,
+            )
+            for blocker in report.recent_blockers
+        ],
+    )
 
 
 @router.get("/performance/signal-validation", response_model=SignalValidationResponse)

@@ -12,6 +12,7 @@ from app.features.models import FeatureSnapshot
 from app.market_data.candles import Candle
 from app.market_data.models import MarketSnapshot
 from app.market_data.orderbook import TopOfBook
+from app.monitoring.blocker_analytics import categorize_blocker
 from app.paper.broker import PaperBroker
 from app.paper.models import FillResult, OrderRequest, Position
 from app.risk.limits import RiskEngine
@@ -278,6 +279,16 @@ class StrategyRunner:
                 blocking_reasons[0] if blocking_reasons else "Deterministic entry conditions are not active yet."
             )
 
+        blocker_category = None
+        blocker_message = None
+        if risk_blocked and risk_decision is not None:
+            blocker_category = categorize_blocker(risk_decision.reason_codes, reason_if_not_trading)
+            blocker_message = reason_if_not_trading
+        elif not deterministic_entry_signal and not deterministic_exit_signal:
+            blocker_category = categorize_blocker(signal_reason_codes, reason_if_not_trading)
+            blocker_message = reason_if_not_trading
+        last_cycle = self._last_cycle_result_by_symbol.get(normalized_symbol)
+
         return TradeReadiness(
             selected_symbol=normalized_symbol,
             runtime_active=True,
@@ -297,6 +308,22 @@ class StrategyRunner:
             expected_edge_pct=risk_decision.expected_edge_pct if risk_decision is not None else None,
             estimated_round_trip_cost_pct=(
                 risk_decision.estimated_round_trip_cost_pct if risk_decision is not None else None
+            ),
+            latest_signal_side=actionable_signal.side,
+            latest_signal_reasons=signal_reason_codes,
+            risk_decision=risk_decision.decision if risk_decision is not None else "skipped",
+            execution_status=(
+                last_cycle.execution_result.status
+                if last_cycle is not None and last_cycle.execution_result is not None
+                else ("pending" if risk_ready and mode == "auto_paper" else "skipped")
+            ),
+            blocker_category=blocker_category,
+            blocker_message=blocker_message,
+            next_possible_trigger=self._next_possible_trigger(blocker_category),
+            last_trade_attempt_at=(
+                last_cycle.feature_snapshot.timestamp.isoformat()
+                if last_cycle is not None
+                else feature_snapshot.timestamp.isoformat()
             ),
         )
 
@@ -408,6 +435,49 @@ class StrategyRunner:
             "RESIZED_TO_POSITION": "Exit size was reduced to the current open position.",
         }
         return tuple(messages.get(code, code.replace("_", " ").capitalize()) for code in reason_codes)
+
+    @staticmethod
+    def _next_possible_trigger(category: str | None) -> str:
+        """Return the next deterministic trigger likely to unblock trading."""
+
+        triggers = {
+            "insufficient_history": "More closed candles and feature context.",
+            "weak_signal": "Stronger momentum and EMA alignment.",
+            "low_volatility": "A wider tradable range or breakout expansion.",
+            "volatility_too_high": "Lower, more stable ATR and price movement.",
+            "spread_too_wide": "Tighter spread and healthier order-book quality.",
+            "edge_below_costs": "Expected edge clearing fees, slippage, and buffer.",
+            "no_trend_confirmation": "Confirmed bullish regime for Spot entries.",
+            "position_limit": "A closed paper position or higher paper-only limit.",
+            "daily_loss_limit": "Daily loss protection reset after review.",
+            "no_position_to_exit": "An open paper position before close logic can act.",
+        }
+        return triggers.get(category or "", "A deterministic signal and risk approval.")
+
+    def _blocked_payload(
+        self,
+        *,
+        reason_codes: tuple[str, ...],
+        message: str,
+        symbol: str,
+        execution_source: str,
+    ) -> dict[str, object]:
+        """Build a consistent trade-blocked payload with current portfolio context."""
+
+        position = self._broker.get_position(symbol)
+        category = categorize_blocker(reason_codes, message)
+        return {
+            "reason_codes": reason_codes,
+            "blocker_category": category,
+            "blocker_message": message,
+            "next_possible_trigger": self._next_possible_trigger(category),
+            "current_position_quantity": str(position.quantity if position is not None else Decimal("0")),
+            "current_position_open": bool(position is not None and position.quantity > Decimal("0")),
+            "current_pnl": str(self._current_pnl()),
+            "execution_source": execution_source,
+            "trading_profile": self._config.trading_profile,
+            "session_id": self._config.session_id,
+        }
 
     def _build_risk_input(
         self,
@@ -630,16 +700,18 @@ class StrategyRunner:
                     tuning_version_id=self._config.tuning_version_id,
                 )
             else:
+                blocker_reasons = execution_result.reason_codes or risk_decision.reason_codes
+                blocker_message = f"blocked={blocker_reasons[0]}"
                 self._persist_event(
                     event_type="trade_blocked",
                     symbol=normalized_symbol,
-                    message=f"blocked={(execution_result.reason_codes or risk_decision.reason_codes)[0]}",
-                    payload={
-                        "reason_codes": execution_result.reason_codes or risk_decision.reason_codes,
-                        "execution_source": "manual",
-                        "trading_profile": self._config.trading_profile,
-                        "session_id": self._config.session_id,
-                    },
+                    message=blocker_message,
+                    payload=self._blocked_payload(
+                        reason_codes=blocker_reasons,
+                        message=blocker_message,
+                        symbol=normalized_symbol,
+                        execution_source="manual",
+                    ),
                     event_time=event_time,
                 )
         current_position, current_pnl = self._persist_position_and_pnl(normalized_symbol, event_time)
@@ -791,16 +863,17 @@ class StrategyRunner:
                 else:
                     blocker_reasons = execution_result.reason_codes or risk_decision.reason_codes
                     if blocker_reasons:
+                        blocker_message = f"blocked={blocker_reasons[0]}"
                         self._persist_event(
                             event_type="trade_blocked",
                             symbol=symbol,
-                            message=f"blocked={blocker_reasons[0]}",
-                            payload={
-                                "reason_codes": blocker_reasons,
-                                "execution_source": "auto",
-                                "trading_profile": self._config.trading_profile,
-                                "session_id": self._config.session_id,
-                            },
+                            message=blocker_message,
+                            payload=self._blocked_payload(
+                                reason_codes=blocker_reasons,
+                                message=blocker_message,
+                                symbol=symbol,
+                                execution_source="auto",
+                            ),
                             event_time=feature_snapshot.timestamp,
                         )
         else:
@@ -821,16 +894,17 @@ class StrategyRunner:
                 event_time=feature_snapshot.timestamp,
             )
             blocker_reasons = signal.reason_codes or ("NON_ACTIONABLE_SIGNAL",)
+            blocker_message = f"blocked={blocker_reasons[0]}"
             self._persist_event(
                 event_type="trade_blocked",
                 symbol=symbol,
-                message=f"blocked={blocker_reasons[0]}",
-                payload={
-                    "reason_codes": blocker_reasons,
-                    "execution_source": "auto",
-                    "trading_profile": self._config.trading_profile,
-                    "session_id": self._config.session_id,
-                },
+                message=blocker_message,
+                payload=self._blocked_payload(
+                    reason_codes=blocker_reasons,
+                    message=blocker_message,
+                    symbol=symbol,
+                    execution_source="auto",
+                ),
                 event_time=feature_snapshot.timestamp,
             )
 

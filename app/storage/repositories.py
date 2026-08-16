@@ -19,11 +19,16 @@ from app.storage.db import create_db_connection
 from app.storage.models import (
     AISignalFeatureSummaryRecord,
     AISignalSnapshotRecord,
+    ContinuousIntelligenceCandidateRecord,
+    ContinuousIntelligenceCycleRecord,
+    ContinuousIntelligenceStateRecord,
     DailyPnlRecord,
     DrawdownPoint,
     DrawdownSummary,
     EquityHistoryPoint,
     FillRecord,
+    FuturesPaperFillRecord,
+    FuturesPaperPositionRecord,
     HistoricalCandleRecord,
     MarketCandleSnapshotRecord,
     PaperBrokerStateRecord,
@@ -41,6 +46,7 @@ from app.storage.models import (
     ScannerValidationSnapshotRecord,
     SignalOutcomeRecord,
     SignalOutcomeSnapshotRecord,
+    SignalTimingBaselineRecord,
     SignalValidationSnapshotRecord,
     SymbolAnalysisCacheRecord,
     SymbolBackfillJobRecord,
@@ -386,6 +392,133 @@ def _signal_outcome_from_row(row: sqlite3.Row) -> SignalOutcomeRecord:
     )
 
 
+def _signal_timing_baseline_from_row(row: sqlite3.Row) -> SignalTimingBaselineRecord:
+    """Convert a SQLite row into a signal timing baseline record."""
+
+    def optional_decimal(column: str) -> Decimal | None:
+        return _decimal(row[column]) if row[column] is not None else None
+
+    return SignalTimingBaselineRecord(
+        id=int(row["id"]),
+        signal_id=row["signal_id"],
+        horizon=row["horizon"],
+        symbol=row["symbol"],
+        source=row["source"],
+        direction=row["direction"],
+        signal_time=datetime.fromisoformat(row["signal_time"]),
+        setup_start_time=_safe_datetime(row["setup_start_time"]),
+        setup_start_price=optional_decimal("setup_start_price"),
+        activation_price=optional_decimal("activation_price"),
+        recent_swing_low=optional_decimal("recent_swing_low"),
+        recent_swing_high=optional_decimal("recent_swing_high"),
+        horizon_end_price=optional_decimal("horizon_end_price"),
+        max_favorable_price=optional_decimal("max_favorable_price"),
+        max_adverse_price=optional_decimal("max_adverse_price"),
+        move_before_signal_pct=optional_decimal("move_before_signal_pct"),
+        move_after_signal_pct=optional_decimal("move_after_signal_pct"),
+        max_favorable_excursion_pct=optional_decimal("max_favorable_excursion_pct"),
+        max_adverse_excursion_pct=optional_decimal("max_adverse_excursion_pct"),
+        full_move_pct=optional_decimal("full_move_pct"),
+        move_already_consumed_pct=optional_decimal("move_already_consumed_pct"),
+        move_capture_ratio_pct=optional_decimal("move_capture_ratio_pct"),
+        entry_efficiency_pct=optional_decimal("entry_efficiency_pct"),
+        pre_move_lead_time_seconds=(
+            int(row["pre_move_lead_time_seconds"])
+            if row["pre_move_lead_time_seconds"] is not None
+            else None
+        ),
+        signal_to_entry_latency_seconds=(
+            int(row["signal_to_entry_latency_seconds"])
+            if row["signal_to_entry_latency_seconds"] is not None
+            else None
+        ),
+        time_to_target_seconds=(
+            int(row["time_to_target_seconds"]) if row["time_to_target_seconds"] is not None else None
+        ),
+        time_to_stop_seconds=(
+            int(row["time_to_stop_seconds"]) if row["time_to_stop_seconds"] is not None else None
+        ),
+        expiry_seconds=int(row["expiry_seconds"]),
+        net_return_after_costs_pct=optional_decimal("net_return_after_costs_pct"),
+        estimated_round_trip_cost_pct=_decimal(row["estimated_round_trip_cost_pct"]),
+        realized_volatility_pct=optional_decimal("realized_volatility_pct"),
+        regime_label=row["regime_label"],
+        liquidity_context=row["liquidity_context"],
+        classification=row["classification"],
+        classification_reasons=_parse_json_tuple(row["classification_reasons_json"]),
+        outcome_state=row["outcome_state"],
+        evaluated_at=datetime.fromisoformat(row["evaluated_at"]),
+    )
+
+
+def _continuous_intelligence_state_from_row(
+    row: sqlite3.Row,
+) -> ContinuousIntelligenceStateRecord:
+    return ContinuousIntelligenceStateRecord(
+        enabled=bool(row["enabled"]),
+        status=row["status"],
+        cycle_id=row["cycle_id"],
+        started_at=_safe_datetime(row["started_at"]),
+        last_cycle_started_at=_safe_datetime(row["last_cycle_started_at"]),
+        last_cycle_completed_at=_safe_datetime(row["last_cycle_completed_at"]),
+        last_full_universe_pass_at=_safe_datetime(row["last_full_universe_pass_at"]),
+        last_universe_refresh_at=_safe_datetime(row["last_universe_refresh_at"]),
+        last_websocket_event_at=_safe_datetime(row["last_websocket_event_at"]),
+        next_cycle_at=_safe_datetime(row["next_cycle_at"]),
+        last_error=row["last_error"],
+        universe_source=row["universe_source"],
+        total_symbols=int(row["total_symbols"]),
+        fast_screened_symbols=int(row["fast_screened_symbols"]),
+        deep_analyzed_symbols=int(row["deep_analyzed_symbols"]),
+        deep_queue_depth=int(row["deep_queue_depth"]),
+        successful_cycles=int(row["successful_cycles"]),
+        failed_cycles=int(row["failed_cycles"]),
+        consecutive_failures=int(row["consecutive_failures"]),
+        config_json=row["config_json"],
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+def _continuous_intelligence_candidate_from_row(
+    row: sqlite3.Row,
+) -> ContinuousIntelligenceCandidateRecord:
+    return ContinuousIntelligenceCandidateRecord(
+        market=row["market"],
+        symbol=row["symbol"],
+        stage=row["stage"],
+        fast_score=int(row["fast_score"]),
+        deep_score=int(row["deep_score"]) if row["deep_score"] is not None else None,
+        direction_hint=row["direction_hint"],
+        current_price=_decimal(row["current_price"]) if row["current_price"] is not None else None,
+        triggers=_parse_json_tuple(row["triggers_json"]),
+        metrics_json=row["metrics_json"],
+        reasons=_parse_json_tuple(row["reasons_json"]),
+        warnings=_parse_json_tuple(row["warnings_json"]),
+        screened_at=datetime.fromisoformat(row["screened_at"]),
+        deep_analyzed_at=_safe_datetime(row["deep_analyzed_at"]),
+        data_source=row["data_source"],
+    )
+
+
+def _continuous_intelligence_cycle_from_row(
+    row: sqlite3.Row,
+) -> ContinuousIntelligenceCycleRecord:
+    return ContinuousIntelligenceCycleRecord(
+        cycle_id=row["cycle_id"],
+        started_at=datetime.fromisoformat(row["started_at"]),
+        completed_at=_safe_datetime(row["completed_at"]),
+        status=row["status"],
+        universe_source=row["universe_source"],
+        total_symbols=int(row["total_symbols"]),
+        fast_screened_symbols=int(row["fast_screened_symbols"]),
+        deep_analyzed_symbols=int(row["deep_analyzed_symbols"]),
+        candidate_count=int(row["candidate_count"]),
+        failed_symbols=_parse_json_tuple(row["failed_symbols_json"]),
+        error_message=row["error_message"],
+        duration_ms=int(row["duration_ms"]) if row["duration_ms"] is not None else None,
+    )
+
+
 def _serialize_ai_feature_summary(snapshot: AISignalSnapshot) -> str:
     """Serialize the persisted AI feature summary."""
 
@@ -553,6 +686,10 @@ class StorageRepository:
                     "positions_snapshots",
                     "pnl_snapshots",
                     "runner_events",
+                    "futures_paper_events",
+                    "futures_paper_fills",
+                    "futures_paper_positions",
+                    "futures_paper_pnl_snapshots",
                     "ai_signal_snapshots",
                     "market_candle_snapshots",
                     "signal_validation_snapshots",
@@ -2352,6 +2489,402 @@ class StorageRepository:
             return []
         return [_signal_outcome_from_row(row) for row in rows]
 
+    def upsert_signal_timing_baseline(self, baseline: SignalTimingBaselineRecord) -> None:
+        """Persist or replace one signal timing-quality baseline."""
+
+        values = (
+            baseline.signal_id,
+            baseline.horizon,
+            baseline.symbol.upper(),
+            baseline.source,
+            baseline.direction,
+            baseline.signal_time.isoformat(),
+            baseline.setup_start_time.isoformat() if baseline.setup_start_time is not None else None,
+            str(baseline.setup_start_price) if baseline.setup_start_price is not None else None,
+            str(baseline.activation_price) if baseline.activation_price is not None else None,
+            str(baseline.recent_swing_low) if baseline.recent_swing_low is not None else None,
+            str(baseline.recent_swing_high) if baseline.recent_swing_high is not None else None,
+            str(baseline.horizon_end_price) if baseline.horizon_end_price is not None else None,
+            str(baseline.max_favorable_price) if baseline.max_favorable_price is not None else None,
+            str(baseline.max_adverse_price) if baseline.max_adverse_price is not None else None,
+            str(baseline.move_before_signal_pct) if baseline.move_before_signal_pct is not None else None,
+            str(baseline.move_after_signal_pct) if baseline.move_after_signal_pct is not None else None,
+            (
+                str(baseline.max_favorable_excursion_pct)
+                if baseline.max_favorable_excursion_pct is not None
+                else None
+            ),
+            (
+                str(baseline.max_adverse_excursion_pct)
+                if baseline.max_adverse_excursion_pct is not None
+                else None
+            ),
+            str(baseline.full_move_pct) if baseline.full_move_pct is not None else None,
+            (
+                str(baseline.move_already_consumed_pct)
+                if baseline.move_already_consumed_pct is not None
+                else None
+            ),
+            (
+                str(baseline.move_capture_ratio_pct)
+                if baseline.move_capture_ratio_pct is not None
+                else None
+            ),
+            str(baseline.entry_efficiency_pct) if baseline.entry_efficiency_pct is not None else None,
+            baseline.pre_move_lead_time_seconds,
+            baseline.signal_to_entry_latency_seconds,
+            baseline.time_to_target_seconds,
+            baseline.time_to_stop_seconds,
+            baseline.expiry_seconds,
+            (
+                str(baseline.net_return_after_costs_pct)
+                if baseline.net_return_after_costs_pct is not None
+                else None
+            ),
+            str(baseline.estimated_round_trip_cost_pct),
+            str(baseline.realized_volatility_pct) if baseline.realized_volatility_pct is not None else None,
+            baseline.regime_label,
+            baseline.liquidity_context,
+            baseline.classification,
+            json.dumps(list(baseline.classification_reasons)),
+            baseline.outcome_state,
+            baseline.evaluated_at.isoformat(),
+        )
+        try:
+            with self._connection_scope() as connection:
+                with connection:
+                    connection.execute(
+                        """
+                        INSERT INTO signal_timing_baselines (
+                            signal_id, horizon, symbol, source, direction, signal_time,
+                            setup_start_time, setup_start_price, activation_price,
+                            recent_swing_low, recent_swing_high, horizon_end_price,
+                            max_favorable_price, max_adverse_price, move_before_signal_pct,
+                            move_after_signal_pct, max_favorable_excursion_pct,
+                            max_adverse_excursion_pct, full_move_pct, move_already_consumed_pct,
+                            move_capture_ratio_pct, entry_efficiency_pct, pre_move_lead_time_seconds,
+                            signal_to_entry_latency_seconds, time_to_target_seconds,
+                            time_to_stop_seconds, expiry_seconds, net_return_after_costs_pct,
+                            estimated_round_trip_cost_pct, realized_volatility_pct, regime_label,
+                            liquidity_context, classification, classification_reasons_json,
+                            outcome_state, evaluated_at
+                        ) VALUES (
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        )
+                        ON CONFLICT(signal_id, horizon) DO UPDATE SET
+                            setup_start_time = excluded.setup_start_time,
+                            setup_start_price = excluded.setup_start_price,
+                            activation_price = excluded.activation_price,
+                            recent_swing_low = excluded.recent_swing_low,
+                            recent_swing_high = excluded.recent_swing_high,
+                            horizon_end_price = excluded.horizon_end_price,
+                            max_favorable_price = excluded.max_favorable_price,
+                            max_adverse_price = excluded.max_adverse_price,
+                            move_before_signal_pct = excluded.move_before_signal_pct,
+                            move_after_signal_pct = excluded.move_after_signal_pct,
+                            max_favorable_excursion_pct = excluded.max_favorable_excursion_pct,
+                            max_adverse_excursion_pct = excluded.max_adverse_excursion_pct,
+                            full_move_pct = excluded.full_move_pct,
+                            move_already_consumed_pct = excluded.move_already_consumed_pct,
+                            move_capture_ratio_pct = excluded.move_capture_ratio_pct,
+                            entry_efficiency_pct = excluded.entry_efficiency_pct,
+                            pre_move_lead_time_seconds = excluded.pre_move_lead_time_seconds,
+                            signal_to_entry_latency_seconds = excluded.signal_to_entry_latency_seconds,
+                            time_to_target_seconds = excluded.time_to_target_seconds,
+                            time_to_stop_seconds = excluded.time_to_stop_seconds,
+                            expiry_seconds = excluded.expiry_seconds,
+                            net_return_after_costs_pct = excluded.net_return_after_costs_pct,
+                            estimated_round_trip_cost_pct = excluded.estimated_round_trip_cost_pct,
+                            realized_volatility_pct = excluded.realized_volatility_pct,
+                            regime_label = excluded.regime_label,
+                            liquidity_context = excluded.liquidity_context,
+                            classification = excluded.classification,
+                            classification_reasons_json = excluded.classification_reasons_json,
+                            outcome_state = excluded.outcome_state,
+                            evaluated_at = excluded.evaluated_at
+                        """,
+                        values,
+                    )
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Signal timing baseline storage is unavailable.")
+            LOGGER.warning("Skipping signal timing baseline persistence due to schema issue: %s", exc)
+
+    def get_signal_timing_baselines(
+        self,
+        *,
+        symbol: str | None = None,
+        source: str | None = None,
+        horizon: str | None = None,
+        classification: str | None = None,
+        limit: int | None = None,
+    ) -> list[SignalTimingBaselineRecord]:
+        """Return persisted signal timing baselines with optional filters."""
+
+        query = "SELECT * FROM signal_timing_baselines WHERE 1 = 1"
+        params: list[Any] = []
+        if symbol is not None:
+            query += " AND symbol = ?"
+            params.append(symbol.upper())
+        if source is not None:
+            query += " AND source = ?"
+            params.append(source)
+        if horizon is not None:
+            query += " AND horizon = ?"
+            params.append(horizon)
+        if classification is not None:
+            query += " AND classification = ?"
+            params.append(classification)
+        query += " ORDER BY signal_time DESC, id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        try:
+            with self._connection_scope() as connection:
+                rows = connection.execute(query, tuple(params)).fetchall()
+        except sqlite3.OperationalError as exc:
+            if not _is_optional_schema_error(exc):
+                raise
+            self._mark_optional_storage_degraded("Signal timing baseline storage is unavailable.")
+            LOGGER.warning("Failed to read signal timing baselines due to schema issue: %s", exc)
+            return []
+        return [_signal_timing_baseline_from_row(row) for row in rows]
+
+    def upsert_continuous_intelligence_state(
+        self,
+        state: ContinuousIntelligenceStateRecord,
+    ) -> None:
+        """Persist the singleton continuous-intelligence service checkpoint."""
+
+        with self._connection_scope() as connection:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO continuous_intelligence_state (
+                        singleton_id, enabled, status, cycle_id, started_at,
+                        last_cycle_started_at, last_cycle_completed_at,
+                        last_full_universe_pass_at, last_universe_refresh_at,
+                        last_websocket_event_at, next_cycle_at, last_error,
+                        universe_source, total_symbols, fast_screened_symbols,
+                        deep_analyzed_symbols, deep_queue_depth, successful_cycles,
+                        failed_cycles, consecutive_failures, config_json, updated_at
+                    ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(singleton_id) DO UPDATE SET
+                        enabled = excluded.enabled,
+                        status = excluded.status,
+                        cycle_id = excluded.cycle_id,
+                        started_at = excluded.started_at,
+                        last_cycle_started_at = excluded.last_cycle_started_at,
+                        last_cycle_completed_at = excluded.last_cycle_completed_at,
+                        last_full_universe_pass_at = excluded.last_full_universe_pass_at,
+                        last_universe_refresh_at = excluded.last_universe_refresh_at,
+                        last_websocket_event_at = excluded.last_websocket_event_at,
+                        next_cycle_at = excluded.next_cycle_at,
+                        last_error = excluded.last_error,
+                        universe_source = excluded.universe_source,
+                        total_symbols = excluded.total_symbols,
+                        fast_screened_symbols = excluded.fast_screened_symbols,
+                        deep_analyzed_symbols = excluded.deep_analyzed_symbols,
+                        deep_queue_depth = excluded.deep_queue_depth,
+                        successful_cycles = excluded.successful_cycles,
+                        failed_cycles = excluded.failed_cycles,
+                        consecutive_failures = excluded.consecutive_failures,
+                        config_json = excluded.config_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        int(state.enabled),
+                        state.status,
+                        state.cycle_id,
+                        state.started_at.isoformat() if state.started_at else None,
+                        state.last_cycle_started_at.isoformat() if state.last_cycle_started_at else None,
+                        state.last_cycle_completed_at.isoformat() if state.last_cycle_completed_at else None,
+                        state.last_full_universe_pass_at.isoformat() if state.last_full_universe_pass_at else None,
+                        state.last_universe_refresh_at.isoformat() if state.last_universe_refresh_at else None,
+                        state.last_websocket_event_at.isoformat() if state.last_websocket_event_at else None,
+                        state.next_cycle_at.isoformat() if state.next_cycle_at else None,
+                        state.last_error,
+                        state.universe_source,
+                        state.total_symbols,
+                        state.fast_screened_symbols,
+                        state.deep_analyzed_symbols,
+                        state.deep_queue_depth,
+                        state.successful_cycles,
+                        state.failed_cycles,
+                        state.consecutive_failures,
+                        state.config_json,
+                        state.updated_at.isoformat(),
+                    ),
+                )
+
+    def get_continuous_intelligence_state(self) -> ContinuousIntelligenceStateRecord | None:
+        """Return the persisted continuous-intelligence checkpoint."""
+
+        with self._connection_scope() as connection:
+            row = connection.execute(
+                "SELECT * FROM continuous_intelligence_state WHERE singleton_id = 1"
+            ).fetchone()
+        return _continuous_intelligence_state_from_row(row) if row is not None else None
+
+    def upsert_continuous_intelligence_candidates(
+        self,
+        candidates: list[ContinuousIntelligenceCandidateRecord],
+    ) -> int:
+        """Persist the latest tiered screening result for each symbol."""
+
+        if not candidates:
+            return 0
+        with self._connection_scope() as connection:
+            with connection:
+                cursor = connection.executemany(
+                    """
+                    INSERT INTO continuous_intelligence_candidates (
+                        market, symbol, stage, fast_score, deep_score, direction_hint,
+                        current_price, triggers_json, metrics_json, reasons_json,
+                        warnings_json, screened_at, deep_analyzed_at, data_source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(market, symbol) DO UPDATE SET
+                        stage = excluded.stage,
+                        fast_score = excluded.fast_score,
+                        deep_score = excluded.deep_score,
+                        direction_hint = excluded.direction_hint,
+                        current_price = excluded.current_price,
+                        triggers_json = excluded.triggers_json,
+                        metrics_json = excluded.metrics_json,
+                        reasons_json = excluded.reasons_json,
+                        warnings_json = excluded.warnings_json,
+                        screened_at = excluded.screened_at,
+                        deep_analyzed_at = excluded.deep_analyzed_at,
+                        data_source = excluded.data_source
+                    """,
+                    [
+                        (
+                            item.market,
+                            item.symbol.upper(),
+                            item.stage,
+                            item.fast_score,
+                            item.deep_score,
+                            item.direction_hint,
+                            str(item.current_price) if item.current_price is not None else None,
+                            json.dumps(list(item.triggers)),
+                            item.metrics_json,
+                            json.dumps(list(item.reasons)),
+                            json.dumps(list(item.warnings)),
+                            item.screened_at.isoformat(),
+                            item.deep_analyzed_at.isoformat() if item.deep_analyzed_at else None,
+                            item.data_source,
+                        )
+                        for item in candidates
+                    ],
+                )
+        return int(cursor.rowcount)
+
+    def get_continuous_intelligence_candidates(
+        self,
+        *,
+        market: str | None = None,
+        stage: str | None = None,
+        limit: int = 100,
+    ) -> list[ContinuousIntelligenceCandidateRecord]:
+        """Return latest continuous candidates ordered by deep then fast score."""
+
+        query = "SELECT * FROM continuous_intelligence_candidates WHERE 1 = 1"
+        params: list[Any] = []
+        if market is not None:
+            query += " AND market = ?"
+            params.append(market)
+        if stage is not None:
+            query += " AND stage = ?"
+            params.append(stage)
+        query += " ORDER BY COALESCE(deep_score, -1) DESC, fast_score DESC, symbol ASC LIMIT ?"
+        params.append(limit)
+        with self._connection_scope() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [_continuous_intelligence_candidate_from_row(row) for row in rows]
+
+    def delete_stale_continuous_intelligence_candidates(
+        self,
+        *,
+        market: str,
+        active_symbols: list[str],
+    ) -> int:
+        """Remove candidates no longer present in the active configured universe."""
+
+        normalized = [symbol.upper() for symbol in active_symbols]
+        with self._connection_scope() as connection:
+            with connection:
+                if not normalized:
+                    cursor = connection.execute(
+                        "DELETE FROM continuous_intelligence_candidates WHERE market = ?",
+                        (market,),
+                    )
+                else:
+                    placeholders = ",".join("?" for _ in normalized)
+                    cursor = connection.execute(
+                        f"DELETE FROM continuous_intelligence_candidates WHERE market = ? AND symbol NOT IN ({placeholders})",
+                        (market, *normalized),
+                    )
+        return int(cursor.rowcount)
+
+    def upsert_continuous_intelligence_cycle(
+        self,
+        cycle: ContinuousIntelligenceCycleRecord,
+    ) -> None:
+        """Persist one continuous-intelligence cycle summary."""
+
+        with self._connection_scope() as connection:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO continuous_intelligence_cycles (
+                        cycle_id, started_at, completed_at, status, universe_source,
+                        total_symbols, fast_screened_symbols, deep_analyzed_symbols,
+                        candidate_count, failed_symbols_json, error_message, duration_ms
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(cycle_id) DO UPDATE SET
+                        completed_at = excluded.completed_at,
+                        status = excluded.status,
+                        universe_source = excluded.universe_source,
+                        total_symbols = excluded.total_symbols,
+                        fast_screened_symbols = excluded.fast_screened_symbols,
+                        deep_analyzed_symbols = excluded.deep_analyzed_symbols,
+                        candidate_count = excluded.candidate_count,
+                        failed_symbols_json = excluded.failed_symbols_json,
+                        error_message = excluded.error_message,
+                        duration_ms = excluded.duration_ms
+                    """,
+                    (
+                        cycle.cycle_id,
+                        cycle.started_at.isoformat(),
+                        cycle.completed_at.isoformat() if cycle.completed_at else None,
+                        cycle.status,
+                        cycle.universe_source,
+                        cycle.total_symbols,
+                        cycle.fast_screened_symbols,
+                        cycle.deep_analyzed_symbols,
+                        cycle.candidate_count,
+                        json.dumps(list(cycle.failed_symbols)),
+                        cycle.error_message,
+                        cycle.duration_ms,
+                    ),
+                )
+
+    def get_continuous_intelligence_cycles(
+        self,
+        *,
+        limit: int = 20,
+    ) -> list[ContinuousIntelligenceCycleRecord]:
+        """Return recent continuous-intelligence cycle summaries."""
+
+        with self._connection_scope() as connection:
+            rows = connection.execute(
+                "SELECT * FROM continuous_intelligence_cycles ORDER BY started_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [_continuous_intelligence_cycle_from_row(row) for row in rows]
+
     def latest_historical_candle(
         self,
         *,
@@ -2826,6 +3359,254 @@ class StorageRepository:
             )
         finally:
             connection.close()
+
+    def insert_futures_paper_event(
+        self,
+        *,
+        event_type: str,
+        symbol: str,
+        payload: dict[str, Any],
+        event_time: datetime,
+    ) -> None:
+        """Persist a paper Futures event separately from Spot runner events."""
+
+        with self._connection_scope() as connection:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO futures_paper_events (
+                        event_type, symbol, payload_json, event_time
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        event_type,
+                        symbol.upper(),
+                        json.dumps(payload, default=str, sort_keys=True),
+                        event_time.isoformat(),
+                    ),
+                )
+
+    def insert_futures_paper_fill(
+        self,
+        *,
+        order_id: str,
+        status: str,
+        symbol: str,
+        side: str,
+        filled_quantity: Decimal,
+        fill_price: Decimal,
+        fee_paid: Decimal,
+        realized_pnl: Decimal,
+        reason_codes: tuple[str, ...],
+        event_time: datetime,
+    ) -> None:
+        """Persist a paper Futures fill/result row."""
+
+        with self._connection_scope() as connection:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO futures_paper_fills (
+                        order_id, status, symbol, side, filled_quantity, fill_price,
+                        fee_paid, realized_pnl, reason_codes, event_time
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        order_id,
+                        status,
+                        symbol.upper(),
+                        side,
+                        str(filled_quantity),
+                        str(fill_price),
+                        str(fee_paid),
+                        str(realized_pnl),
+                        json.dumps(reason_codes),
+                        event_time.isoformat(),
+                    ),
+                )
+
+    def upsert_futures_paper_position(self, position: FuturesPaperPositionRecord) -> None:
+        """Persist the current paper Futures position for one symbol."""
+
+        with self._connection_scope() as connection:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO futures_paper_positions (
+                        symbol, side, quantity, entry_price, mark_price, leverage, margin_mode,
+                        margin_used, unrealized_pnl, realized_pnl, liquidation_price_estimate,
+                        opened_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(symbol) DO UPDATE SET
+                        side = excluded.side,
+                        quantity = excluded.quantity,
+                        entry_price = excluded.entry_price,
+                        mark_price = excluded.mark_price,
+                        leverage = excluded.leverage,
+                        margin_mode = excluded.margin_mode,
+                        margin_used = excluded.margin_used,
+                        unrealized_pnl = excluded.unrealized_pnl,
+                        realized_pnl = excluded.realized_pnl,
+                        liquidation_price_estimate = excluded.liquidation_price_estimate,
+                        opened_at = excluded.opened_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        position.symbol.upper(),
+                        position.side,
+                        str(position.quantity),
+                        str(position.entry_price),
+                        str(position.mark_price),
+                        position.leverage,
+                        position.margin_mode,
+                        str(position.margin_used),
+                        str(position.unrealized_pnl),
+                        str(position.realized_pnl),
+                        str(position.liquidation_price_estimate),
+                        position.opened_at.isoformat(),
+                        position.updated_at.isoformat(),
+                    ),
+                )
+
+    def delete_futures_paper_position(self, symbol: str) -> None:
+        """Delete the current paper Futures position for one symbol."""
+
+        with self._connection_scope() as connection:
+            with connection:
+                connection.execute(
+                    "DELETE FROM futures_paper_positions WHERE symbol = ?",
+                    (symbol.upper(),),
+                )
+
+    def insert_futures_paper_pnl_snapshot(
+        self,
+        *,
+        symbol: str,
+        snapshot_time: datetime,
+        unrealized_pnl: Decimal,
+        realized_pnl: Decimal,
+    ) -> None:
+        """Persist a paper Futures PnL snapshot."""
+
+        with self._connection_scope() as connection:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO futures_paper_pnl_snapshots (
+                        symbol, snapshot_time, unrealized_pnl, realized_pnl
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        symbol.upper(),
+                        snapshot_time.isoformat(),
+                        str(unrealized_pnl),
+                        str(realized_pnl),
+                    ),
+                )
+
+    def get_futures_paper_position(self, symbol: str) -> FuturesPaperPositionRecord | None:
+        """Return the current paper Futures position for one symbol."""
+
+        with self._connection_scope() as connection:
+            row = connection.execute(
+                """
+                SELECT symbol, side, quantity, entry_price, mark_price, leverage, margin_mode,
+                       margin_used, unrealized_pnl, realized_pnl, liquidation_price_estimate,
+                       opened_at, updated_at
+                FROM futures_paper_positions
+                WHERE symbol = ?
+                """,
+                (symbol.upper(),),
+            ).fetchone()
+        if row is None:
+            return None
+        return FuturesPaperPositionRecord(
+            symbol=row["symbol"],
+            side=row["side"],
+            quantity=_decimal(row["quantity"]),
+            entry_price=_decimal(row["entry_price"]),
+            mark_price=_decimal(row["mark_price"]),
+            leverage=int(row["leverage"]),
+            margin_mode=row["margin_mode"],
+            margin_used=_decimal(row["margin_used"]),
+            unrealized_pnl=_decimal(row["unrealized_pnl"]),
+            realized_pnl=_decimal(row["realized_pnl"]),
+            liquidation_price_estimate=_decimal(row["liquidation_price_estimate"]),
+            opened_at=datetime.fromisoformat(row["opened_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    def get_futures_paper_positions(self) -> list[FuturesPaperPositionRecord]:
+        """Return all current paper Futures positions."""
+
+        with self._connection_scope() as connection:
+            rows = connection.execute(
+                """
+                SELECT symbol, side, quantity, entry_price, mark_price, leverage, margin_mode,
+                       margin_used, unrealized_pnl, realized_pnl, liquidation_price_estimate,
+                       opened_at, updated_at
+                FROM futures_paper_positions
+                ORDER BY symbol ASC
+                """
+            ).fetchall()
+        return [
+            FuturesPaperPositionRecord(
+                symbol=row["symbol"],
+                side=row["side"],
+                quantity=_decimal(row["quantity"]),
+                entry_price=_decimal(row["entry_price"]),
+                mark_price=_decimal(row["mark_price"]),
+                leverage=int(row["leverage"]),
+                margin_mode=row["margin_mode"],
+                margin_used=_decimal(row["margin_used"]),
+                unrealized_pnl=_decimal(row["unrealized_pnl"]),
+                realized_pnl=_decimal(row["realized_pnl"]),
+                liquidation_price_estimate=_decimal(row["liquidation_price_estimate"]),
+                opened_at=datetime.fromisoformat(row["opened_at"]),
+                updated_at=datetime.fromisoformat(row["updated_at"]),
+            )
+            for row in rows
+        ]
+
+    def get_futures_paper_fills(
+        self,
+        *,
+        symbol: str | None = None,
+        limit: int | None = None,
+    ) -> list[FuturesPaperFillRecord]:
+        """Return recent paper Futures fills."""
+
+        query = """
+            SELECT order_id, status, symbol, side, filled_quantity, fill_price,
+                   fee_paid, realized_pnl, reason_codes, event_time
+            FROM futures_paper_fills
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if symbol is not None:
+            query += " AND symbol = ?"
+            params.append(symbol.upper())
+        query += " ORDER BY id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        with self._connection_scope() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [
+            FuturesPaperFillRecord(
+                order_id=row["order_id"],
+                status=row["status"],
+                symbol=row["symbol"],
+                side=row["side"],
+                filled_quantity=_decimal(row["filled_quantity"]),
+                fill_price=_decimal(row["fill_price"]),
+                fee_paid=_decimal(row["fee_paid"]),
+                realized_pnl=_decimal(row["realized_pnl"]),
+                reason_codes=_parse_reason_codes(row["reason_codes"]),
+                event_time=datetime.fromisoformat(row["event_time"]),
+            )
+            for row in rows
+        ]
 
     def _apply_history_filters(
         self,

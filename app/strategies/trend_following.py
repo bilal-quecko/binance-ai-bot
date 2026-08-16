@@ -40,6 +40,35 @@ class TrendFollowingStrategy:
             return None
         return snapshot.atr / snapshot.mid_price
 
+    @staticmethod
+    def _ratio(
+        numerator: Decimal | None,
+        denominator: Decimal | None,
+    ) -> Decimal | None:
+        if numerator is None or denominator in {None, Decimal("0")}:
+            return None
+        return numerator / denominator
+
+    def _early_momentum_entry(self, snapshot: FeatureSnapshot) -> StrategySignal | None:
+        """Allow active paper entries before full regime confirmation."""
+
+        if not self.config.allow_early_momentum_entry:
+            return None
+        if snapshot.ema_fast is None or snapshot.ema_slow is None or snapshot.mid_price in {None, Decimal("0")}:
+            return self._hold(snapshot.symbol, "MISSING_EMA")
+        ema_gap = (snapshot.ema_fast - snapshot.ema_slow) / snapshot.mid_price
+        if ema_gap < self.config.min_ema_gap_ratio:
+            return self._hold(snapshot.symbol, "EMA_GAP_TOO_SMALL")
+        momentum_ratio = ema_gap
+        if momentum_ratio < self.config.min_momentum_ratio:
+            return self._hold(snapshot.symbol, "MOMENTUM_TOO_WEAK")
+        return StrategySignal(
+            symbol=snapshot.symbol,
+            side="BUY",
+            confidence=self.config.buy_confidence,
+            reason_codes=("AGGRESSIVE_MOMENTUM_ENTRY", "EMA_BULLISH", "RISK_FILTERS_PASS"),
+        )
+
     def _is_spread_healthy(self, snapshot: FeatureSnapshot) -> bool:
         """Return whether spread and imbalance pass deterministic sanity checks."""
 
@@ -94,7 +123,9 @@ class TrendFollowingStrategy:
         if snapshot.ema_fast is None or snapshot.ema_slow is None:
             return self._hold(snapshot.symbol, "MISSING_EMA")
         if snapshot.regime != "bullish":
-            return self._hold(snapshot.symbol, "REGIME_NOT_TREND")
+            early_signal = self._early_momentum_entry(snapshot)
+            if early_signal is None or early_signal.side != "BUY":
+                return early_signal or self._hold(snapshot.symbol, "REGIME_NOT_TREND")
 
         atr_ratio = self._atr_ratio(snapshot)
         if atr_ratio is None:
@@ -107,6 +138,11 @@ class TrendFollowingStrategy:
             return self._hold(snapshot.symbol, "MICROSTRUCTURE_UNHEALTHY")
         if snapshot.ema_fast <= snapshot.ema_slow:
             return self._hold(snapshot.symbol, "EMA_NOT_BULLISH")
+
+        if snapshot.regime != "bullish":
+            early_signal = self._early_momentum_entry(snapshot)
+            if early_signal is not None and early_signal.side == "BUY":
+                return early_signal
 
         return StrategySignal(
             symbol=snapshot.symbol,

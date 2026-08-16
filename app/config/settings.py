@@ -50,6 +50,33 @@ class Settings(BaseSettings):
     heatmap_vendor_symbol_param: str = Field(default="symbol", alias="HEATMAP_VENDOR_SYMBOL_PARAM")
     heatmap_request_timeout_seconds: int = Field(default=10, alias="HEATMAP_REQUEST_TIMEOUT_SECONDS")
 
+    continuous_intelligence_enabled: bool = Field(default=True, alias="CONTINUOUS_INTELLIGENCE_ENABLED")
+    continuous_intelligence_markets: str = Field(default="spot,futures", alias="CONTINUOUS_INTELLIGENCE_MARKETS")
+    continuous_intelligence_quote_asset: str = Field(default="USDT", alias="CONTINUOUS_INTELLIGENCE_QUOTE_ASSET")
+    continuous_intelligence_universe_limit: int = Field(default=50, alias="CONTINUOUS_INTELLIGENCE_UNIVERSE_LIMIT")
+    continuous_intelligence_cycle_seconds: int = Field(default=300, alias="CONTINUOUS_INTELLIGENCE_CYCLE_SECONDS")
+    continuous_intelligence_universe_refresh_seconds: int = Field(
+        default=1800,
+        alias="CONTINUOUS_INTELLIGENCE_UNIVERSE_REFRESH_SECONDS",
+    )
+    continuous_intelligence_deep_candidate_limit: int = Field(
+        default=12,
+        alias="CONTINUOUS_INTELLIGENCE_DEEP_CANDIDATE_LIMIT",
+    )
+    continuous_intelligence_fast_score_threshold: int = Field(
+        default=45,
+        alias="CONTINUOUS_INTELLIGENCE_FAST_SCORE_THRESHOLD",
+    )
+    continuous_intelligence_concurrency: int = Field(default=4, alias="CONTINUOUS_INTELLIGENCE_CONCURRENCY")
+    continuous_intelligence_request_interval_ms: int = Field(
+        default=50,
+        alias="CONTINUOUS_INTELLIGENCE_REQUEST_INTERVAL_MS",
+    )
+    continuous_intelligence_initial_delay_seconds: int = Field(
+        default=2,
+        alias="CONTINUOUS_INTELLIGENCE_INITIAL_DELAY_SECONDS",
+    )
+
     @property
     def symbol_list(self) -> list[str]:
         return [item.strip().upper() for item in self.symbols.split(",") if item.strip()]
@@ -57,6 +84,16 @@ class Settings(BaseSettings):
     @property
     def timeframe_list(self) -> list[str]:
         return [item.strip() for item in self.timeframes.split(",") if item.strip()]
+
+    @property
+    def continuous_intelligence_market_list(self) -> list[str]:
+        """Return the enabled continuous-intelligence market names."""
+
+        return [
+            item.strip().lower()
+            for item in self.continuous_intelligence_markets.split(",")
+            if item.strip().lower() in {"spot", "futures"}
+        ]
 
 
 @lru_cache

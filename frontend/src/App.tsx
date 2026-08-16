@@ -12,6 +12,7 @@ import { DiagnosticsPanel } from './components/DiagnosticsPanel';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { FusionSignalSection } from './components/FusionSignalSection';
 import { FuturesPaperScannerSection } from './components/FuturesPaperScannerSection';
+import { FuturesPaperTradingSection } from './components/FuturesPaperTradingSection';
 import { MarketSentimentSection } from './components/MarketSentimentSection';
 import { MetricCard } from './components/MetricCard';
 import { OpportunityScannerSection } from './components/OpportunityScannerSection';
@@ -32,6 +33,7 @@ import { TechnicalAnalysisSection } from './components/TechnicalAnalysisSection'
 import { TradeEligibilitySection } from './components/TradeEligibilitySection';
 import { TradingAssistantSection } from './components/TradingAssistantSection';
 import { TradeReadinessPanel } from './components/TradeReadinessPanel';
+import { WhyNoTradePanel } from './components/WhyNoTradePanel';
 import { TradeQualitySection } from './components/TradeQualitySection';
 import { V1SignalDashboard } from './components/V1SignalDashboard';
 import {
@@ -370,7 +372,7 @@ function describeLiveFieldGap(workstation: WorkstationResponse | null): string {
   return 'Not yet populated';
 }
 
-type WorkstationTab = 'discover' | 'signal' | 'simulate' | 'validate' | 'advanced';
+type WorkstationTab = 'discover' | 'signal' | 'simulate' | 'futures' | 'validate' | 'advanced';
 type SignalAnalysisTab = 'ai' | 'technicals' | 'liquidity' | 'sentiment' | 'validation' | 'similar' | 'notes';
 type MainSignal = 'BUY' | 'WAIT' | 'AVOID' | 'EXIT';
 
@@ -3231,10 +3233,11 @@ function App() {
     ['discover', 'Discover', 'Market Scanner'],
     ['signal', 'Signal', 'Symbol Analysis'],
     ['simulate', 'Simulate', 'Paper Trading'],
+    ['futures', 'Futures', 'Paper Long/Short'],
     ['validate', 'Validate', 'Signal Performance'],
     ['advanced', 'Advanced', 'Analytics & Insights'],
   ];
-  const isDetailTab = ['simulate', 'validate', 'advanced'].includes(tab);
+  const isDetailTab = ['simulate', 'futures', 'validate', 'advanced'].includes(tab);
   const refreshAll = () => {
     void refreshWorkspace(selectedSymbol, { includeSignal: true, includeAutoTrade: isDetailTab });
     void refreshOpportunities();
@@ -3470,6 +3473,7 @@ function App() {
               onManualClose={() => void runManualTradeAction(() => manualClosePosition(selectedSymbol))}
             />
             <AdvancedDetailsPro>
+              <WhyNoTradePanel symbol={selectedSymbol} />
               <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-4">
                 <TradeReadinessPanel symbol={selectedSymbol} readiness={readiness} />
               </div>
@@ -3522,6 +3526,12 @@ function App() {
               </AdvancedDetailsPro>
             </ErrorBoundary>
           </div>
+        ) : null}
+
+        {tab === 'futures' ? (
+          <ErrorBoundary fallbackTitle="Futures paper controls unavailable">
+            <FuturesPaperTradingSection symbol={selectedSymbol} />
+          </ErrorBoundary>
         ) : null}
 
         {tab === 'advanced' ? (

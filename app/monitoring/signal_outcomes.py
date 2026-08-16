@@ -218,6 +218,13 @@ class SignalOutcomeBackgroundService:
                 repository = StorageRepository(self._database_url)
                 try:
                     evaluate_pending_signal_outcomes(repository=repository)
+                    # Imported lazily to keep the existing outcome module independent
+                    # while sharing its scheduled persistence lifecycle.
+                    from app.monitoring.signal_timing_baseline import (
+                        evaluate_pending_signal_timing_baselines,
+                    )
+
+                    evaluate_pending_signal_timing_baselines(repository=repository)
                 finally:
                     repository.close()
             except Exception:

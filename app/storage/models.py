@@ -130,6 +130,61 @@ class RunnerEventRecord:
 
 
 @dataclass(slots=True)
+class FuturesPaperEventRecord:
+    """Persisted paper Futures event."""
+
+    event_type: str
+    symbol: str
+    payload_json: str
+    event_time: datetime
+
+
+@dataclass(slots=True)
+class FuturesPaperFillRecord:
+    """Persisted paper Futures fill."""
+
+    order_id: str
+    status: str
+    symbol: str
+    side: str
+    filled_quantity: Decimal
+    fill_price: Decimal
+    fee_paid: Decimal
+    realized_pnl: Decimal
+    reason_codes: tuple[str, ...]
+    event_time: datetime
+
+
+@dataclass(slots=True)
+class FuturesPaperPositionRecord:
+    """Persisted current paper Futures position."""
+
+    symbol: str
+    side: str
+    quantity: Decimal
+    entry_price: Decimal
+    mark_price: Decimal
+    leverage: int
+    margin_mode: str
+    margin_used: Decimal
+    unrealized_pnl: Decimal
+    realized_pnl: Decimal
+    liquidation_price_estimate: Decimal
+    opened_at: datetime
+    updated_at: datetime
+
+
+@dataclass(slots=True)
+class FuturesPaperPnlSnapshotRecord:
+    """Persisted paper Futures PnL snapshot."""
+
+    symbol: str
+    snapshot_time: datetime
+    unrealized_pnl: Decimal
+    realized_pnl: Decimal
+
+
+@dataclass(slots=True)
 class AISignalFeatureSummaryRecord:
     """Compact persisted AI feature summary."""
 
@@ -347,6 +402,114 @@ class SignalOutcomeRecord:
     did_heatmap_reduce_loss: bool | None = None
     predicted_sweep_direction: str = "none"
     actual_sweep_direction: str = "none"
+
+
+@dataclass(slots=True)
+class SignalTimingBaselineRecord:
+    """Persisted timing-quality baseline for one actionable signal horizon."""
+
+    id: int | None
+    signal_id: str
+    horizon: str
+    symbol: str
+    source: str
+    direction: str
+    signal_time: datetime
+    setup_start_time: datetime | None
+    setup_start_price: Decimal | None
+    activation_price: Decimal | None
+    recent_swing_low: Decimal | None
+    recent_swing_high: Decimal | None
+    horizon_end_price: Decimal | None
+    max_favorable_price: Decimal | None
+    max_adverse_price: Decimal | None
+    move_before_signal_pct: Decimal | None
+    move_after_signal_pct: Decimal | None
+    max_favorable_excursion_pct: Decimal | None
+    max_adverse_excursion_pct: Decimal | None
+    full_move_pct: Decimal | None
+    move_already_consumed_pct: Decimal | None
+    move_capture_ratio_pct: Decimal | None
+    entry_efficiency_pct: Decimal | None
+    pre_move_lead_time_seconds: int | None
+    signal_to_entry_latency_seconds: int | None
+    time_to_target_seconds: int | None
+    time_to_stop_seconds: int | None
+    expiry_seconds: int
+    net_return_after_costs_pct: Decimal | None
+    estimated_round_trip_cost_pct: Decimal
+    realized_volatility_pct: Decimal | None
+    regime_label: str | None
+    liquidity_context: str | None
+    classification: str
+    classification_reasons: tuple[str, ...]
+    outcome_state: str
+    evaluated_at: datetime
+
+
+@dataclass(slots=True)
+class ContinuousIntelligenceStateRecord:
+    """Persisted checkpoint for the backend-owned continuous market service."""
+
+    enabled: bool
+    status: str
+    cycle_id: str | None
+    started_at: datetime | None
+    last_cycle_started_at: datetime | None
+    last_cycle_completed_at: datetime | None
+    last_full_universe_pass_at: datetime | None
+    last_universe_refresh_at: datetime | None
+    last_websocket_event_at: datetime | None
+    next_cycle_at: datetime | None
+    last_error: str | None
+    universe_source: str
+    total_symbols: int
+    fast_screened_symbols: int
+    deep_analyzed_symbols: int
+    deep_queue_depth: int
+    successful_cycles: int
+    failed_cycles: int
+    consecutive_failures: int
+    config_json: str
+    updated_at: datetime
+
+
+@dataclass(slots=True)
+class ContinuousIntelligenceCandidateRecord:
+    """Latest persisted continuous screening state for one market symbol."""
+
+    market: str
+    symbol: str
+    stage: str
+    fast_score: int
+    deep_score: int | None
+    direction_hint: str
+    current_price: Decimal | None
+    triggers: tuple[str, ...]
+    metrics_json: str
+    reasons: tuple[str, ...]
+    warnings: tuple[str, ...]
+    screened_at: datetime
+    deep_analyzed_at: datetime | None
+    data_source: str
+
+
+@dataclass(slots=True)
+class ContinuousIntelligenceCycleRecord:
+    """Persisted summary of one continuous market-intelligence cycle."""
+
+    cycle_id: str
+    started_at: datetime
+    completed_at: datetime | None
+    status: str
+    universe_source: str
+    total_symbols: int
+    fast_screened_symbols: int
+    deep_analyzed_symbols: int
+    candidate_count: int
+    failed_symbols: tuple[str, ...]
+    error_message: str | None
+    duration_ms: int | None
 
 
 @dataclass(slots=True)

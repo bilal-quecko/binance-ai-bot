@@ -2,6 +2,61 @@
 
 Chronological implementation checkpoints for Binance AI Bot.
 
+## No. 43 - Prediction Redesign Phase 1: Signal Timing Baseline
+
+- Status: Implemented
+- Scope:
+  - added an additive `signal_timing_baselines` SQLite table with restart-safe idempotency by signal and horizon
+  - evaluated actionable BUY/SELL and LONG/SHORT snapshots across `5m`, `15m`, `1h`, `4h`, and `24h`
+  - measured activation price, derived lookback swing origin, recent swing high/low, pre-signal and post-signal movement, full measured move, move consumed, capture ratio, entry efficiency, MFE, MAE, lead time, target/stop timing, expiry, estimated post-cost return, realized volatility, inferred regime, and available liquidity context
+  - linked the nearest matching executed paper order to signal-to-entry latency when available; missing execution remains explicitly null
+  - classified evidence as `early`, `useful`, `late`, `chased`, `false`, `neutral`, or `insufficient_data` using documented deterministic thresholds
+  - kept Spot and USD-M Futures candle histories separated during evaluation
+  - integrated timing evaluation into the existing background signal-outcome service without changing scanner scores, strategy thresholds, risk checks, or execution behavior
+  - added `GET /bot/signal-timing-baseline` with optional symbol, source, horizon, and recent-sample filters
+  - added source/horizon/classification indexes and automatic compatibility setup for existing SQLite databases
+- Verification:
+  - `tests/test_signal_timing_baseline.py`: 5 passed
+  - timing, signal outcome, storage, and bot API compatibility suite: 76 passed
+  - full backend suite: 291 passed
+  - full `ruff check app tests`: passed
+- Safety:
+  - paper-only behavior is unchanged
+  - no live orders, real Futures execution, autonomous AI execution, or profitability claims were added
+  - setup-origin evidence is explicitly described as a derived swing proxy because the current bot does not yet emit a forming-setup event
+
+## No. 42 - V2 Paper Trading Upgrades
+
+- Status: Implemented
+- Scope:
+  - tuned the aggressive Spot paper profile to be more active while keeping conservative and balanced profiles stable
+  - added explicit no-trade diagnostics to Spot readiness: latest signal, risk decision, execution status, blocker category/message, next trigger, and last attempt timestamp
+  - enriched persisted Spot blocked events with blocker category, current position state, and PnL context
+  - added blocker analytics for recent `trade_blocked`, `risk_decision`, and `execution_result` events
+  - added separate paper Futures models, broker, risk engine, LONG/SHORT signal engine, service, storage tables, endpoints, and UI tab
+  - added investor-facing README summary
+- Backend:
+  - `GET /performance/blockers?symbol=...&limit=...`
+  - `GET /bot/futures/status`
+  - `POST /bot/futures/start`
+  - `POST /bot/futures/stop`
+  - `GET /bot/futures/signal?symbol=...`
+  - `POST /bot/futures/manual-long`
+  - `POST /bot/futures/manual-short`
+  - `POST /bot/futures/manual-close`
+  - `GET /performance/futures-paper?symbol=...`
+- Frontend:
+  - added compact `Why No Trade?` blocker analytics panel
+  - added separate Futures Paper tab with deterministic signal, position/PnL/margin/liquidation-estimate display, and manual LONG/SHORT/CLOSE paper controls
+- Safety:
+  - no live Binance order placement, real Futures orders, real leverage/margin execution, autonomous AI execution, or profitability claim was added
+  - Futures manual controls require explicit paper market-price input and use deterministic risk checks
+  - Spot and Futures paper state are separated in code and persistence
+- Validation Run:
+  - `.\.venv\Scripts\python.exe -m ruff check app tests` passed
+  - `.\.venv\Scripts\python.exe -m pytest` passed (`286 passed`; pytest cache warning only)
+  - `npm run build` from `frontend/` passed
+
 ## No. 41 - Spot Paper Opportunity Scanner
 
 - Status: Completed

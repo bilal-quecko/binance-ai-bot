@@ -13,11 +13,16 @@ This project is a paper-mode signal intelligence workstation for Binance symbols
 - Signal validation, regime analysis, similar setup outcomes, trade eligibility, and adaptive recommendations exist.
 - A paper-only Futures Long/Short Opportunity Scanner is available for advisory ranking only.
 - A paper-only Spot Opportunity Scanner is available for advisory buy/watch/avoid ranking only.
+- Active Spot paper profile is more responsive while retaining deterministic risk, fee/slippage, daily-loss, and max-position gates.
+- Spot paper attempts now persist signal, risk, execution, blocked reason, position, and PnL context for blocker analytics.
+- Separate paper-only Futures LONG/SHORT execution models and manual LONG/SHORT/CLOSE endpoints are available for simulation only.
 - The futures scanner can scan up to 100 symbols and includes a display-only paper leverage risk simulator.
 - The Spot scanner can scan up to 100 Spot USDT symbols with progressive async jobs, validation-ready persistence, and Spot paper simulation handoff.
 - Selected-symbol analysis loads separately from paper trading runtime controls; Start, Pause, Resume, and Stop control only paper runtime.
 - Sidebar selections use Spot analysis/simulation by default, while Futures scanner Simulate opens a separate USD-M Futures paper simulation flow.
 - Market Sensitivity supports Conservative, Balanced, and Active paper modes. Active mode is paper-only and only surfaces smaller slow-market setups when deterministic structure, liquidity, invalidation, and cost checks remain acceptable.
+- Prediction-redesign Phase 1 is implemented: actionable signals are continuously evaluated for timing quality across 5m, 15m, 1h, 4h, and 24h horizons.
+- Timing baselines persist pre-signal move consumption, post-signal capture, lead time, MFE/MAE, target/stop timing, paper-entry latency when available, estimated post-cost return, regime, volatility, liquidity context, and early/useful/late/chased/false classifications.
 - LONG futures scanner candidates should render green, SHORT candidates red, and WAIT/AVOID candidates neutral.
 
 ## Safety Baseline
@@ -105,9 +110,12 @@ npm run build
 - Trade eligibility gate: advisory evidence-based gate for paper automation consideration.
 - Adaptive recommendations: report-only threshold and rule suggestions from measured outcomes.
 - Paper futures scanner: advisory LONG/SHORT/WAIT/AVOID opportunity ranking without execution, with async progressive scan jobs, 20/50/100-symbol scan sizes, display-only leverage-risk simulation, and event-based liquidation intelligence fields.
+- Paper futures execution sandbox: separate isolated-margin paper models, conservative leverage, estimated liquidation references, fees, manual LONG/SHORT/CLOSE, and separate Futures persistence. It never submits Binance Futures orders.
 - Paper Spot scanner: advisory BUY candidate/WATCH/AVOID/EXIT watch ranking from Spot candles, technical structure, regime, validation, and eligibility evidence, with async progressive scan jobs and persisted validation snapshots.
+- Blocker analytics: summarizes recent `trade_blocked`, `risk_decision`, and `execution_result` events so operators can see why no trade happened.
 - Slow-market opportunity detection: range breakout, liquidity sweep reversal, compression breakout, mean reversion from range edge, low-volatility continuation, and low-volatility no-edge blocking are labeled for paper-only review.
 - Liquidation event intelligence: interprets recent Binance force-order events into cascade, exhaustion, sweep-confirmation, noise, and no-activity context. This uses observed liquidation events only; it does not fabricate predictive liquidation levels.
+- Signal timing baseline: measures whether current actionable Spot/Futures signals activate before or after the available move and keeps the lookback swing used as the setup-origin proxy explicitly labeled as derived evidence.
 
 ## Main UI
 
@@ -136,8 +144,26 @@ Advanced details are for validation and due diligence. They must not bypass pape
 - `POST /bot/spot-opportunities/scan` - start a paper-only Spot opportunity scan.
 - `GET /bot/spot-opportunities/scan/{scan_id}` - read Spot scanner progress and partial/final results.
 - `POST /bot/spot-opportunities/scan/{scan_id}/cancel` - cancel a running Spot scan.
+- `GET /performance/blockers?symbol=...` - recent no-trade blocker analytics.
+- `GET /bot/futures/status`, `POST /bot/futures/start`, `POST /bot/futures/stop` - paper Futures runtime controls.
+- `GET /bot/futures/signal?symbol=...` - deterministic paper Futures LONG/SHORT/WAIT/AVOID/CLOSE signal.
+- `POST /bot/futures/manual-long`, `POST /bot/futures/manual-short`, `POST /bot/futures/manual-close` - manual paper Futures actions only.
+- `GET /performance/futures-paper?symbol=...` - paper Futures fills, positions, and PnL summary.
 - `GET /bot/futures-opportunities` - paper-only futures long/short opportunity scanner.
 - `GET /performance/signal-validation` - measured signal validation report.
+- `GET /bot/signal-timing-baseline?symbol=...&source=...&horizon=...` - Phase 1 timing-quality baseline with aggregate and recent per-signal evidence.
+
+## Investor-Facing Summary
+
+Binance shows market data. This platform converts market data into explainable, validated, paper-tested trading decisions.
+
+- Explainable signal engine with separate technical, sentiment, pattern, validation, and eligibility context.
+- Spot and Futures paper simulation with long/short decision support.
+- Blocker analytics that explains why no trade happened.
+- Validation loop that checks whether past signals worked.
+- Similar setup analysis and adaptive recommendations.
+- Paper-first safety before any live-risk phase.
+- Beginner-friendly summary with advanced pro details for due diligence.
 - `GET /performance/similar-setups` - historical similar setup outcome report.
 - `GET /performance/adaptive-recommendations` - report-only adaptive recommendations.
 

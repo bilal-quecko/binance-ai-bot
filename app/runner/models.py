@@ -54,6 +54,14 @@ class TradeReadiness:
     risk_reason_codes: tuple[str, ...] = ()
     expected_edge_pct: Decimal | None = None
     estimated_round_trip_cost_pct: Decimal | None = None
+    latest_signal_side: str | None = None
+    latest_signal_reasons: tuple[str, ...] = ()
+    risk_decision: str | None = None
+    execution_status: str | None = None
+    blocker_category: str | None = None
+    blocker_message: str | None = None
+    next_possible_trigger: str | None = None
+    last_trade_attempt_at: str | None = None
 
 
 @dataclass(slots=True)

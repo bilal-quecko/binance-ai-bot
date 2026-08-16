@@ -458,9 +458,12 @@ class PaperBotRuntime:
         if profile == "aggressive":
             return TrendFollowingConfig(
                 min_atr_ratio=resolved_thresholds["min_atr_ratio"],
-                max_atr_ratio=Decimal("0.0600"),
+                max_atr_ratio=Decimal("0.0750"),
                 max_spread_ratio=resolved_thresholds["max_spread_ratio"],
                 min_order_book_imbalance=resolved_thresholds["min_order_book_imbalance"],
+                allow_early_momentum_entry=True,
+                min_momentum_ratio=Decimal("0.0008"),
+                min_ema_gap_ratio=Decimal("0.00005"),
                 stop_loss_atr_multiple=resolved_thresholds["stop_loss_atr_multiple"],
                 take_profit_atr_multiple=resolved_thresholds["take_profit_atr_multiple"],
             )

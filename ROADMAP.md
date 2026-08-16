@@ -1,6 +1,6 @@
 # Binance AI Bot Roadmap
 
-Last updated: 2026-04-30
+Last updated: 2026-07-19
 
 ## Product Direction
 
@@ -91,6 +91,27 @@ Status: Completed
 - Safety messaging is visible: paper mode, advisory only, no guaranteed profit.
 
 ## Current Phase
+
+### Prediction Redesign - Phase 1 Timing Baseline
+
+Status: Completed
+
+- Existing actionable signal snapshots are evaluated at fixed 5m, 15m, 1h, 4h, and 24h horizons without changing entry or execution behavior.
+- The baseline measures activation price, a clearly labeled derived lookback swing origin, recent swing bounds, pre-signal move, post-signal move, MFE/MAE, move-consumed percentage, capture ratio, entry efficiency, lead time, target/stop timing, expiry, estimated post-cost return, volatility, regime, and available liquidity context.
+- Matching executed paper orders contribute signal-to-entry latency when available; unrelated or absent paper execution remains null rather than fabricated.
+- Samples are classified deterministically as early, useful, late, chased, false, neutral, or insufficient-data.
+- Results persist in SQLite, recover across restarts, are evaluated by the existing background outcome service, and are exposed through `GET /bot/signal-timing-baseline`.
+- This phase establishes the measurable control baseline required before the continuous scanner and predictive setup lifecycle are implemented.
+
+### V2 Paper Trading Upgrades
+
+Status: Implemented incrementally in paper mode
+
+- Active Spot paper profile is more responsive, but keeps deterministic risk checks, fee/slippage handling, daily-loss protection, and max-position controls.
+- Blocker analytics groups no-trade causes such as weak signal, low volatility, spread too wide, edge below costs, position limit, and daily loss limit.
+- Separate Futures paper models, risk checks, signal engine, service, persistence, endpoints, and UI controls support manual paper LONG, SHORT, and CLOSE.
+- Futures execution remains paper-only with conservative leverage and estimated liquidation references.
+- AI remains advisory-only and cannot bypass deterministic strategy/risk checks.
 
 ### Futures Paper Long/Short Opportunity Scanner
 

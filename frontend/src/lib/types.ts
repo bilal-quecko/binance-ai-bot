@@ -807,6 +807,14 @@ export interface TradeReadinessResponse {
   risk_reason_codes: string[];
   expected_edge_pct: DecimalString | null;
   estimated_round_trip_cost_pct: DecimalString | null;
+  latest_signal_side: string | null;
+  latest_signal_reasons: string[];
+  risk_decision: string | null;
+  execution_status: string | null;
+  blocker_category: string | null;
+  blocker_message: string | null;
+  next_possible_trigger: string | null;
+  last_trade_attempt_at: string | null;
 }
 
 export interface ManualTradeResponse {
@@ -822,6 +830,91 @@ export interface ManualTradeResponse {
   current_position_quantity: DecimalString;
   current_position_open: boolean;
   current_pnl: DecimalString;
+}
+
+export interface FuturesPaperPositionResponse {
+  symbol: string;
+  side: 'LONG' | 'SHORT' | string;
+  quantity: DecimalString;
+  entry_price: DecimalString;
+  mark_price: DecimalString;
+  leverage: number;
+  margin_mode: string;
+  margin_used: DecimalString;
+  unrealized_pnl: DecimalString;
+  realized_pnl: DecimalString;
+  liquidation_price_estimate: DecimalString;
+  liquidation_estimate_label: string;
+  opened_at: string;
+  updated_at: string;
+}
+
+export interface FuturesPaperStatusResponse {
+  active: boolean;
+  mode: 'paper';
+  paper_only: boolean;
+  live_futures_trading_enabled: boolean;
+  positions: FuturesPaperPositionResponse[];
+  realized_pnl: DecimalString;
+}
+
+export interface FuturesPaperExecutionSignalResponse {
+  symbol: string;
+  signal: 'LONG' | 'SHORT' | 'WAIT' | 'AVOID' | 'CLOSE_LONG' | 'CLOSE_SHORT' | string;
+  confidence: number;
+  risk_grade: 'low' | 'medium' | 'high';
+  reason_codes: string[];
+  blocker_reason: string | null;
+  paper_only: boolean;
+  ai_execution_authority: boolean;
+}
+
+export interface FuturesPaperFillResponse {
+  order_id: string;
+  status: 'executed' | 'rejected' | string;
+  symbol: string;
+  side: 'LONG' | 'SHORT' | 'CLOSE' | string;
+  filled_quantity: DecimalString;
+  fill_price: DecimalString;
+  fee_paid: DecimalString;
+  realized_pnl: DecimalString;
+  reason_codes: string[];
+  paper_only: boolean;
+}
+
+export interface FuturesPaperPerformanceResponse {
+  symbol: string | null;
+  paper_only: boolean;
+  total_fills: number;
+  realized_pnl: DecimalString;
+  positions: FuturesPaperPositionResponse[];
+  recent_fills: FuturesPaperFillResponse[];
+}
+
+export interface BlockerGroupResponse {
+  category: string;
+  count: number;
+  percentage: number;
+  explanation: string;
+}
+
+export interface RecentBlockerResponse {
+  symbol: string;
+  event_type: string;
+  category: string;
+  message: string;
+  reason_codes: string[];
+  event_time: string;
+}
+
+export interface BlockerAnalyticsResponse {
+  symbol: string | null;
+  total_events: number;
+  groups: BlockerGroupResponse[];
+  most_common_blocker: string | null;
+  explanation: string;
+  next_suggested_action: string;
+  recent_blockers: RecentBlockerResponse[];
 }
 
 export interface AISignalHistoryResponse {
